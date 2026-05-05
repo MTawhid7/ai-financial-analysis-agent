@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-financial-analyst"
+version = "0.1.0"
+description = "Autonomous AI Financial Analyst Agent using ReAct + Multi-Agent Architecture"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain==1.2.17",
+    "langgraph==1.1.10",
+    "langgraph-checkpoint-sqlite==3.0.3",
+    "langchain-google-genai==4.2.2",
+    "langchain-tavily==0.2.18",
+    "yfinance==1.3.0",
+    "pydantic>=2.10,<3.0",
+    "tenacity==9.1.2",
+    "diskcache==5.6.3",
+    "streamlit==1.45.1",
+    "langsmith==0.8.0",
+    "numexpr==2.10.2",
+    "python-dotenv==1.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.5",
+    "pytest-asyncio==0.25.3",
+    "pytest-recording==0.13.2",
+    "pytest-cov==6.1.0",
+    "vcrpy==6.0.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ai_financial_analyst*", "ui*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-v"
+
+[tool.coverage.run]
+source = ["ai_financial_analyst", "ui"]
+omit = ["tests/*"]

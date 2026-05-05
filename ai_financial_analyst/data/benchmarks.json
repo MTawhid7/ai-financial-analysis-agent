@@ -1,0 +1,75 @@
+{
+  "_meta": {
+    "source": "Bundled static data — GICS sector averages (approximate, 2024)",
+    "last_updated": "2025-01",
+    "note": "Use only for relative comparison; do not treat as authoritative."
+  },
+  "sectors": {
+    "Information Technology": {
+      "pe_ratio": 28.5,
+      "ev_ebitda": 18.2,
+      "price_to_book": 7.1,
+      "peer_examples": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL"]
+    },
+    "Health Care": {
+      "pe_ratio": 22.0,
+      "ev_ebitda": 14.5,
+      "price_to_book": 4.2,
+      "peer_examples": ["JNJ", "UNH", "LLY", "ABT", "TMO"]
+    },
+    "Financials": {
+      "pe_ratio": 14.5,
+      "ev_ebitda": 11.0,
+      "price_to_book": 1.8,
+      "peer_examples": ["BRK-B", "JPM", "BAC", "WFC", "GS"]
+    },
+    "Consumer Discretionary": {
+      "pe_ratio": 24.0,
+      "ev_ebitda": 15.8,
+      "price_to_book": 5.3,
+      "peer_examples": ["AMZN", "TSLA", "HD", "MCD", "NKE"]
+    },
+    "Consumer Staples": {
+      "pe_ratio": 19.5,
+      "ev_ebitda": 13.2,
+      "price_to_book": 5.6,
+      "peer_examples": ["PG", "KO", "PEP", "COST", "WMT"]
+    },
+    "Industrials": {
+      "pe_ratio": 20.5,
+      "ev_ebitda": 13.5,
+      "price_to_book": 3.8,
+      "peer_examples": ["UPS", "HON", "GE", "CAT", "BA"]
+    },
+    "Communication Services": {
+      "pe_ratio": 21.0,
+      "ev_ebitda": 12.8,
+      "price_to_book": 3.5,
+      "peer_examples": ["META", "GOOGL", "DIS", "NFLX", "VZ"]
+    },
+    "Energy": {
+      "pe_ratio": 12.0,
+      "ev_ebitda": 6.8,
+      "price_to_book": 1.9,
+      "peer_examples": ["XOM", "CVX", "COP", "SLB", "EOG"]
+    },
+    "Utilities": {
+      "pe_ratio": 17.0,
+      "ev_ebitda": 10.5,
+      "price_to_book": 1.7,
+      "peer_examples": ["NEE", "DUK", "SO", "AEP", "EXC"]
+    },
+    "Real Estate": {
+      "pe_ratio": 35.0,
+      "ev_ebitda": 20.0,
+      "price_to_book": 2.1,
+      "peer_examples": ["AMT", "PLD", "CCI", "EQIX", "DLR"]
+    },
+    "Materials": {
+      "pe_ratio": 17.5,
+      "ev_ebitda": 10.8,
+      "price_to_book": 2.8,
+      "peer_examples": ["LIN", "APD", "FCX", "NEM", "DOW"]
+    }
+  }
+}
