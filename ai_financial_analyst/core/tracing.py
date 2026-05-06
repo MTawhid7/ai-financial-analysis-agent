@@ -41,6 +41,7 @@ class RunTracer:
         self.model = model
         self._tool_calls: list[dict[str, Any]] = []
         self._errors: list[dict[str, Any]] = []
+        self._agent_events: list[dict[str, Any]] = []
         self._status = RunStatus.COMPLETE
         self._step = 0
 
@@ -93,6 +94,22 @@ class RunTracer:
         if error_type == ErrorType.TOOL_ERROR and "injection" in message.lower():
             _append_jsonl("errors.jsonl", entry)
 
+    def record_agent_start(self, agent: str, input_summary: dict) -> None:
+        self._agent_events.append({
+            "event": "agent_start",
+            "agent": agent,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "input_summary": input_summary,
+        })
+
+    def record_agent_complete(self, agent: str, output_summary: dict) -> None:
+        self._agent_events.append({
+            "event": "agent_complete",
+            "agent": agent,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "output_summary": output_summary,
+        })
+
     def set_status(self, status: RunStatus) -> None:
         self._status = status
 
@@ -105,6 +122,7 @@ class RunTracer:
             "run_id": self.run_id,
             "timestamp": self.timestamp,
             "model": self.model,
+            "agent_events": self._agent_events,
             "tool_calls": self._tool_calls,
             "errors": self._errors,
             "status": self._status.value,

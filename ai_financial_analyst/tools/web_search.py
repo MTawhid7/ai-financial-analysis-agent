@@ -23,6 +23,8 @@ from .base import StrictToolInput, safe_tool_call
 logger = logging.getLogger(__name__)
 
 _MAX_FACTS_PER_RESULT = 5
+# Minimum characters of non-link, non-whitespace text for a result to be kept.
+_MIN_CONTENT_CHARS = 150
 _cache = ResultCache()
 
 # Sanitizer (regex-only — no Flash-Lite needed since Tavily pre-summarises).
@@ -61,17 +63,26 @@ def web_search_tool(query: str, max_results: int = 3) -> str:
 
 def _search_and_sanitize(query: str, max_results: int) -> str:
     def _run():
+        # search_depth="basic" reliably returns results; "advanced" (the default)
+        # often returns empty arrays for financial queries.
         tavily = TavilySearch(
             max_results=max_results,
             api_key=os.environ["TAVILY_API_KEY"],
+            search_depth="basic",
         )
         raw_results = tavily.invoke({"query": query})
 
-        # raw_results is a list of dicts with keys: title, url, content, score
+        # Normalise the response: TavilySearch may return a bare list OR a dict
+        # {"results": [...], "answer": ...} depending on the SDK version.
         if isinstance(raw_results, str):
             raw_results = json.loads(raw_results)
+        if isinstance(raw_results, dict):
+            raw_results = raw_results.get("results", raw_results.get("data", []))
         if not isinstance(raw_results, list):
             raw_results = []
+
+        if not raw_results:
+            logger.warning("Tavily returned 0 results for query: %s", query[:80])
 
         summaries = []
         data_truncated = False
@@ -84,6 +95,17 @@ def _search_and_sanitize(query: str, max_results: int) -> str:
             cleaned = _sanitizer._regex_filter(content)
             if cleaned is None:
                 logger.warning("Tavily result sanitized away: title='%s'", title[:60])
+                continue
+
+            # Discard results that are navigation menus or near-empty pages —
+            # strip markdown links and check for enough substantive text.
+            import re as _re
+            text_only = _re.sub(r'\[.*?\]\(.*?\)', '', cleaned).strip()
+            if len(text_only) < _MIN_CONTENT_CHARS:
+                logger.warning(
+                    "Tavily result skipped (low content, %d chars): title='%s'",
+                    len(text_only), title[:60],
+                )
                 continue
 
             # Truncate if content is excessively long.

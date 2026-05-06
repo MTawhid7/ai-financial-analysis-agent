@@ -40,6 +40,8 @@ async def editor_node(state: AgentState, config: dict | None = None) -> AgentSta
     validate_state_for_agent(state, "editor")
 
     tracer: RunTracer | None = config.get("tracer") if config else None
+    artifacts = config.get("artifacts") if config else None
+    step_callback = config.get("step_callback") if config else None
     iteration_log: list[IterationLogEntry] = list(state.get("iteration_log", []))
     errors: list[dict[str, Any]] = list(state.get("errors", []))
 
@@ -47,6 +49,9 @@ async def editor_node(state: AgentState, config: dict | None = None) -> AgentSta
     tickers = state.get("tickers", list(analysis.keys()))
     data_coverage = state.get("data_coverage", [])
     researcher_gaps = state.get("researcher_gaps", [])
+
+    if tracer:
+        tracer.record_agent_start("editor", {"tickers": tickers})
 
     sop_checklist: dict[str, bool] = {}
     all_tickers_pass = True
@@ -59,9 +64,23 @@ async def editor_node(state: AgentState, config: dict | None = None) -> AgentSta
                 logger.warning("SOP checklist FAIL for %s: missing '%s'", ticker, label)
                 all_tickers_pass = False
 
+    # Build compact raw-data summary so the report writer can cite exact figures.
+    raw_data = state.get("raw_data", {})
+    raw_data_summary: dict = {}
+    for ticker, tdata in raw_data.items():
+        raw_data_summary[ticker] = {
+            dtype: {
+                k: v for k, v in dval.items()
+                if isinstance(v, (int, float)) and k not in ("data_points",)
+            }
+            for dtype, dval in tdata.items()
+            if isinstance(dval, dict)
+        }
+
     # Build analysis JSON for the report writer, including data coverage.
     analysis_with_coverage = {
         "analysis": analysis,
+        "raw_data_summary": raw_data_summary,
         "data_coverage": data_coverage,
         "data_gaps": researcher_gaps,
         "sop_checklist_passed": all_tickers_pass,
@@ -69,13 +88,30 @@ async def editor_node(state: AgentState, config: dict | None = None) -> AgentSta
 
     # --- Invoke ReportWriterTool ---
     report_input = {
-        "analysis_json": json.dumps(analysis_with_coverage, indent=2)[:6000],
+        "analysis_json": json.dumps(analysis_with_coverage, indent=2)[:9000],
         "tickers": tickers,
         "data_gaps": researcher_gaps,
     }
 
     step = len(iteration_log) + 1
     report_str = await report_writer_tool.arun(report_input)
+
+    if artifacts:
+        artifacts.record_llm_exchange(
+            agent="editor",
+            purpose="report_writing",
+            ticker=None,
+            prompt_messages=[
+                {"role": "user", "content": report_input["analysis_json"]},
+            ],
+            raw_response=report_str,
+        )
+
+    if step_callback:
+        step_callback({
+            "step": step, "agent": "editor", "tool": "report_writer",
+            "input": {"tickers": tickers}, "cache_hit": False, "ok": bool(report_str),
+        })
 
     if tracer:
         tracer.record_tool_call(
@@ -98,7 +134,11 @@ async def editor_node(state: AgentState, config: dict | None = None) -> AgentSta
     )
 
     # --- Grounding check ---
-    report_markdown = _grounding_check(report_str, iteration_log, tracer)
+    report_markdown = _grounding_check(
+        report_str, iteration_log, tracer,
+        analysis=analysis,
+        raw_data=state.get("raw_data", {}),
+    )
 
     # --- Canary check ---
     try:
@@ -118,6 +158,14 @@ async def editor_node(state: AgentState, config: dict | None = None) -> AgentSta
             "investment decisions. This is not financial advice.*"
         )
 
+    if tracer:
+        tracer.record_agent_complete("editor", {
+            "sop_passed": all_tickers_pass,
+            "sop_checklist": sop_checklist,
+            "report_length_chars": len(report_markdown),
+            "errors": len(errors),
+        })
+
     return AgentState(**{
         **state,
         "report_markdown": report_markdown,
@@ -128,36 +176,91 @@ async def editor_node(state: AgentState, config: dict | None = None) -> AgentSta
     })
 
 
+def _parse_grounded_floats(grounded_values: set[str]) -> list[float]:
+    """Convert grounded numeric strings to floats for scaled comparison."""
+    result = []
+    for s in grounded_values:
+        try:
+            result.append(float(s.rstrip("%")))
+        except (ValueError, AttributeError):
+            pass
+    return result
+
+
+def _is_grounded_by_scale(val_str: str, grounded_floats: list[float], tol: float = 0.015) -> bool:
+    """Return True if val_str is within tol of any grounded float under SI unit scaling.
+
+    Handles: rounding (34.362755 → 34.4), unit conversion (285508000000 → 285.5B),
+    and percentage representation (0.27152 → 27%).
+    """
+    try:
+        val = float(val_str.rstrip("%"))
+    except (ValueError, AttributeError):
+        return True  # unparseable — don't flag
+    if val == 0:
+        return True
+    # Scales cover: exact, thousands, millions, billions, trillions, pct (×100 or ÷100)
+    scale_factors = (1, 1e3, 1e6, 1e9, 1e12, 100.0, 0.01)
+    for gf in grounded_floats:
+        for scale in scale_factors:
+            ref = gf / scale
+            if ref != 0 and abs(val - ref) / abs(ref) <= tol:
+                return True
+    return False
+
+
 def _grounding_check(
     report: str,
     iteration_log: list[IterationLogEntry],
     tracer: RunTracer | None,
+    analysis: dict | None = None,
+    raw_data: dict | None = None,
 ) -> str:
     """Replace ungrounded numeric claims with [UNVERIFIED] tags.
 
-    A number is considered grounded if it appears in at least one tool output
-    captured in the iteration_log.
+    A number is grounded if it can be matched (exact or within 1.5% at any SI
+    unit scale) to a value in tool call inputs, the analysis dict, or raw_data.
+    This handles LLM reformatting such as 285508000000 → 285.5B or 0.27 → 27%.
     """
-    # Build a set of all numeric strings that appear in tool outputs.
     grounded_values: set[str] = set()
+
+    # Source 1: tool call inputs from iteration_log
     for entry in iteration_log:
         output_str = json.dumps(entry.get("input", {}))
-        nums = _NUMERIC_PATTERN.findall(output_str)
-        grounded_values.update(nums)
+        grounded_values.update(_NUMERIC_PATTERN.findall(output_str))
 
+    # Source 2: computed analysis values (CAGR, P/E, etc.)
+    if analysis:
+        try:
+            grounded_values.update(
+                _NUMERIC_PATTERN.findall(json.dumps(analysis, default=str))
+            )
+        except Exception:
+            pass
+
+    # Source 3: raw fetched data (price history, balance sheet figures, etc.)
+    if raw_data:
+        try:
+            grounded_values.update(
+                _NUMERIC_PATTERN.findall(json.dumps(raw_data, default=str))
+            )
+        except Exception:
+            pass
+
+    grounded_floats = _parse_grounded_floats(grounded_values)
     unverified_count = 0
 
     def _check_match(m: re.Match) -> str:
         nonlocal unverified_count
         val = m.group(0)
-        # Common report structure numbers (years, percentages with context) are
-        # not flagged unless the value is clearly a financial figure.
-        # We only flag values > 4 digits or containing a decimal point.
+        # Only flag values that look like financial figures: decimal points or >3 digits.
         is_financial = "." in val or len(val.replace("%", "")) > 3
-        if is_financial and val not in grounded_values:
-            unverified_count += 1
-            return f"[UNVERIFIED:{val}]"
-        return val
+        if not is_financial:
+            return val
+        if val in grounded_values or _is_grounded_by_scale(val, grounded_floats):
+            return val
+        unverified_count += 1
+        return f"[UNVERIFIED:{val}]"
 
     verified_report = _NUMERIC_PATTERN.sub(_check_match, report)
 

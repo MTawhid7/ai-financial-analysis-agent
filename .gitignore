@@ -40,8 +40,10 @@ tests/e2e/cassettes/
 .cache/
 # LangGraph SQLite checkpoints
 .checkpoints/
-# Run traces (user-generated, not source code)
+# Run traces and full API/LLM response artifacts (user-generated, not source code)
 run_trace_*.json
+run_artifacts_*.json
+debug_artifacts/
 errors.jsonl
 
 # === macOS ===

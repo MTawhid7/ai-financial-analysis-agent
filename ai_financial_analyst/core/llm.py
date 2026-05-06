@@ -6,10 +6,10 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from functools import wraps
 from typing import Any, Callable
 
 import tenacity
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 logger = logging.getLogger(__name__)
@@ -85,27 +85,22 @@ def _retry_on_rate_limit(circuit_breaker: _CircuitBreaker) -> Callable:
     )
 
 
-def _wrap_with_budget(llm: ChatGoogleGenerativeAI, record_fn: Callable) -> ChatGoogleGenerativeAI:
-    """Monkey-patch invoke/ainvoke to record budget calls."""
-    original_invoke = llm.invoke
-    original_ainvoke = llm.ainvoke
+class _BudgetCallbackHandler(BaseCallbackHandler):
+    """Records each LLM call to the budget tracker via LangChain's callback system.
 
-    @wraps(original_invoke)
-    def invoke(input: Any, *args: Any, **kwargs: Any) -> Any:
-        record_fn()
-        return original_invoke(input, *args, **kwargs)
+    Using callbacks instead of monkey-patching avoids Pydantic v2's strict
+    __setattr__ validation on ChatGoogleGenerativeAI.
+    """
 
-    @wraps(original_ainvoke)
-    async def ainvoke(input: Any, *args: Any, **kwargs: Any) -> Any:
-        record_fn()
-        return await original_ainvoke(input, *args, **kwargs)
+    def __init__(self, record_fn: Callable[[], None]) -> None:
+        super().__init__()
+        self._record_fn = record_fn
 
-    llm.invoke = invoke  # type: ignore[method-assign]
-    llm.ainvoke = ainvoke  # type: ignore[method-assign]
-    return llm
+    def on_chat_model_start(self, serialized: dict, messages: list, **kwargs: Any) -> None:
+        self._record_fn()
 
 
-def get_primary_llm(budget_tracker=None) -> ChatGoogleGenerativeAI:
+def get_primary_llm(budget_tracker=None):
     """Return Gemini Flash LLM for the core ReAct reasoning loop."""
     llm = ChatGoogleGenerativeAI(
         model=_PRIMARY_MODEL,
@@ -118,11 +113,13 @@ def get_primary_llm(budget_tracker=None) -> ChatGoogleGenerativeAI:
         max_retries=1,
     )
     if budget_tracker:
-        _wrap_with_budget(llm, budget_tracker.record_primary_call)
+        return llm.with_config(
+            {"callbacks": [_BudgetCallbackHandler(budget_tracker.record_primary_call)]}
+        )
     return llm
 
 
-def get_subllm(budget_tracker=None) -> ChatGoogleGenerativeAI:
+def get_subllm(budget_tracker=None):
     """Return Gemini Flash-Lite LLM for summarisation and sanitisation sub-tasks."""
     llm = ChatGoogleGenerativeAI(
         model=_SUB_MODEL,
@@ -132,8 +129,27 @@ def get_subllm(budget_tracker=None) -> ChatGoogleGenerativeAI:
         max_retries=1,
     )
     if budget_tracker:
-        _wrap_with_budget(llm, budget_tracker.record_sub_call)
+        return llm.with_config(
+            {"callbacks": [_BudgetCallbackHandler(budget_tracker.record_sub_call)]}
+        )
     return llm
+
+
+def content_to_str(content: Any) -> str:
+    """Normalize an LLM response content value to a plain string.
+
+    In langchain-google-genai 4.x the google-genai SDK returns content as a
+    list of typed blocks: [{'type': 'text', 'text': '...'}].  Plain strings
+    are passed through unchanged.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    return str(content)
 
 
 def with_retry(fn: Callable, is_primary: bool = True) -> Callable:

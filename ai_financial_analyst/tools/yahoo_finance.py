@@ -17,6 +17,8 @@ from .base import StrictToolInput, ToolError, ErrorType, safe_tool_call
 logger = logging.getLogger(__name__)
 
 _cache = ResultCache()
+# yfinance 1.x requires curl_cffi (not requests) to manage its own session.
+# Do NOT pass a session= argument — let yfinance handle it internally.
 
 
 class YahooFinanceInput(StrictToolInput):
@@ -52,6 +54,11 @@ def _fetch_data(ticker: str, data_type: str) -> str:
         if data_type == "price_history":
             hist = stock.history(period="5y")
             if hist.empty:
+                # Yahoo Finance sometimes blocks long-period requests; try shorter.
+                hist = stock.history(period="2y")
+            if hist.empty:
+                hist = stock.history(period="1y")
+            if hist.empty:
                 return _null_result(ticker, data_type, "No price history available")
             prices = hist["Close"].dropna()
             return json.dumps({
@@ -67,12 +74,20 @@ def _fetch_data(ticker: str, data_type: str) -> str:
 
         if data_type == "fundamentals":
             info = stock.info
-            if not info or info.get("regularMarketPrice") is None:
+            # regularMarketPrice was deprecated in yfinance 1.x; fall back to
+            # currentPrice. Reject only if the dict is truly empty or has no
+            # price-related key at all (avoids false nulls on valid stocks).
+            has_price = any(info.get(k) for k in (
+                "currentPrice", "regularMarketPrice", "previousClose"
+            ))
+            if not info or not has_price:
                 return _null_result(ticker, data_type, "Fundamentals unavailable")
+            current_price = info.get("currentPrice") or info.get("regularMarketPrice")
             return json.dumps({
                 "ticker": ticker,
                 "data_type": "fundamentals",
                 "data_timestamp": timestamp,
+                "current_price": current_price,
                 "pe_ratio": info.get("trailingPE"),
                 "forward_pe": info.get("forwardPE"),
                 "market_cap": info.get("marketCap"),

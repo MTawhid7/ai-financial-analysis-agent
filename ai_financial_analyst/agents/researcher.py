@@ -53,12 +53,17 @@ Rules:
 async def researcher_node(state: AgentState, config: dict | None = None) -> AgentState:
     """LangGraph node: Researcher agent."""
     tracer: RunTracer | None = config.get("tracer") if config else None
+    artifacts = config.get("artifacts") if config else None
+    step_callback = config.get("step_callback") if config else None
     # primary_llm is not used by the Researcher — it calls tools directly.
 
     tickers = state.get("tickers", [])
     query = state.get("query", "")
     iteration_log: list[IterationLogEntry] = list(state.get("iteration_log", []))
     errors: list[dict[str, Any]] = list(state.get("errors", []))
+
+    if tracer:
+        tracer.record_agent_start("researcher", {"tickers": tickers, "query": query})
 
     # Build tool map
     tools = {
@@ -121,14 +126,32 @@ async def researcher_node(state: AgentState, config: dict | None = None) -> Agen
                     output_tokens=len(result_str) // 4,
                     cache_hit=cache_hit,
                 )
+            if artifacts:
+                artifacts.record_tool_response(
+                    agent="researcher",
+                    tool="yahoo_finance",
+                    input_data=tool_input,
+                    full_output=result_str,
+                    step=step,
+                    cache_hit=cache_hit,
+                )
+            if step_callback:
+                step_callback({
+                    "step": step, "agent": "researcher", "tool": "yahoo_finance",
+                    "input": tool_input, "cache_hit": cache_hit,
+                    "ok": "error_type" not in result,
+                })
 
             if "error_type" in result:
                 gap = f"{ticker}/{data_type}: {result.get('message', 'unknown error')}"
                 coverage["data_gaps"].append(gap)
                 data_gaps.append(gap)
                 errors.append({"error_type": ErrorType.TOOL_ERROR.value, "detail": gap})
-            elif result.get("result") is None:
-                gap = f"{ticker}/{data_type}: {result.get('reason', 'no data')}"
+            elif "reason" in result and result.get("result") is None:
+                # Explicit null returned by the tool: {"result": None, "reason": "..."}
+                # NOTE: dict.get("result") returns None for both missing keys AND explicit
+                # None values, so we check for "reason" to distinguish null from success.
+                gap = f"{ticker}/{data_type}: {result['reason']}"
                 coverage["data_gaps"].append(gap)
                 data_gaps.append(gap)
             else:
@@ -175,6 +198,20 @@ async def researcher_node(state: AgentState, config: dict | None = None) -> Agen
                     output_data=news_result,
                     output_tokens=len(news_str) // 4,
                 )
+            if artifacts:
+                artifacts.record_tool_response(
+                    agent="researcher",
+                    tool="web_search",
+                    input_data=news_input,
+                    full_output=news_str,
+                    step=step,
+                )
+            if step_callback:
+                step_callback({
+                    "step": step, "agent": "researcher", "tool": "web_search",
+                    "input": news_input, "cache_hit": False,
+                    "ok": "error_type" not in news_result,
+                })
 
             if "error_type" not in news_result:
                 ticker_data["news"] = news_result
@@ -193,6 +230,13 @@ async def researcher_node(state: AgentState, config: dict | None = None) -> Agen
             "researcher",
             ["raw_data — no data retrieved for any ticker"],
         )
+
+    if tracer:
+        tracer.record_agent_complete("researcher", {
+            "tickers_fetched": list(raw_data.keys()),
+            "total_gaps": len(data_gaps),
+            "gaps": data_gaps[:5],
+        })
 
     return AgentState(**{
         **state,

@@ -9,6 +9,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 from pydantic import Field
 
+from ..core.llm import content_to_str
 from .base import StrictToolInput, safe_tool_call
 
 logger = logging.getLogger(__name__)
@@ -34,9 +35,10 @@ MANDATORY SECTIONS — every report MUST include all of the following:
    financial advice.*
 
 Rules:
-- Every quantitative claim MUST reference its source tool and observation step.
-- Do NOT fabricate any numbers not present in the analysis JSON.
-- Use [UNVERIFIED] tag for any figure that cannot be traced to a tool observation.
+- Use ONLY numbers that appear in the analysis JSON. Do NOT invent figures.
+- Format all numbers in a professional, human-readable style: e.g. $4.17T (not 4173852573696), $285.5B (not 285508000000.0), 27.2% (not 0.27152002), 34.4x P/E (not 34.362755). Round to 3 significant figures.
+- Every quantitative claim MUST cite its source tool in parentheses, e.g. "(Source: fundamentals)" or "(Source: benchmark_lookup)".
+- Do NOT add [UNVERIFIED] tags — grounding is handled in post-processing.
 - Keep language professional, concise, and analytical.""",
         ),
         (
@@ -81,7 +83,8 @@ def report_writer_tool(
             )
         chain = _REPORT_PROMPT | _primary_llm
         response = chain.invoke({"analysis_json": analysis_json})
-        report = response.content if hasattr(response, "content") else str(response)
+        raw_content = response.content if hasattr(response, "content") else response
+        report = content_to_str(raw_content)
         return _enforce_disclaimer(report)
 
     return safe_tool_call(

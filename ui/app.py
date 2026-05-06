@@ -22,6 +22,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from ai_financial_analyst.core.log_capture import capture_logs
+
 # ------------------------------------------------------------------
 # Page config
 # ------------------------------------------------------------------
@@ -48,13 +50,16 @@ with st.sidebar:
         if uploaded:
             trace_file = json.load(uploaded)
 
+    debug_mode = st.checkbox("Debug mode", value=False,
+                              help="Show intermediate agent outputs and pipeline logs after each run.")
+
     st.divider()
     st.markdown("**Stack**")
     st.markdown(
         "- LangGraph pipeline\n"
-        "- Gemini 2.0 Flash (primary)\n"
-        "- Gemini 2.0 Flash-Lite (sub-tasks)\n"
-        "- yfinance + DuckDuckGo (free tier)\n"
+        "- Gemini 3 Flash (primary)\n"
+        "- Gemini 3.1 Flash-Lite (sub-tasks)\n"
+        "- yfinance + Tavily (free tier)\n"
         "- LangSmith tracing\n"
     )
 
@@ -164,39 +169,51 @@ def _run_analysis(tickers: list[str]) -> None:
         with tao_container:
             tao_output.markdown("\n\n".join(tao_lines[-30:]))
 
+    # Live step callback — called by each agent immediately after each tool call.
+    def _on_step(event: dict) -> None:
+        step = event.get("step", "?")
+        agent = event.get("agent", "?")
+        tool = event.get("tool", "?")
+        cache = " *(cached)*" if event.get("cache_hit") else ""
+        status_icon = "✓" if event.get("ok", True) else "✗"
+        _append_tao(f"{status_icon} **[STEP {step}]** `{agent}` → `{tool}`{cache}")
+
     _append_tao(f"**Starting analysis for: {', '.join(tickers)}**")
     _render_transparency({}, [], "RUNNING")
 
     try:
-        final_state, trace_path = asyncio.run(
-            run_pipeline(
-                query=f"Analyse {', '.join(tickers)}",
-                tickers=tickers,
-                dry_run=False,
-                trace_output_dir=".",
+        with capture_logs() as log_handler:
+            final_state, trace_path, artifacts_path = asyncio.run(
+                run_pipeline(
+                    query=f"Analyse {', '.join(tickers)}",
+                    tickers=tickers,
+                    dry_run=False,
+                    step_callback=_on_step,
+                )
             )
-        )
+        captured_logs = log_handler.records
     except Exception as exc:
         st.error(f"Pipeline error: {exc}")
+        import traceback
+        st.code(traceback.format_exc(), language="text")
         return
 
-    # Render TAO log
-    for entry in final_state.get("iteration_log", []):
-        step = entry.get("step", "?")
-        agent = entry.get("agent", "?")
-        tool = entry.get("tool", "?")
-        cache = " (cached)" if entry.get("cache_hit") else ""
-        _append_tao(f"**[STEP {step}]** `{agent}` → `{tool}`{cache}")
+    _append_tao("**Pipeline complete.**")
 
     # Transparency panel
     errors = final_state.get("errors", [])
     status = final_state.get("status", "COMPLETE")
-    # Budget stats available from trace file
+    trace_data: dict = {}
+    artifacts_data: dict = {}
     try:
         trace_data = json.loads(Path(trace_path).read_text())
         budget_stats = trace_data.get("budget_stats", {})
     except Exception:
         budget_stats = {}
+    try:
+        artifacts_data = json.loads(Path(artifacts_path).read_text())
+    except Exception:
+        pass
 
     _render_transparency(budget_stats, errors, status)
 
@@ -213,19 +230,118 @@ def _run_analysis(tickers: list[str]) -> None:
     else:
         st.warning("No report generated — check the error log above.")
 
-    # Download trace
+    # Download trace + artifacts
+    dl_col1, dl_col2 = st.columns(2)
     if trace_path and Path(trace_path).exists():
-        st.download_button(
+        dl_col1.download_button(
             "Download run_trace.json",
             data=Path(trace_path).read_text(),
             file_name=Path(trace_path).name,
             mime="application/json",
         )
+    if artifacts_path and Path(artifacts_path).exists():
+        dl_col2.download_button(
+            "Download run_artifacts.json (Full API & LLM Responses)",
+            data=Path(artifacts_path).read_text(),
+            file_name=Path(artifacts_path).name,
+            mime="application/json",
+        )
 
     if errors:
-        with st.expander("Error Details", expanded=False):
+        with st.expander(f"⚠️ Errors ({len(errors)})", expanded=True):
             for err in errors:
                 st.json(err)
+
+    # Debug mode: intermediate state inspection
+    if debug_mode:
+        st.divider()
+        st.subheader("Debug: Pipeline Inspection")
+
+        agent_events = trace_data.get("agent_events", [])
+        if agent_events:
+            with st.expander("Agent Events Timeline", expanded=True):
+                for evt in agent_events:
+                    icon = "▶" if evt["event"] == "agent_start" else "✓"
+                    st.markdown(
+                        f"`{evt['timestamp']}` **{icon} {evt['agent']}** "
+                        f"— {evt['event'].replace('_', ' ')}"
+                    )
+                    summary = evt.get("input_summary") or evt.get("output_summary", {})
+                    if summary:
+                        st.json(summary)
+
+        raw_data = final_state.get("raw_data", {})
+        if raw_data:
+            with st.expander("Researcher Output — raw_data keys per ticker", expanded=False):
+                for ticker, data in raw_data.items():
+                    st.markdown(f"**{ticker}**: {list(data.keys())}")
+                    for dtype, dval in data.items():
+                        st.markdown(f"*{dtype}*")
+                        if isinstance(dval, dict):
+                            st.json(dval)
+                        else:
+                            st.text(str(dval)[:500])
+
+        analysis = final_state.get("analysis", {})
+        if analysis:
+            with st.expander("Quant Analyst Output — analysis per ticker", expanded=False):
+                st.json(analysis)
+
+        if captured_logs:
+            with st.expander(f"Pipeline Logs ({len(captured_logs)} entries)", expanded=False):
+                level_colors = {
+                    "DEBUG": "gray", "INFO": "green",
+                    "WARNING": "orange", "ERROR": "red", "CRITICAL": "red"
+                }
+                for rec in captured_logs:
+                    color = level_colors.get(rec["level"], "gray")
+                    st.markdown(
+                        f"<span style='color:{color};font-size:0.85em'>"
+                        f"[{rec['time']}] **{rec['level']}** {rec['message']}"
+                        f"</span>",
+                        unsafe_allow_html=True,
+                    )
+
+        # ------------------------------------------------------------------
+        # Full API & LLM response inspection (from run_artifacts.json)
+        # ------------------------------------------------------------------
+
+        tool_responses = artifacts_data.get("tool_responses", [])
+        if tool_responses:
+            with st.expander(
+                f"Full API Responses ({len(tool_responses)} tool calls)", expanded=False
+            ):
+                for resp in tool_responses:
+                    label = (
+                        f"Step {resp.get('step')} — "
+                        f"`{resp.get('agent')}` → `{resp.get('tool')}`"
+                        + (" *(cached)*" if resp.get("cache_hit") else "")
+                    )
+                    with st.expander(label, expanded=False):
+                        st.markdown("**Input**")
+                        st.json(resp.get("input", {}))
+                        st.markdown("**Full Output**")
+                        parsed = resp.get("output_parsed")
+                        if parsed is not None:
+                            st.json(parsed)
+                        else:
+                            st.text(resp.get("full_output_str", "")[:3000])
+
+        llm_exchanges = artifacts_data.get("llm_exchanges", [])
+        if llm_exchanges:
+            with st.expander(
+                f"Full LLM Exchanges ({len(llm_exchanges)} calls)", expanded=False
+            ):
+                for i, ex in enumerate(llm_exchanges):
+                    ticker_label = f" [{ex.get('ticker')}]" if ex.get("ticker") else ""
+                    label = f"{ex.get('agent')} — {ex.get('purpose')}{ticker_label}"
+                    with st.expander(label, expanded=False):
+                        for msg in ex.get("prompt_messages", []):
+                            role = msg.get("role", "?")
+                            st.markdown(f"**Prompt ({role})**")
+                            st.text(str(msg.get("content", ""))[:4000])
+                        st.markdown("**Raw LLM Response**")
+                        st.text(ex.get("raw_response", "")[:6000])
 
 
 # ------------------------------------------------------------------

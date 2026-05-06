@@ -4,13 +4,12 @@ Pipeline: START → researcher → quant_analyst → editor → END
 
 Each node is wrapped to catch PartialStateError and CircuitBreakerError,
 producing a graceful partial output rather than a hard crash.
-State is checkpointed after each node via SQLite.
+State is checkpointed after each node via AsyncSqliteSaver (required for
+async pipelines; SqliteSaver only supports synchronous methods).
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import os
 import uuid
@@ -19,10 +18,10 @@ from typing import Any
 
 from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
-# SqliteSaver lives in the separate langgraph-checkpoint-sqlite package (v3+).
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
+from ..core.artifacts import RunArtifacts
 from ..core.budget_tracker import RequestBudgetTracker
 from ..core.llm import CircuitBreakerError, get_primary_llm, get_subllm
 from ..core.state import AgentState, PartialStateError
@@ -38,33 +37,30 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _CHECKPOINT_PATH = os.getenv("CHECKPOINT_DB_PATH", ".checkpoints/state.db")
+_ARTIFACTS_DIR = os.getenv("ARTIFACTS_DIR", "debug_artifacts")
 
 
-def build_pipeline(dry_run: bool = False):
-    """Construct and return the compiled LangGraph pipeline.
+def _clear_old_artifacts(output_dir: str) -> None:
+    """Delete previous run files so only the latest run is kept in the folder."""
+    folder = Path(output_dir)
+    if not folder.exists():
+        return
+    for pattern in ("run_trace_*.json", "run_artifacts_*.json"):
+        for f in folder.glob(pattern):
+            try:
+                f.unlink()
+                logger.debug("Removed old artifact: %s", f.name)
+            except OSError as exc:
+                logger.warning("Could not remove %s: %s", f, exc)
 
-    Args:
-        dry_run: Use MemorySaver (no SQLite, no API calls) for demo replay.
 
-    Returns:
-        Compiled LangGraph app ready for ainvoke().
+def _build_graph(node_config: dict) -> StateGraph:
+    """Build the StateGraph with nodes and edges (not yet compiled).
+
+    Compilation is deferred to run_pipeline() so the async checkpointer
+    context manager can wrap the full ainvoke() call.
     """
-    budget = RequestBudgetTracker()
-    primary_llm = get_primary_llm(budget_tracker=budget)
-    subllm = get_subllm(budget_tracker=budget)
-
-    # Inject sub-LLM into tools that need it.
-    web_search_module.configure(subllm=subllm)
-    report_writer_module.configure(primary_llm=primary_llm)
-
-    tracer = RunTracer()
-
-    # Shared config injected into every node via LangGraph's config parameter.
-    node_config = {
-        "primary_llm": primary_llm,
-        "tracer": tracer,
-        "budget": budget,
-    }
+    tracer: RunTracer = node_config["tracer"]
 
     async def _researcher(state: AgentState) -> AgentState:
         return await _safe_node("researcher", researcher_node, state, node_config, tracer)
@@ -83,21 +79,7 @@ def build_pipeline(dry_run: bool = False):
     graph.add_edge("researcher", "quant_analyst")
     graph.add_edge("quant_analyst", "editor")
     graph.add_edge("editor", END)
-
-    if dry_run:
-        checkpointer = MemorySaver()
-    else:
-        db_path = Path(_CHECKPOINT_PATH)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        checkpointer = SqliteSaver.from_conn_string(str(db_path))
-
-    app = graph.compile(checkpointer=checkpointer)
-
-    # Attach metadata so the UI can access tracer/budget after the run.
-    app._tracer = tracer  # type: ignore[attr-defined]
-    app._budget = budget  # type: ignore[attr-defined]
-
-    return app
+    return graph
 
 
 async def _safe_node(
@@ -121,20 +103,20 @@ async def _safe_node(
                 "missing_fields": exc.missing_fields,
             }
         )
-        return AgentState(**state, errors=errors, status="PARTIAL")
+        return AgentState(**{**state, "errors": errors, "status": "PARTIAL"})
     except CircuitBreakerError as exc:
         logger.critical("Circuit breaker tripped in %s: %s", name, exc)
         tracer.set_status(RunStatus.RATE_LIMITED)
         errors = list(state.get("errors", []))
         errors.append({"error_type": "RATE_LIMIT", "agent": name, "detail": str(exc)})
         report = state.get("report_markdown") or _partial_report(state, name)
-        return AgentState(**state, errors=errors, status="RATE_LIMITED", report_markdown=report)
+        return AgentState(**{**state, "errors": errors, "status": "RATE_LIMITED", "report_markdown": report})
     except Exception as exc:
         logger.exception("Unexpected error in node %s", name)
         tracer.set_status(RunStatus.FAILED)
         errors = list(state.get("errors", []))
         errors.append({"error_type": "UNKNOWN", "agent": name, "detail": str(exc)})
-        return AgentState(**state, errors=errors, status="FAILED")
+        return AgentState(**{**state, "errors": errors, "status": "FAILED"})
 
 
 def _partial_report(state: AgentState, failed_at: str) -> str:
@@ -173,15 +155,36 @@ async def run_pipeline(
     query: str,
     tickers: list[str],
     dry_run: bool = False,
-    trace_output_dir: str = ".",
-) -> tuple[AgentState, str]:
+    trace_output_dir: str = _ARTIFACTS_DIR,
+    step_callback: Any | None = None,
+) -> tuple[AgentState, str, str]:
     """High-level entry point: run the full pipeline and export the trace.
+
+    AsyncSqliteSaver must wrap the ainvoke() call because its context manager
+    owns the aiosqlite connection lifetime.
 
     Returns:
         (final_state, trace_path)
     """
-    app = build_pipeline(dry_run=dry_run)
+    budget = RequestBudgetTracker()
+    primary_llm = get_primary_llm(budget_tracker=budget)
+    subllm = get_subllm(budget_tracker=budget)
+
+    web_search_module.configure(subllm=subllm)
+    report_writer_module.configure(primary_llm=primary_llm)
+
+    tracer = RunTracer()
     run_id = str(uuid.uuid4())
+    artifacts = RunArtifacts(run_id=run_id, tickers=[t.strip().upper() for t in tickers])
+    node_config = {
+        "primary_llm": primary_llm,
+        "tracer": tracer,
+        "budget": budget,
+        "artifacts": artifacts,
+        "step_callback": step_callback,
+    }
+
+    graph = _build_graph(node_config)
 
     initial_state = AgentState(
         query=query,
@@ -191,13 +194,23 @@ async def run_pipeline(
         status="COMPLETE",
         run_id=run_id,
     )
-
     thread_config = {"configurable": {"thread_id": run_id}}
-    final_state = await app.ainvoke(initial_state, config=thread_config)
 
-    tracer: RunTracer = app._tracer  # type: ignore[attr-defined]
-    budget: RequestBudgetTracker = app._budget  # type: ignore[attr-defined]
+    if dry_run:
+        app = graph.compile(checkpointer=MemorySaver())
+        final_state = await app.ainvoke(initial_state, config=thread_config)
+    else:
+        db_path = Path(_CHECKPOINT_PATH)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+            app = graph.compile(checkpointer=checkpointer)
+            final_state = await app.ainvoke(initial_state, config=thread_config)
+
+    _clear_old_artifacts(trace_output_dir)
     trace_path = tracer.export(output_dir=trace_output_dir)
     tracer.build(budget_stats=budget.get_stats())
 
-    return final_state, str(trace_path)
+    artifacts.set_report(final_state.get("report_markdown", ""))
+    artifacts_path = artifacts.save(output_dir=trace_output_dir)
+
+    return final_state, str(trace_path), str(artifacts_path)
