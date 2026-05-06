@@ -1,6 +1,8 @@
 # AI Financial Analyst Agent
 
-An autonomous financial research agent built on the **ReAct + Multi-Agent** architecture using **LangGraph**, **Gemini free tier**, **yfinance**, and **DuckDuckGo**. Zero ongoing API cost.
+A **conversational AI financial analyst** built on the **ReAct + Multi-Agent** architecture using **LangGraph**, **Gemini free tier**, **yfinance**, and **Tavily**. Zero ongoing API cost.
+
+Accepts natural language queries — no fixed ticker form. Autonomously classifies intent, routes requests, and runs a structured multi-agent pipeline to produce research-grade reports.
 
 > **Portfolio project** — demonstrates production-grade agentic AI engineering patterns. Not for real financial decisions.
 
@@ -10,7 +12,11 @@ An autonomous financial research agent built on the **ReAct + Multi-Agent** arch
 
 ```mermaid
 flowchart LR
-    User -->|query + tickers| Orchestrator
+    User -->|natural language| CA["💬 ConversationalAgent\n(intent classifier + router)"]
+
+    CA -->|financial_analysis| Orchestrator
+    CA -->|financial_question| LLM["Primary LLM\n(direct answer)"]
+    CA -->|off_topic| Reject["Polite rejection"]
 
     subgraph Pipeline ["LangGraph Pipeline (Sequential)"]
         direction LR
@@ -24,7 +30,7 @@ flowchart LR
 
     subgraph ResearcherTools ["Researcher Tools"]
         YF["YahooFinanceTool\n(yfinance, free)"]
-        WS["WebSearchTool\n(DuckDuckGo + sanitizer\n+ Flash-Lite compression)"]
+        WS["WebSearchTool\n(Tavily + sanitizer)"]
     end
 
     subgraph QuantTools ["Quant Tools"]
@@ -40,9 +46,9 @@ flowchart LR
     Q --> CALC & BL
     E --> RW
 
-    E -->|Markdown report| User
+    E -->|Markdown report| CA -->|chat response| User
     Orchestrator -->|SQLite checkpoint| DB[(SQLite)]
-    Orchestrator -->|run_trace.json| Trace[📄 Trace]
+    Orchestrator -->|run_trace.json + run_artifacts.json| Trace[📄 Debug Artifacts]
 ```
 
 ---
@@ -99,14 +105,20 @@ cp .env.example .env
 ### Run
 
 ```bash
+# Conversational chat interface (recommended — Phase 1+)
+streamlit run ui/chat_app.py
+
+# Classic single-turn form with dry-run replay
 streamlit run ui/app.py
 ```
 
-Enter tickers like `AAPL, NVDA` and click **Run Analysis**.
+**Chat mode**: type naturally — *"Analyse AAPL"*, *"What is a P/E ratio?"*, *"Compare Tesla and Ford"*. The agent classifies your intent and routes it automatically.
 
-### Demo without API calls (--dry-run)
+**Classic mode**: enter comma-separated tickers and click **Run Analysis**. Includes dry-run replay for zero-API demo.
 
-After a real run, download the `run_trace.json` file. Then:
+### Demo without API calls (dry-run)
+
+After a real run, download the `run_trace.json` from the chat or the classic UI. Then in the classic UI:
 
 1. Check the **Dry-run mode** checkbox in the sidebar
 2. Upload your `run_trace.json`
@@ -142,9 +154,10 @@ pytest -v
 |-----------|--------|-------|
 | Gemini free tier: ~1,500 RPD, 15 RPM | Pipeline stalls on heavy usage | `RequestBudgetTracker` warns at 80% |
 | yfinance data lag | Prices may be 15 min delayed | `data_timestamp` field makes this explicit |
-| DuckDuckGo rate limiting | Occasional empty search results | Tool returns structured null; agent notes gap |
+| Tavily free tier: 1,000 searches/month | Occasional cache reliance | 4-hour diskcache reduces consumption |
 | Static benchmark data | Sector P/E averages are approximate 2024 values | Not live — use only for relative comparison |
 | Sequential execution | Each run takes 60–120s for 2–3 tickers | Required to stay within free-tier RPM cap |
+| Chat history not persisted across restarts | Conversation resets on server restart | Phase 2 adds SQLite-backed long-term memory |
 
 ---
 
@@ -152,17 +165,34 @@ pytest -v
 
 ```
 ai_financial_analyst/
-├── core/           # LLM client, state, cache, tracing, sanitizer
-├── tools/          # Five LangChain tools with Pydantic v2 schemas
-├── agents/         # Researcher, Quant Analyst, Editor + LangGraph orchestrator
-└── data/           # benchmarks.json (static GICS sector data)
+├── core/
+│   ├── llm.py               # Gemini client: retry + circuit breaker
+│   ├── state.py             # AgentState TypedDict (inner pipeline contract)
+│   ├── conversation_state.py # ConversationState TypedDict (chat layer)
+│   ├── cache.py             # diskcache 4-hour TTL
+│   ├── budget_tracker.py    # Free-tier API call counter
+│   ├── tracing.py           # run_trace.json builder + LangSmith
+│   ├── artifacts.py         # Full API/LLM response storage
+│   └── sanitizer.py         # Injection filter + canary token
+├── tools/                   # Five LangChain tools with Pydantic v2 schemas
+├── agents/
+│   ├── conversational_agent.py  # Top-level chat agent (intent router)
+│   ├── intent_classifier.py     # Flash-Lite intent + ticker extraction
+│   ├── researcher.py            # yfinance + Tavily; max 5 iter/ticker
+│   ├── quant_analyst.py         # CAGR, P/E vs benchmark, bull/bear
+│   ├── editor.py                # SOP rubric + grounding check
+│   └── orchestrator.py          # LangGraph pipeline + SQLite checkpoint
+└── data/
+    └── benchmarks.json      # Static GICS sector P/E averages
 ui/
-└── app.py          # Streamlit UI with streaming + dry-run
+├── chat_app.py              # Conversational chat UI (recommended)
+└── app.py                   # Classic form UI with dry-run replay
 tests/
-├── unit/           # Tool-level tests, mocked APIs
-├── integration/    # Per-agent tests, mocked LLM
-├── e2e/            # Full pipeline, VCR cassettes
-└── adversarial/    # Prompt injection payload tests
+├── unit/                    # Tool-level + classifier tests, mocked APIs
+├── integration/             # Per-agent + conversational agent tests
+├── e2e/                     # Full pipeline, VCR cassettes
+└── adversarial/             # Prompt injection payload tests
+debug_artifacts/             # Per-run trace + artifact JSON (gitignored)
 ```
 
 ---

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Autonomous AI Financial Analyst Agent built as a portfolio/prototype project. Uses a ReAct + Multi-Agent architecture with LangGraph. Produces structured, multi-page financial research reports from a stock ticker query with zero ongoing API cost.
+Conversational AI Financial Analyst Agent built as a portfolio/prototype project. Uses a ReAct + Multi-Agent architecture with LangGraph. Accepts natural language queries, classifies intent, and routes requests — running a structured multi-agent pipeline for stock analysis or answering general finance questions directly.
 
 **This is not a production system.** It is a hire-worthy portfolio showcase of agentic AI engineering patterns.
 
@@ -28,11 +28,14 @@ Note: LangSmith env vars changed in v0.8 — use `LANGSMITH_API_KEY` and `LANGSM
 ## Running the Project
 
 ```bash
-# Start the Streamlit UI
+# Conversational chat UI — Phase 1+ (recommended)
+streamlit run ui/chat_app.py
+
+# Classic single-turn form UI
 streamlit run ui/app.py
 
 # Demo replay without any API calls (for interviews)
-# Check "Dry-run mode" in the sidebar and upload a run_trace.json
+# In the classic UI: check "Dry-run mode" and upload a run_trace.json
 ```
 
 ---
@@ -49,20 +52,28 @@ pytest tests/e2e/           # full pipeline with pre-recorded mocked responses
 pytest --cov=ai_financial_analyst --cov-report=term-missing
 ```
 
-All four layers must pass before any feature is complete. Current status: **57/57** (unit + integration + adversarial).
+All four layers must pass before any feature is complete. Current status: **84/84** (unit + integration + adversarial).
 
 ---
 
 ## Architecture
 
-Three-agent LangGraph pipeline, sequential execution:
+Two-layer system: a conversational agent on top, the analysis pipeline below.
 
 ```
-User Query → Orchestrator → Researcher → Quant Analyst → Editor → Markdown Report
+User (natural language)
+    ↓
+ConversationalAgent  ← intent classifier (Flash-Lite)
+    ↓ financial_analysis          ↓ financial_question   ↓ off_topic
+Orchestrator                 Primary LLM             Rejection template
+    ↓
+Researcher → Quant Analyst → Editor → Markdown Report
 ```
 
-| Agent | File | Responsibilities |
+| Component | File | Responsibilities |
 |---|---|---|
+| ConversationalAgent | `agents/conversational_agent.py` | Intent routing, session state, LLM answers for general questions |
+| IntentClassifier | `agents/intent_classifier.py` | Flash-Lite JSON classifier + regex ticker fallback |
 | Researcher | `agents/researcher.py` | yfinance + Tavily fetch; max 5 iterations per ticker |
 | Quant Analyst | `agents/quant_analyst.py` | CAGR, P/E vs benchmark, SOP analysis, bull/bear cases |
 | Editor | `agents/editor.py` | SOP rubric check, grounding check, disclaimer enforced |
@@ -74,15 +85,18 @@ User Query → Orchestrator → Researcher → Quant Analyst → Editor → Mark
 
 | Path | Purpose |
 |---|---|
-| `ai_financial_analyst/core/state.py` | `AgentState` TypedDict — shared contract between all agents |
+| `ai_financial_analyst/core/conversation_state.py` | `ConversationState` TypedDict — chat layer state (separate from pipeline) |
+| `ai_financial_analyst/core/state.py` | `AgentState` TypedDict — inner pipeline contract |
 | `ai_financial_analyst/core/llm.py` | Gemini client with `tenacity` retry + circuit breaker |
 | `ai_financial_analyst/core/sanitizer.py` | Prompt injection filter (full-content rejection) + canary token |
 | `ai_financial_analyst/core/budget_tracker.py` | Free-tier API call counter; warns at 80% |
 | `ai_financial_analyst/core/cache.py` | `diskcache` 4-hour TTL for yfinance + Tavily results |
 | `ai_financial_analyst/core/tracing.py` | `run_trace.json` builder + LangSmith hooks |
+| `ai_financial_analyst/core/artifacts.py` | Full untruncated API/LLM response storage |
 | `ai_financial_analyst/tools/calculator.py` | AST-validated numexpr evaluator (no REPL) |
 | `ai_financial_analyst/data/benchmarks.json` | Static GICS sector P/E averages (no API call) |
-| `ui/app.py` | Streamlit UI with TAO stream, transparency panel, dry-run replay |
+| `ui/chat_app.py` | Conversational chat UI with live TAO stream |
+| `ui/app.py` | Classic form UI with dry-run replay |
 | `docs/AI_Financial_Analyst_Agent_PRD.docx` | Full product requirements document |
 
 ---
@@ -123,6 +137,12 @@ The Researcher agent hard-caps at 5 tool calls per ticker. Increasing this risks
 
 ### Tavily over DuckDuckGo
 Tavily is LangChain's default search tool, purpose-built for AI agents. `DuckDuckGoSearchRun` is a legacy tool. Google Custom Search API is closed to new signups in 2026. Do not revert.
+
+### ConversationState vs AgentState — Two Separate TypedDicts
+`ConversationState` (in `core/conversation_state.py`) is owned by the `ConversationalAgent` and holds chat-level state: messages, session ID, last intent, pending tickers. `AgentState` (in `core/state.py`) is owned by the inner Researcher → Quant → Editor pipeline. They must never be merged — the chat layer is a routing layer, not a pipeline participant. The `ConversationalAgent` calls `run_pipeline()` and receives back the final report; it never reads or writes `AgentState` directly.
+
+### Intent Classification Uses Sub-LLM (Flash-Lite)
+The intent classifier in `agents/intent_classifier.py` uses `get_subllm()` (Flash-Lite) rather than the primary LLM (Flash). This preserves the primary model's 15 RPM budget for actual analysis. The classifier is a cheap JSON extraction call — Flash-Lite is sufficient.
 
 ---
 

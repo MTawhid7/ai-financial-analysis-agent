@@ -151,6 +151,20 @@ def _partial_report(state: AgentState, failed_at: str) -> str:
     return "\n".join(lines)
 
 
+def run_pipeline_from_tool(
+    query: str,
+    tickers: list[str],
+    step_callback: Any | None = None,
+) -> tuple[AgentState, str, str]:
+    """Synchronous wrapper around run_pipeline for use inside LangChain @tool functions.
+
+    Calls asyncio.run(), so it must NOT be invoked from within an already-running
+    event loop. Use `await run_pipeline(...)` directly from async contexts instead.
+    """
+    import asyncio
+    return asyncio.run(run_pipeline(query=query, tickers=tickers, step_callback=step_callback))
+
+
 async def run_pipeline(
     query: str,
     tickers: list[str],
