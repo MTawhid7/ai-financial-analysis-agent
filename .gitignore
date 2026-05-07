@@ -45,6 +45,8 @@ run_trace_*.json
 run_artifacts_*.json
 debug_artifacts/
 errors.jsonl
+# Long-term memory SQLite database
+.memory/
 
 # === macOS ===
 .DS_Store

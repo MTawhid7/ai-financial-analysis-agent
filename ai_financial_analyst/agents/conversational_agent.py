@@ -3,7 +3,7 @@
 Sits above the Researcher → Quant → Editor pipeline and handles:
   - Intent classification (financial_analysis / financial_question / off_topic / clarification_needed)
   - Routing user messages to the appropriate handler
-  - Session-scoped budget tracking and LLM instances
+  - Session-scoped budget tracking, LLM instances, and memory
   - Propagation of step_callback to the inner pipeline for live UI updates
 
 The inner pipeline (run_pipeline) is treated as a black box; this agent
@@ -13,20 +13,21 @@ never touches AgentState directly.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Callable
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from ..core.budget_tracker import RequestBudgetTracker
 from ..core.conversation_state import (
     ConversationState,
     append_messages,
-    get_recent_context,
     new_session,
 )
 from ..core.llm import content_to_str, get_primary_llm_with_fallback, get_subllm
+from ..memory.long_term import LongTermMemory
+from ..memory.memory_manager import MemoryManager
+from ..memory.short_term import ShortTermMemory
 from .intent_classifier import IntentType, classify
 from .orchestrator import run_pipeline
 
@@ -34,7 +35,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = (
+_SYSTEM_PROMPT_BASE = (
     "You are an expert AI Financial Analyst. You help users understand stocks, "
     "investment concepts, financial metrics, and market dynamics. "
     "Be concise, accurate, and professional. "
@@ -62,13 +63,14 @@ class ConversationalAgent:
     """Session-scoped conversational agent wrapping the financial pipeline.
 
     Create one instance per chat session and keep it in session state.
-    The budget_tracker accumulates across the entire session.
+    The budget_tracker and memory accumulate across the entire session.
     """
 
     def __init__(self) -> None:
         self.budget = RequestBudgetTracker()
         self._primary_llm = get_primary_llm_with_fallback(budget_tracker=self.budget)
         self._subllm = get_subllm(budget_tracker=self.budget)
+        self._memory = MemoryManager(LongTermMemory(), subllm=self._subllm)
 
     async def process_message(
         self,
@@ -87,6 +89,18 @@ class ConversationalAgent:
         Returns:
             (response_text, new_conversation_state)
         """
+        # Build memory context for this turn (long-term preferences + relevant past analyses).
+        memory_ctx = await self._memory.build_memory_context(
+            messages=state.get("messages", []),
+            query=message,
+        )
+
+        # Extract any preferences the user just stated (best-effort, non-blocking on failure).
+        try:
+            await self._memory.maybe_extract_preferences(message)
+        except Exception as exc:
+            logger.debug("Preference extraction skipped: %s", exc)
+
         intent, tickers = await classify(message, self._subllm)
 
         if intent == "financial_analysis":
@@ -94,7 +108,7 @@ class ConversationalAgent:
                 message, tickers, state, step_callback
             )
         elif intent == "financial_question":
-            response = await self._handle_financial_question(message, state)
+            response = await self._handle_financial_question(message, state, memory_ctx)
         elif intent == "off_topic":
             response = _REJECTION_RESPONSE
         else:
@@ -152,6 +166,17 @@ class ConversationalAgent:
                 f"Errors: {errors}"
             )
 
+        # Persist a summary of this analysis for future memory context retrieval.
+        try:
+            await self._memory.maybe_save_analysis_summary(
+                session_id=state.get("session_id", ""),
+                tickers=tickers,
+                report_markdown=report,
+                run_id=final_state.get("run_id", ""),
+            )
+        except Exception as exc:
+            logger.debug("Analysis summary save skipped: %s", exc)
+
         header = f"Here is my analysis for **{ticker_str}**:\n\n"
         if status != "COMPLETE" and errors:
             header += (
@@ -165,18 +190,24 @@ class ConversationalAgent:
         self,
         message: str,
         state: ConversationState,
+        memory_ctx: str = "",
     ) -> str:
         """Answer a general financial question using the primary LLM."""
-        recent = get_recent_context(state, max_messages=6)
+        # Inject long-term memory context into system prompt when available.
+        system_content = _SYSTEM_PROMPT_BASE
+        if memory_ctx:
+            system_content = f"{_SYSTEM_PROMPT_BASE}\n\n---\n{memory_ctx}"
 
-        # Build message list for the LLM: system prompt + recent history + current question.
-        lc_messages: list[Any] = [SystemMessage(content=_SYSTEM_PROMPT)]
+        # Use token-aware windowing for conversation history.
+        recent = ShortTermMemory.get_windowed_messages(
+            state.get("messages", []), max_tokens=3000
+        )
+
+        lc_messages: list[Any] = [SystemMessage(content=system_content)]
         for msg in recent:
             if msg["role"] == "user":
                 lc_messages.append(HumanMessage(content=msg["content"]))
             elif msg["role"] == "assistant":
-                # LangChain expects AIMessage for assistant turns.
-                from langchain_core.messages import AIMessage
                 lc_messages.append(AIMessage(content=msg["content"]))
 
         lc_messages.append(HumanMessage(content=message))

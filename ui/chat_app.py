@@ -1,4 +1,4 @@
-"""Conversational chat UI — Phase 1 of the agent transformation.
+"""Conversational chat UI — Phase 1 + Phase 2 (memory system).
 
 Run with:
     streamlit run ui/chat_app.py
@@ -9,7 +9,6 @@ Keeps the original ui/app.py intact for dry-run replay and classic mode.
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from pathlib import Path
 
@@ -41,7 +40,7 @@ st.set_page_config(
 def _init_session() -> None:
     """Initialise all session-state keys exactly once per browser session."""
     if "messages" not in st.session_state:
-        st.session_state.messages = []  # display messages: [{"role", "content"}]
+        st.session_state.messages = []
 
     if "conv_state" not in st.session_state:
         from ai_financial_analyst.core.conversation_state import new_session
@@ -64,6 +63,16 @@ def _init_session() -> None:
 _init_session()
 
 # ------------------------------------------------------------------
+# Helper: run async from the synchronous Streamlit context
+# ------------------------------------------------------------------
+
+
+def _run_async(coro):
+    """Run an async coroutine from the synchronous Streamlit script context."""
+    return asyncio.run(coro)
+
+
+# ------------------------------------------------------------------
 # Sidebar
 # ------------------------------------------------------------------
 
@@ -72,7 +81,7 @@ with st.sidebar:
     st.caption("Conversational · Multi-Agent · Gemini Free Tier")
     st.divider()
 
-    # Session budget stats (updated from agent after each turn)
+    # --- Budget metrics ---
     budget_stats = st.session_state.agent.budget.get_stats()
     st.metric(
         "API Calls (session)",
@@ -83,16 +92,46 @@ with st.sidebar:
     if budget_stats.get("model_degraded"):
         st.warning(
             "⚠️ **Flash rate-limited** — switched to Flash-Lite. "
-            "Response quality may be reduced. Wait ~1 min for the primary model to recover.",
+            "Response quality may be reduced. Wait ~1 min for recovery.",
             icon="⚠️",
         )
 
     st.divider()
 
+    # --- Memory panel ---
+    st.subheader("🧠 Memory")
+
+    try:
+        prefs: dict = _run_async(st.session_state.agent._memory.get_preferences())
+        analysis_count: int = _run_async(st.session_state.agent._memory.count_analyses())
+    except Exception:
+        prefs = {}
+        analysis_count = 0
+
+    st.caption(f"Past analyses stored: **{analysis_count}**")
+
+    if prefs:
+        st.caption("Known preferences:")
+        for key, value in prefs.items():
+            st.markdown(f"- **{key}**: {value}")
+    else:
+        st.caption("No preferences stored yet. Try saying *\"I prefer conservative analysis\"*.")
+
+    if st.button("🗑️ Clear memory", use_container_width=True):
+        try:
+            _run_async(st.session_state.agent._memory.clear_all())
+            st.success("Memory cleared.")
+        except Exception as exc:
+            st.error(f"Could not clear memory: {exc}")
+        st.rerun()
+
+    st.divider()
+
+    # --- Settings ---
     debug_mode = st.checkbox(
         "Debug mode",
         value=st.session_state.debug_mode,
-        help="Show trace/artifacts download links and intermediate debug info.",
+        help="Show trace/artifacts download links after pipeline runs.",
     )
     st.session_state.debug_mode = debug_mode
 
@@ -131,10 +170,10 @@ with st.sidebar:
 st.title("AI Financial Analyst")
 st.caption(
     "Chat naturally. Ask for stock analysis, financial concepts, or calculations. "
-    "The agent decides which tools to use automatically."
+    "The agent uses memory to personalise responses across sessions."
 )
 
-# Render existing conversation history
+# Render existing conversation history.
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -170,12 +209,10 @@ if st.session_state.debug_mode:
 # ------------------------------------------------------------------
 
 if prompt := st.chat_input("Ask about stocks, financial concepts, or request analysis…"):
-    # Immediately display the user's message
     with st.chat_message("user"):
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # Display assistant response area with live TAO streaming
     with st.chat_message("assistant"):
         progress_placeholder = st.empty()
         response_placeholder = st.empty()
@@ -183,14 +220,12 @@ if prompt := st.chat_input("Ask about stocks, financial concepts, or request ana
         tao_lines: list[str] = []
 
         def _on_step(event: dict) -> None:
-            """Called by each agent after every tool invocation."""
             step = event.get("step", "?")
-            agent = event.get("agent", "?")
+            agent_name = event.get("agent", "?")
             tool = event.get("tool", "?")
             cache = " *(cached)*" if event.get("cache_hit") else ""
             icon = "✓" if event.get("ok", True) else "✗"
-            tao_lines.append(f"{icon} **[Step {step}]** `{agent}` → `{tool}`{cache}")
-            # Show last 20 steps in the progress placeholder
+            tao_lines.append(f"{icon} **[Step {step}]** `{agent_name}` → `{tool}`{cache}")
             progress_placeholder.markdown(
                 "**Running analysis…**\n\n" + "\n\n".join(tao_lines[-20:])
             )
@@ -216,19 +251,21 @@ if prompt := st.chat_input("Ask about stocks, financial concepts, or request ana
             progress_placeholder.empty()
             response_placeholder.markdown(response)
 
-            # Persist trace/artifacts paths for debug downloads
-            # (The orchestrator places them in debug_artifacts/)
             _debug_dir = Path("debug_artifacts")
-            trace_files = sorted(_debug_dir.glob("run_trace_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-            artifacts_files = sorted(_debug_dir.glob("run_artifacts_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if trace_files:
-                st.session_state.last_trace_path = str(trace_files[0])
-            if artifacts_files:
-                st.session_state.last_artifacts_path = str(artifacts_files[0])
+            if _debug_dir.exists():
+                trace_files = sorted(
+                    _debug_dir.glob("run_trace_*.json"),
+                    key=lambda p: p.stat().st_mtime, reverse=True,
+                )
+                artifacts_files = sorted(
+                    _debug_dir.glob("run_artifacts_*.json"),
+                    key=lambda p: p.stat().st_mtime, reverse=True,
+                )
+                if trace_files:
+                    st.session_state.last_trace_path = str(trace_files[0])
+                if artifacts_files:
+                    st.session_state.last_artifacts_path = str(artifacts_files[0])
 
-    # Update session state after successful turn
     st.session_state.messages.append({"role": "assistant", "content": response})
     st.session_state.conv_state = new_state
-
-    # Refresh budget metrics in sidebar without a full rerun
     st.rerun()
