@@ -106,6 +106,7 @@ cp .env.example .env
 
 ```bash
 # Conversational chat interface (recommended — Phase 1+)
+conda activate fin-agent
 streamlit run ui/chat_app.py
 
 # Classic single-turn form with dry-run replay
@@ -157,7 +158,7 @@ pytest -v
 | Tavily free tier: 1,000 searches/month | Occasional cache reliance | 4-hour diskcache reduces consumption |
 | Static benchmark data | Sector P/E averages are approximate 2024 values | Not live — use only for relative comparison |
 | Sequential execution | Each run takes 60–120s for 2–3 tickers | Required to stay within free-tier RPM cap |
-| Chat history not persisted across restarts | Conversation resets on server restart | Phase 2 adds SQLite-backed long-term memory |
+| No multi-user support yet | All data is local, single-user | Phase 4A adds Google Sign-In and per-user isolation |
 
 ---
 
@@ -166,18 +167,22 @@ pytest -v
 ```
 ai_financial_analyst/
 ├── core/
-│   ├── llm.py               # Gemini client: retry + circuit breaker
+│   ├── llm.py               # Gemini client: retry + circuit breaker + Flash-Lite fallback
 │   ├── state.py             # AgentState TypedDict (inner pipeline contract)
 │   ├── conversation_state.py # ConversationState TypedDict (chat layer)
 │   ├── cache.py             # diskcache 4-hour TTL
-│   ├── budget_tracker.py    # Free-tier API call counter
+│   ├── budget_tracker.py    # Free-tier API call counter + model degradation flag
 │   ├── tracing.py           # run_trace.json builder + LangSmith
 │   ├── artifacts.py         # Full API/LLM response storage
 │   └── sanitizer.py         # Injection filter + canary token
+├── memory/
+│   ├── long_term.py         # SQLite: preferences, summaries, conversations, messages
+│   ├── memory_manager.py    # Facade: context injection, preference extraction, summary saving
+│   └── short_term.py        # Token-budget context window (stateless)
 ├── tools/                   # Five LangChain tools with Pydantic v2 schemas
 ├── agents/
-│   ├── conversational_agent.py  # Top-level chat agent (intent router)
-│   ├── intent_classifier.py     # Flash-Lite intent + ticker extraction
+│   ├── conversational_agent.py  # Top-level chat agent (5-intent router + memory query)
+│   ├── intent_classifier.py     # Flash-Lite classifier; 5 intents incl. memory_query
 │   ├── researcher.py            # yfinance + Tavily; max 5 iter/ticker
 │   ├── quant_analyst.py         # CAGR, P/E vs benchmark, bull/bear
 │   ├── editor.py                # SOP rubric + grounding check

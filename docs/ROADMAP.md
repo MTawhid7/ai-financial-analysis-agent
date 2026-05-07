@@ -1,7 +1,7 @@
 # Roadmap: AI Financial Analyst → Conversational AI Agent
 
 **Last updated:** 2026-05-07  
-**Status:** Phase 2 complete — Phase 2.5 + Phase 4 (auth) next
+**Status:** Phase 2.5 complete — Phase 3 next
 
 ---
 
@@ -47,7 +47,7 @@ Capabilities not in the original request that significantly strengthen the produ
 |-------|------|--------|-----------|--------------|
 | **1** | Conversational Core | ✅ **Complete** | Medium | None |
 | **2** | Memory System | ✅ **Complete** | Medium | None |
-| **2.5** | Memory Bug Fix + Conversation Persistence | Planned | Low | None |
+| **2.5** | Memory Bug Fix + Conversation Persistence | ✅ **Complete** | Low | None |
 | **3** | Streaming + Intervention | Planned | High | None |
 | **4A** | FastAPI Backend + Google Auth | Planned | High | fastapi, uvicorn, google-auth, python-jose |
 | **4B** | React Frontend + Conversation UI | Planned | High | (frontend npm deps) |
@@ -410,6 +410,6 @@ These are the invariant files that every phase must leave intact and passing:
 | Baseline | 57 |
 | Phase 1 ✅ | **98** |
 | Phase 2 ✅ | **138** |
-| Phase 2.5 (target) | ~155 |
+| Phase 2.5 ✅ | **156** |
 | Phase 3 (target) | ~170 |
 | Phase 4 (target) | ~200+ |

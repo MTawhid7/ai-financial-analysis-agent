@@ -171,6 +171,73 @@ class TestRouting:
 
 
 # ---------------------------------------------------------------------------
+# Memory query routing
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryQueryRouting:
+    @pytest.mark.asyncio
+    async def test_memory_query_does_not_call_pipeline(self, agent):
+        """memory_query should return stored summaries, never invoke run_pipeline."""
+        state = new_session()
+        pipeline_called = []
+
+        async def _pipeline_spy(*a, **kw):
+            pipeline_called.append(True)
+            return ({}, "", "")
+
+        with (
+            patch(
+                "ai_financial_analyst.agents.conversational_agent.classify",
+                side_effect=_mock_classify("memory_query", ["AAPL"]),
+            ),
+            patch(
+                "ai_financial_analyst.agents.conversational_agent.run_pipeline",
+                _pipeline_spy,
+            ),
+        ):
+            response, new_state = await agent.process_message(
+                "What did we find about AAPL earlier?", state
+            )
+
+        assert not pipeline_called, "Pipeline must NOT be called for memory_query"
+        assert new_state["current_intent"] == "memory_query"
+
+    @pytest.mark.asyncio
+    async def test_memory_query_no_stored_summaries_returns_helpful_message(self, agent):
+        state = new_session()
+        # Mock _lt.search_summaries to return nothing
+        agent._memory._lt.search_summaries = AsyncMock(return_value=[])
+
+        with patch(
+            "ai_financial_analyst.agents.conversational_agent.classify",
+            side_effect=_mock_classify("memory_query", ["AAPL"]),
+        ):
+            response, _ = await agent.process_message(
+                "What did we find about AAPL earlier?", state
+            )
+
+        assert "don't have" in response.lower() or "stored" in response.lower()
+
+    @pytest.mark.asyncio
+    async def test_memory_query_with_stored_summary_returns_it(self, agent):
+        state = new_session()
+        agent._memory._lt.search_summaries = AsyncMock(return_value=[
+            {"tickers": "AAPL", "summary": "Apple had 17% CAGR, P/E 34x.", "created_at": 0}
+        ])
+
+        with patch(
+            "ai_financial_analyst.agents.conversational_agent.classify",
+            side_effect=_mock_classify("memory_query", ["AAPL"]),
+        ):
+            response, _ = await agent.process_message(
+                "What did we find about AAPL earlier?", state
+            )
+
+        assert "17% CAGR" in response or "AAPL" in response
+
+
+# ---------------------------------------------------------------------------
 # Financial question answering
 # ---------------------------------------------------------------------------
 

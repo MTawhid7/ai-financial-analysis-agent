@@ -1,7 +1,8 @@
 """ConversationalAgent — top-level multi-turn chat agent.
 
 Sits above the Researcher → Quant → Editor pipeline and handles:
-  - Intent classification (financial_analysis / financial_question / off_topic / clarification_needed)
+  - Intent classification (financial_analysis / financial_question / memory_query /
+    off_topic / clarification_needed)
   - Routing user messages to the appropriate handler
   - Session-scoped budget tracking, LLM instances, and memory
   - Propagation of step_callback to the inner pipeline for live UI updates
@@ -89,13 +90,11 @@ class ConversationalAgent:
         Returns:
             (response_text, new_conversation_state)
         """
-        # Build memory context for this turn (long-term preferences + relevant past analyses).
         memory_ctx = await self._memory.build_memory_context(
             messages=state.get("messages", []),
             query=message,
         )
 
-        # Extract any preferences the user just stated (best-effort, non-blocking on failure).
         try:
             await self._memory.maybe_extract_preferences(message)
         except Exception as exc:
@@ -107,6 +106,8 @@ class ConversationalAgent:
             response = await self._handle_financial_analysis(
                 message, tickers, state, step_callback
             )
+        elif intent == "memory_query":
+            response = await self._handle_memory_query(message, tickers)
         elif intent == "financial_question":
             response = await self._handle_financial_question(message, state, memory_ctx)
         elif intent == "off_topic":
@@ -122,6 +123,55 @@ class ConversationalAgent:
             tickers=tickers,
         )
         return response, new_state
+
+    async def _handle_memory_query(self, message: str, tickers: list[str]) -> str:
+        """Answer a question about past analyses from stored summaries.
+
+        Searches by ticker first (most precise), then falls back to keyword
+        search across summary text. If nothing is found, offers to run fresh analysis.
+        """
+        summaries: list[dict] = []
+
+        try:
+            if tickers:
+                seen_summaries: set[str] = set()
+                for ticker in tickers:
+                    results = await self._memory._lt.search_summaries(ticker, limit=2)
+                    for r in results:
+                        if r["summary"] not in seen_summaries:
+                            summaries.append(r)
+                            seen_summaries.add(r["summary"])
+
+            if not summaries:
+                summaries = await self._memory._lt.search_summaries(message, limit=3)
+        except Exception as exc:
+            logger.warning("Memory search failed: %s", exc)
+
+        if not summaries:
+            offer = ""
+            if tickers:
+                offer = (
+                    f"\n\nWould you like me to run a fresh analysis? "
+                    f"Try: *\"Analyse {', '.join(tickers)}\"*"
+                )
+            return (
+                "I don't have any stored analyses that match your question."
+                + offer
+            )
+
+        ticker_label = summaries[0]["tickers"]
+        lines = [f"Here's what I found from a previous analysis of **{ticker_label}**:\n"]
+        for s in summaries[:3]:
+            if s["tickers"] != ticker_label:
+                lines.append(f"**{s['tickers']}**: {s['summary']}")
+            else:
+                lines.append(s["summary"])
+
+        lines.append(
+            "\n---\n*This is from a stored past analysis. "
+            "Would you like me to run a fresh analysis to get the latest data?*"
+        )
+        return "\n\n".join(lines)
 
     async def _handle_financial_analysis(
         self,
@@ -166,7 +216,6 @@ class ConversationalAgent:
                 f"Errors: {errors}"
             )
 
-        # Persist a summary of this analysis for future memory context retrieval.
         try:
             await self._memory.maybe_save_analysis_summary(
                 session_id=state.get("session_id", ""),
@@ -193,12 +242,10 @@ class ConversationalAgent:
         memory_ctx: str = "",
     ) -> str:
         """Answer a general financial question using the primary LLM."""
-        # Inject long-term memory context into system prompt when available.
         system_content = _SYSTEM_PROMPT_BASE
         if memory_ctx:
             system_content = f"{_SYSTEM_PROMPT_BASE}\n\n---\n{memory_ctx}"
 
-        # Use token-aware windowing for conversation history.
         recent = ShortTermMemory.get_windowed_messages(
             state.get("messages", []), max_tokens=3000
         )

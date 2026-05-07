@@ -184,7 +184,7 @@ class MemoryManager:
             logger.warning("Could not save analysis summary: %s", exc)
 
     # ------------------------------------------------------------------
-    # UI accessors
+    # UI accessors — memory stats
     # ------------------------------------------------------------------
 
     async def get_preferences(self) -> dict[str, str]:
@@ -195,3 +195,36 @@ class MemoryManager:
 
     async def clear_all(self) -> None:
         await self._lt.delete_all()
+
+    # ------------------------------------------------------------------
+    # Conversation persistence (proxy methods for chat_app.py)
+    # ------------------------------------------------------------------
+
+    async def create_conversation(self, conversation_id: str, title: str) -> None:
+        await self._lt.save_conversation(conversation_id, title)
+
+    async def update_conversation_title(self, conversation_id: str, title: str) -> None:
+        await self._lt.update_conversation_title(conversation_id, title)
+
+    async def update_conversation_updated_at(self, conversation_id: str) -> None:
+        await self._lt.update_conversation_updated_at(conversation_id)
+
+    async def list_conversations(self, limit: int = 20) -> list[dict]:
+        return await self._lt.list_conversations(limit)
+
+    async def load_conversation(self, conversation_id: str) -> list[dict]:
+        """Return all messages for a conversation in chronological order."""
+        return await self._lt.get_conversation_messages(conversation_id)
+
+    async def save_message(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        intent: str = "",
+        tickers: str = "",
+    ) -> None:
+        await self._lt.save_message(conversation_id, role, content, intent, tickers)
+
+    async def delete_conversation(self, conversation_id: str) -> None:
+        await self._lt.delete_conversation(conversation_id)

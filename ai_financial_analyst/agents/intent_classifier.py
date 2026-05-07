@@ -1,12 +1,13 @@
 """Intent classifier for the conversational agent.
 
-Classifies each user message into one of four intents and extracts
+Classifies each user message into one of five intents and extracts
 any stock tickers mentioned. Uses Flash-Lite (sub-LLM) to preserve
 the primary-model budget.
 
 Intent taxonomy:
-  financial_analysis  — user wants analysis of one or more specific stocks
+  financial_analysis  — user wants a NEW analysis of one or more specific stocks
   financial_question  — general finance/investing question (no specific stock)
+  memory_query        — user wants to RECALL something from a previous interaction
   off_topic           — unrelated to finance or investing
   clarification_needed — too vague to act on; need more information
 """
@@ -20,22 +21,27 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-# Intent type alias used throughout the module.
 IntentType = Literal[
     "financial_analysis",
     "financial_question",
+    "memory_query",
     "off_topic",
     "clarification_needed",
 ]
 
 _VALID_INTENTS: frozenset[str] = frozenset(
-    ["financial_analysis", "financial_question", "off_topic", "clarification_needed"]
+    [
+        "financial_analysis",
+        "financial_question",
+        "memory_query",
+        "off_topic",
+        "clarification_needed",
+    ]
 )
 
 # Regex for potential stock tickers: 1-5 uppercase letters standing alone.
 _TICKER_RE = re.compile(r"\b([A-Z]{1,5})\b")
 
-# Common English ALL-CAPS words to exclude from ticker candidates.
 _EXCLUDED_CAPS = frozenset(
     [
         "I", "A", "AN", "THE", "AND", "OR", "BUT", "IN", "ON", "AT", "TO",
@@ -56,26 +62,31 @@ You are classifying a user message for an AI Financial Analyst assistant.
 Classify the message into exactly one intent and extract any stock tickers.
 
 INTENT DEFINITIONS:
-- "financial_analysis": user wants analysis of one or more specific stocks/companies
-  (even if the company name is spelled out, e.g. "Tell me about Apple" or "Is Tesla worth buying?")
-- "financial_question": general finance/investing question with no specific stock
+- "financial_analysis": user wants a NEW analysis or information about one or more specific stocks.
+  (e.g. "Analyse AAPL", "Is Tesla worth buying?", "Tell me about Microsoft", "How is NVDA doing?")
+- "financial_question": general finance/investing question with no specific stock to analyse.
   (e.g. "What is a P/E ratio?", "How does dollar-cost averaging work?")
-- "off_topic": unrelated to finance, investing, or economics
-  (e.g. "What's the weather?", "Write me a poem", "How do I cook pasta?")
-- "clarification_needed": too vague to determine what financial topic is meant
-  (e.g. "Tell me about that", "What do you think?", "Can you help me?")
+- "memory_query": user wants to RECALL something from a PREVIOUS conversation or past analysis
+  — they are asking about something already discussed, not requesting new analysis.
+  (e.g. "What did we find about AAPL earlier?", "Remind me what you said about Tesla",
+   "What was the P/E ratio we found last time?", "What did we discuss previously?",
+   "Do you remember our analysis of Microsoft?", "What did you find out about NVDA?")
+- "off_topic": unrelated to finance, investing, or economics.
+  (e.g. "What's the weather?", "Write me a poem")
+- "clarification_needed": too vague to determine what financial topic is meant.
+  (e.g. "Tell me about that", "What do you think?")
 
-RULES:
-1. If the user mentions a company name or stock symbol and seems to want information or analysis about it, use "financial_analysis".
-2. If asking for general financial education, use "financial_question".
-3. tickers: extract only the actual stock symbols or map company names to their ticker.
-   Examples: Apple→AAPL, Tesla→TSLA, Microsoft→MSFT, Amazon→AMZN, Google/Alphabet→GOOGL,
-   Meta→META, Netflix→NFLX, NVIDIA→NVDA, AMD→AMD, Intel→INTC.
-   If no specific stock is mentioned, return an empty list.
+CRITICAL RULES:
+1. If the message contains retrospective phrases — "earlier", "last time", "previously",
+   "what did we", "what did you", "what you found", "remind me", "do you remember",
+   "recall", "from before", "last session" — classify as "memory_query" EVEN IF a ticker is present.
+2. If the user clearly wants fresh analysis ("analyse X", "tell me about X", "is X a good buy"),
+   use "financial_analysis" regardless of whether X was discussed before.
+3. tickers: extract stock symbols even for memory_query (they help retrieve the right memory).
 4. Output ONLY the JSON object below. No explanation, no markdown.
 
 OUTPUT FORMAT:
-{{"intent": "<one of the four intents>", "tickers": ["TICK1", "TICK2"]}}
+{{"intent": "<one of the five intents>", "tickers": ["TICK1", "TICK2"]}}
 
 USER MESSAGE:
 {message}
@@ -84,10 +95,6 @@ USER MESSAGE:
 
 async def classify(message: str, subllm) -> tuple[IntentType, list[str]]:
     """Classify a user message and extract any mentioned tickers.
-
-    Args:
-        message: The raw user message.
-        subllm: Flash-Lite LLM instance (from get_subllm()).
 
     Returns:
         (intent, tickers) tuple. Never raises — falls back to
@@ -99,11 +106,9 @@ async def classify(message: str, subllm) -> tuple[IntentType, list[str]]:
         response = await subllm.ainvoke([HumanMessage(content=prompt)])
         raw = response.content if hasattr(response, "content") else str(response)
 
-        # Normalize content (handles google-genai list-of-blocks format)
         from ..core.llm import content_to_str
         raw = content_to_str(raw).strip()
 
-        # Strip markdown code fences if present
         if raw.startswith("```"):
             raw = raw.split("```", 2)[1]
             if raw.startswith("json"):
@@ -115,23 +120,22 @@ async def classify(message: str, subllm) -> tuple[IntentType, list[str]]:
         tickers = [t.upper().strip() for t in parsed.get("tickers", []) if t.strip()]
 
         if intent not in _VALID_INTENTS:
-            logger.warning("Unexpected intent from classifier: %r; defaulting to financial_question", intent)
+            logger.warning("Unexpected intent %r; defaulting to financial_question", intent)
             intent = "financial_question"
             tickers = []
 
-        # If intent is financial_analysis but no tickers extracted, try regex fallback.
-        if intent == "financial_analysis" and not tickers:
+        # Regex fallback for ticker extraction when the LLM missed them.
+        if intent in ("financial_analysis", "memory_query") and not tickers:
             tickers = _extract_tickers_regex(message)
 
-        logger.debug("Classified '%s...' → intent=%s tickers=%s", message[:60], intent, tickers)
+        logger.debug("Classified %r → intent=%s tickers=%s", message[:60], intent, tickers)
         return intent, tickers  # type: ignore[return-value]
 
     except Exception as exc:
-        logger.warning("Intent classification failed (%s); falling back to financial_question", exc)
+        logger.warning("Intent classification failed (%s); defaulting to financial_question", exc)
         return "financial_question", []
 
 
 def _extract_tickers_regex(message: str) -> list[str]:
     """Best-effort ticker extraction from ALL_CAPS tokens in the message."""
-    candidates = _TICKER_RE.findall(message)
-    return [t for t in candidates if t not in _EXCLUDED_CAPS]
+    return [t for t in _TICKER_RE.findall(message) if t not in _EXCLUDED_CAPS]

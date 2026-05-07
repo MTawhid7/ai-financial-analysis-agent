@@ -52,7 +52,7 @@ pytest tests/e2e/           # full pipeline with pre-recorded mocked responses
 pytest --cov=ai_financial_analyst --cov-report=term-missing
 ```
 
-All four layers must pass before any feature is complete. Current status: **84/84** (unit + integration + adversarial).
+All four layers must pass before any feature is complete. Current status: **156/156** (unit + integration + adversarial).
 
 ---
 
@@ -72,8 +72,8 @@ Researcher → Quant Analyst → Editor → Markdown Report
 
 | Component | File | Responsibilities |
 |---|---|---|
-| ConversationalAgent | `agents/conversational_agent.py` | Intent routing, session state, LLM answers for general questions |
-| IntentClassifier | `agents/intent_classifier.py` | Flash-Lite JSON classifier + regex ticker fallback |
+| ConversationalAgent | `agents/conversational_agent.py` | Intent routing, session state, LLM answers, memory query handler |
+| IntentClassifier | `agents/intent_classifier.py` | Flash-Lite JSON classifier; 5 intents including `memory_query` |
 | Researcher | `agents/researcher.py` | yfinance + Tavily fetch; max 5 iterations per ticker |
 | Quant Analyst | `agents/quant_analyst.py` | CAGR, P/E vs benchmark, SOP analysis, bull/bear cases |
 | Editor | `agents/editor.py` | SOP rubric check, grounding check, disclaimer enforced |
@@ -87,16 +87,19 @@ Researcher → Quant Analyst → Editor → Markdown Report
 |---|---|
 | `ai_financial_analyst/core/conversation_state.py` | `ConversationState` TypedDict — chat layer state (separate from pipeline) |
 | `ai_financial_analyst/core/state.py` | `AgentState` TypedDict — inner pipeline contract |
-| `ai_financial_analyst/core/llm.py` | Gemini client with `tenacity` retry + circuit breaker |
+| `ai_financial_analyst/core/llm.py` | Gemini client with `tenacity` retry + circuit breaker + Flash-Lite fallback |
 | `ai_financial_analyst/core/sanitizer.py` | Prompt injection filter (full-content rejection) + canary token |
-| `ai_financial_analyst/core/budget_tracker.py` | Free-tier API call counter; warns at 80% |
+| `ai_financial_analyst/core/budget_tracker.py` | Free-tier API call counter; warns at 80%; tracks model degradation |
 | `ai_financial_analyst/core/cache.py` | `diskcache` 4-hour TTL for yfinance + Tavily results |
 | `ai_financial_analyst/core/tracing.py` | `run_trace.json` builder + LangSmith hooks |
 | `ai_financial_analyst/core/artifacts.py` | Full untruncated API/LLM response storage |
+| `ai_financial_analyst/memory/long_term.py` | SQLite memory: preferences, analysis summaries, conversations, messages |
+| `ai_financial_analyst/memory/memory_manager.py` | Memory facade: context injection, preference extraction, summary saving |
 | `ai_financial_analyst/tools/calculator.py` | AST-validated numexpr evaluator (no REPL) |
 | `ai_financial_analyst/data/benchmarks.json` | Static GICS sector P/E averages (no API call) |
-| `ui/chat_app.py` | Conversational chat UI with live TAO stream |
+| `ui/chat_app.py` | Conversational chat UI: live TAO stream, conversation history, memory panel |
 | `ui/app.py` | Classic form UI with dry-run replay |
+| `docs/MEMORY_ARCHITECTURE.md` | Design doc: memory tiers, auth plan, DB schema, retrieval strategy |
 | `docs/AI_Financial_Analyst_Agent_PRD.docx` | Full product requirements document |
 
 ---
@@ -143,6 +146,9 @@ Tavily is LangChain's default search tool, purpose-built for AI agents. `DuckDuc
 
 ### Intent Classification Uses Sub-LLM (Flash-Lite)
 The intent classifier in `agents/intent_classifier.py` uses `get_subllm()` (Flash-Lite) rather than the primary LLM (Flash). This preserves the primary model's 15 RPM budget for actual analysis. The classifier is a cheap JSON extraction call — Flash-Lite is sufficient.
+
+### Five-Intent Taxonomy — `memory_query` Is Distinct From `financial_analysis`
+The classifier uses five intents: `financial_analysis`, `financial_question`, `memory_query`, `off_topic`, `clarification_needed`. `memory_query` is essential: without it, a message like "What did we find about AAPL earlier?" triggers the full pipeline because it contains a ticker. The classifier prompt includes explicit examples of retrospective phrases ("earlier", "last time", "what did we find") that force `memory_query` even when a ticker is present. Do not merge or remove this intent.
 
 ---
 

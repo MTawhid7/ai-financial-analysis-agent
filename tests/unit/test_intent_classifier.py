@@ -157,3 +157,27 @@ class TestClassify:
         intent, tickers = await classify("Tell me about TSLA today", llm)
         assert intent == "financial_analysis"
         assert "TSLA" in tickers
+
+    @pytest.mark.asyncio
+    async def test_memory_query_intent(self):
+        llm = _make_subllm("memory_query", ["AAPL"])
+        intent, tickers = await classify("What did we find about AAPL earlier?", llm)
+        assert intent == "memory_query"
+        assert "AAPL" in tickers
+
+    @pytest.mark.asyncio
+    async def test_memory_query_no_tickers(self):
+        llm = _make_subllm("memory_query", [])
+        intent, tickers = await classify("What did we discuss last time?", llm)
+        assert intent == "memory_query"
+
+    @pytest.mark.asyncio
+    async def test_memory_query_regex_fallback_for_tickers(self):
+        """memory_query with missing tickers should use regex fallback."""
+        llm = _make_subllm("memory_query", [])
+        intent, tickers = await classify("Remind me what you said about NVDA", llm)
+        assert intent == "memory_query"
+        assert "NVDA" in tickers
+
+    def test_valid_intents_includes_memory_query(self):
+        assert "memory_query" in _VALID_INTENTS
