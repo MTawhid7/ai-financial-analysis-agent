@@ -1,221 +1,166 @@
 # AI Financial Analyst Agent
 
-A **conversational AI financial analyst** built on the **ReAct + Multi-Agent** architecture using **LangGraph**, **Gemini free tier**, **yfinance**, and **Tavily**. Zero ongoing API cost.
+A **conversational AI financial analyst** with Google authentication, persistent memory, and real-time streaming. Built on a ReAct + Multi-Agent architecture using LangGraph, Gemini free tier, yfinance, and Tavily.
 
-Accepts natural language queries — no fixed ticker form. Autonomously classifies intent, routes requests, and runs a structured multi-agent pipeline to produce research-grade reports.
-
-> **Portfolio project** — demonstrates production-grade agentic AI engineering patterns. Not for real financial decisions.
+> **Portfolio project** — demonstrates production-grade agentic AI engineering. Not for real investment decisions.
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    User -->|natural language| CA["💬 ConversationalAgent\n(intent classifier + router)"]
-
-    CA -->|financial_analysis| Orchestrator
-    CA -->|financial_question| LLM["Primary LLM\n(direct answer)"]
-    CA -->|off_topic| Reject["Polite rejection"]
-
-    subgraph Pipeline ["LangGraph Pipeline (Sequential)"]
-        direction LR
-        R["🔍 Researcher\nAgent"]
-        Q["📐 Quant Analyst\nAgent"]
-        E["✏️ Editor\nAgent"]
-        R -->|AgentState| Q -->|AgentState| E
-    end
-
-    Orchestrator --> R
-
-    subgraph ResearcherTools ["Researcher Tools"]
-        YF["YahooFinanceTool\n(yfinance, free)"]
-        WS["WebSearchTool\n(Tavily + sanitizer)"]
-    end
-
-    subgraph QuantTools ["Quant Tools"]
-        CALC["CalculatorTool\n(constrained numexpr\n+ AST whitelist)"]
-        BL["BenchmarkLookupTool\n(static GICS JSON)"]
-    end
-
-    subgraph EditorTools ["Editor Tools"]
-        RW["ReportWriterTool\n(structured prompt chain)"]
-    end
-
-    R --> YF & WS
-    Q --> CALC & BL
-    E --> RW
-
-    E -->|Markdown report| CA -->|chat response| User
-    Orchestrator -->|SQLite checkpoint| DB[(SQLite)]
-    Orchestrator -->|run_trace.json + run_artifacts.json| Trace[📄 Debug Artifacts]
+```
+React 19 + Vite  →  FastAPI 0.115  →  ConversationalAgent  →  LangGraph Pipeline
+       │                   │                    │                        │
+  Google OAuth         JWT cookie           5-intent                Researcher
+  SSE streaming        DB migration         routing                 Quant Analyst
+  TanStack Query       user_id scope        memory                  Editor
 ```
 
----
+```mermaid
+flowchart LR
+    User -->|natural language| React["⚛️ React + Vite\n(port 5173)"]
+    React -->|Google OAuth| Google[Google]
+    React -->|REST + SSE| API["⚡ FastAPI\n(port 8000)"]
+    API --> CA["💬 ConversationalAgent\n(intent classifier)"]
 
-## Model Choices
+    CA -->|financial_analysis| Pipeline
+    CA -->|memory_query| Memory[("🧠 SQLite\nmemory.db")]
+    CA -->|financial_question| LLM["Gemini Flash\n(direct answer)"]
+    CA -->|off_topic| Reject["Polite rejection"]
 
-| Role | Model | Rationale |
-|------|-------|-----------|
-| Core ReAct reasoning | `gemini-3-flash-preview` | Best free-tier model for tool-calling accuracy and complex JSON output |
-| Sanitisation sub-tasks | `gemini-3.1-flash-lite-preview` | 2–3× faster than Flash; sufficient for structured extraction; conserves RPM quota |
+    subgraph Pipeline ["LangGraph Pipeline"]
+        R["🔍 Researcher"] --> Q["📐 Quant"] --> E["✏️ Editor"]
+    end
 
-> `gemini-2.0-flash` and `gemini-2.0-flash-lite` are deprecated and shut down June 1, 2026.
+    Pipeline --> Report["Markdown Report\n+ run_artifacts.json"]
+```
 
 ---
 
 ## Key Engineering Decisions
 
 ### No Python REPL
-The `CalculatorTool` uses `numexpr` with an **AST whitelist**, not a general-purpose REPL. Every LLM-generated expression is parsed with `ast.parse()` and validated against a strict whitelist of safe node types before evaluation. This prevents arbitrary code execution even in a local portfolio context.
+`CalculatorTool` uses `numexpr` with a three-level AST whitelist. Every expression is validated before evaluation. Prevents arbitrary code execution.
 
 ### Prompt Injection Mitigation
-All `WebSearchTool` output passes through a **sanitization filter** before reaching the agent:
-1. Tavily returns pre-summarised, structured results (no raw HTML) — significantly reducing the attack surface.
-2. Regex pre-filter strips known imperative injection patterns from every result field.
-
-A canary token in every system prompt detects if injected instructions reach agent output.
+All web search output passes through a two-layer sanitization filter: (1) regex strips known injection patterns, (2) full content blocks are rejected — not partially redacted. A canary token in every system prompt detects successful injection.
 
 ### Rate Limit Resilience
-Every Gemini API call is wrapped with `tenacity` exponential backoff + jitter (2s base, 60s max, 5 retries). A **circuit breaker** halts the pipeline after 3 consecutive 429s within 30 seconds, producing a partial report rather than burning quota in an infinite retry loop.
+`tenacity` exponential backoff + circuit breaker (halts after 3×429 in 30s). Automatic fallback from Gemini Flash to Flash-Lite on rate limit — analysis continues at reduced quality rather than failing.
 
-### Financial Data Hallucination Prevention
-The Editor agent runs a **grounding check**: every quantitative claim in the report must be traceable to a tool observation in the `iteration_log`. Ungrounded figures are tagged `[UNVERIFIED]` and removed.
+### Memory System
+SQLite at `.memory/memory.db`: per-user preferences (extracted by Flash-Lite from natural language), analysis summaries (generated after each pipeline run), full conversation history. Summaries are retrieved by LIKE search to inject relevant past context into the system prompt.
+
+### SSE Streaming
+`POST /chat/{conv_id}` starts the pipeline in a background asyncio task and returns an `event_id`. `GET /stream/{event_id}` opens an `EventSource` that emits tool-step events in real time, followed by the final response.
 
 ---
 
 ## Free-Tier Setup
 
 ### Prerequisites
-- Python 3.11+
-- A [Google AI Studio](https://aistudio.google.com/apikey) account (free `GOOGLE_API_KEY`)
-- A [Tavily](https://app.tavily.com/sign-in) account (free `TAVILY_API_KEY` — 1,000 searches/month)
-- A [LangSmith](https://smith.langchain.com) account (free `LANGSMITH_API_KEY`, for tracing)
+- Python 3.11+ · Node.js 18+
+- Google AI Studio account (free `GOOGLE_API_KEY`)
+- Google Cloud Console project with OAuth 2.0 Client ID
+- Tavily account (free `TAVILY_API_KEY` — 1,000 searches/month)
+- LangSmith account (free `LANGSMITH_API_KEY`)
 
 ### Installation
 
 ```bash
 git clone <this-repo>
 cd ai-financial-analyst
-pip install -e ".[dev]"
-cp .env.example .env
-# Edit .env: fill in GOOGLE_API_KEY, TAVILY_API_KEY, and LANGSMITH_API_KEY
+conda activate fin-agent          # or: python -m venv .venv && source .venv/bin/activate
+pip install -e ".[server]"
+cp .env.example .env              # fill in all 6 required variables
+cd frontend
+npm install
+cp .env.local.example .env.local  # add VITE_GOOGLE_CLIENT_ID
 ```
+
+### Google OAuth setup
+1. Go to [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials)
+2. Create OAuth 2.0 Client ID → Web application
+3. Authorised JavaScript origins: `http://localhost:5173`
+4. Copy Client ID → `.env` (`GOOGLE_CLIENT_ID`) and `frontend/.env.local` (`VITE_GOOGLE_CLIENT_ID`)
+5. Copy Client Secret → `.env` (`GOOGLE_CLIENT_SECRET`)
+6. Generate JWT secret: `python -c "import secrets; print(secrets.token_hex(32))"`  → `FASTAPI_JWT_SECRET`
 
 ### Run
 
 ```bash
-# Install Python deps (including FastAPI server)
-pip install -e ".[server]"
-
-# Terminal 1 — FastAPI backend
+# Terminal 1 — backend
 uvicorn backend.main:app --reload --port 8000
 
-# Terminal 2 — React frontend
-cd frontend && npm install && npm run dev
+# Terminal 2 — frontend
+cd frontend && npm run dev
 # Open http://localhost:5173
 ```
 
-Sign in with Google → start chatting. Say *"Analyse AAPL"* for a full pipeline run, or *"What is CAGR?"* for a direct answer. Past analyses are remembered across sessions.
-
-**Legacy Streamlit UI** (dry-run demos only):
-```bash
-streamlit run ui/app.py   # Classic form with dry-run replay
-```
-
-### Demo without API calls (dry-run)
-
-After a real run, download the `run_trace.json` from the chat or the classic UI. Then in the classic UI:
-
-1. Check the **Dry-run mode** checkbox in the sidebar
-2. Upload your `run_trace.json`
-
-The full Thought / Action / Observation stream replays with zero API calls — ideal for interview demos.
+Sign in with Google → start chatting. Say *"Analyse AAPL"* for a full pipeline run, or *"What did we find about AAPL?"* to recall a past analysis.
 
 ---
 
 ## Running Tests
 
 ```bash
-# Unit tests
-pytest tests/unit/ -v --cov=ai_financial_analyst --cov-report=term-missing
-
-# Integration tests
-pytest tests/integration/ -v
-
-# E2E tests (pre-recorded cassettes, zero live API quota)
-pytest tests/e2e/ -v
-
-# Adversarial / security tests
-pytest tests/adversarial/ -v
-
-# Full suite
-pytest -v
+pytest tests/unit/ tests/integration/ tests/adversarial/ -v
+cd frontend && npm run build      # zero TypeScript errors required
 ```
-
----
-
-## Known Limitations
-
-| Limitation | Impact | Notes |
-|-----------|--------|-------|
-| Gemini free tier: ~1,500 RPD, 15 RPM | Pipeline stalls on heavy usage | `RequestBudgetTracker` warns at 80% |
-| yfinance data lag | Prices may be 15 min delayed | `data_timestamp` field makes this explicit |
-| Tavily free tier: 1,000 searches/month | Occasional cache reliance | 4-hour diskcache reduces consumption |
-| Static benchmark data | Sector P/E averages are approximate 2024 values | Not live — use only for relative comparison |
-| Sequential execution | Each run takes 60–120s for 2–3 tickers | Required to stay within free-tier RPM cap |
-| No multi-user support yet | All data is local, single-user | Phase 4A adds Google Sign-In and per-user isolation |
 
 ---
 
 ## Project Structure
 
 ```
-ai_financial_analyst/
-├── core/
-│   ├── llm.py               # Gemini client: retry + circuit breaker + Flash-Lite fallback
-│   ├── state.py             # AgentState TypedDict (inner pipeline contract)
-│   ├── conversation_state.py # ConversationState TypedDict (chat layer)
-│   ├── cache.py             # diskcache 4-hour TTL
-│   ├── budget_tracker.py    # Free-tier API call counter + model degradation flag
-│   ├── tracing.py           # run_trace.json builder + LangSmith
-│   ├── artifacts.py         # Full API/LLM response storage
-│   └── sanitizer.py         # Injection filter + canary token
-├── memory/
-│   ├── long_term.py         # SQLite: preferences, summaries, conversations, messages
-│   ├── memory_manager.py    # Facade: context injection, preference extraction, summary saving
-│   └── short_term.py        # Token-budget context window (stateless)
-├── tools/                   # Five LangChain tools with Pydantic v2 schemas
-├── agents/
-│   ├── conversational_agent.py  # Top-level chat agent (5-intent router + memory query)
-│   ├── intent_classifier.py     # Flash-Lite classifier; 5 intents incl. memory_query
-│   ├── researcher.py            # yfinance + Tavily; max 5 iter/ticker
-│   ├── quant_analyst.py         # CAGR, P/E vs benchmark, bull/bear
-│   ├── editor.py                # SOP rubric + grounding check
-│   └── orchestrator.py          # LangGraph pipeline + SQLite checkpoint
-└── data/
-    └── benchmarks.json      # Static GICS sector P/E averages
-ui/
-├── chat_app.py              # Conversational chat UI (recommended)
-└── app.py                   # Classic form UI with dry-run replay
-tests/
-├── unit/                    # Tool-level + classifier tests, mocked APIs
-├── integration/             # Per-agent + conversational agent tests
-├── e2e/                     # Full pipeline, VCR cassettes
-└── adversarial/             # Prompt injection payload tests
-debug_artifacts/             # Per-run trace + artifact JSON (gitignored)
+ai_financial_analyst/          Python package (AI pipeline)
+  agents/                      ConversationalAgent, intent classifier, pipeline nodes
+  core/                        LLM client, state, cache, budget tracker, sanitizer
+  memory/                      SQLite memory (long-term, short-term, manager)
+  tools/                       Five LangChain tools (yahoo_finance, web_search, etc.)
+  data/benchmarks.json         Static GICS sector P/E averages
+
+backend/                       FastAPI application
+  main.py                      App, CORS, DB migration on startup
+  routers/                     auth, conversations, chat (SSE), memory
+  core/                        JWT auth, session manager, event store, DB
+
+frontend/                      React + Vite SPA
+  src/pages/                   LoginPage, ChatPage
+  src/components/              ChatInterface, ChatBubble, ConversationList, MemoryPanel
+  src/hooks/                   useAuth, useStreamingChat
+  src/lib/                     Typed API client, constants
+
+ui/                            Streamlit UIs (archived — dry-run replay only)
+tests/                         unit / integration / adversarial / e2e
+docs/ROADMAP.md                Implementation roadmap
 ```
 
 ---
 
-## Security Notes
+## Known Limitations
 
-- No secrets committed — all credentials via `.env` (`.env.example` provided)
-- No Python REPL anywhere in the codebase — constrained `numexpr` only
-- Prompt injection filter on all web-scraped content
-- Canary token detection in agent output
-- All tool inputs validated with `pydantic v2` `extra='forbid'`
+| Limitation | Notes |
+|---|---|
+| Gemini free tier: ~1,500 RPD, 15 RPM | Auto-fallback to Flash-Lite on rate limit |
+| yfinance data lag (~15 min) | `data_timestamp` field makes this explicit |
+| Tavily: 1,000 credits/month | 4-hour diskcache reduces consumption |
+| Static sector benchmarks | Approximate 2024 P/E averages — relative comparison only |
+| Sequential pipeline (~60–120s for 2–3 tickers) | Required to stay within free-tier RPM cap |
+| Single-process FastAPI sessions | Fine for local/demo; migrate to Redis for horizontal scaling |
 
 ---
 
-*DISCLAIMER: This project is for portfolio and educational purposes only. All generated reports are AI-produced and should not be used for real investment decisions. This is not financial advice.*
+## Security
+
+- No secrets committed — all credentials in `.env` (gitignored)
+- No Python REPL — constrained `numexpr` evaluator only
+- Prompt injection filter on all web search content
+- Canary token detection in agent output
+- All tool inputs validated with Pydantic v2 `extra='forbid'`
+- JWT in httpOnly cookie (not accessible to JavaScript)
+- Per-user data isolation via `user_id` scoping on all SQLite queries
+
+---
+
+*DISCLAIMER: Portfolio and educational purposes only. Generated reports should not be used for real investment decisions. This is not financial advice.*

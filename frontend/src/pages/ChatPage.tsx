@@ -49,7 +49,13 @@ export function ChatPage() {
           {/* User profile */}
           <div className="flex items-center gap-2 px-3 py-3 border-t border-zinc-800">
             {user?.picture_url ? (
-              <img src={user.picture_url} alt="" className="w-6 h-6 rounded-full" />
+              <img
+                src={user.picture_url}
+                alt=""
+                className="w-6 h-6 rounded-full"
+                onError={(e) => { e.currentTarget.style.display = "none"; }}
+                referrerPolicy="no-referrer"
+              />
             ) : (
               <div className="w-6 h-6 rounded-full bg-violet-600 flex items-center justify-center text-xs font-medium">
                 {user?.display_name?.[0] ?? "U"}

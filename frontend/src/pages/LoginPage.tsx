@@ -33,6 +33,9 @@ export function LoginPage() {
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 flex flex-col items-center gap-4 w-full max-w-sm">
         <p className="text-zinc-300 text-sm font-medium">Continue with</p>
+        {/* Explicit values for all optional props prevent the library from
+            serialising `undefined` into the button iframe URL, which causes
+            Google's server to return 403. */}
         <GoogleLogin
           onSuccess={handleSuccess}
           onError={() => alert("Google sign-in failed")}
@@ -40,6 +43,8 @@ export function LoginPage() {
           shape="pill"
           size="large"
           width="280"
+          text="signin_with"
+          logo_alignment="left"
         />
         <p className="text-zinc-500 text-xs text-center mt-2">
           Your data is stored locally. We don't share your information.

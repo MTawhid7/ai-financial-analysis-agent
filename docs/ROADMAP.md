@@ -1,415 +1,162 @@
-# Roadmap: AI Financial Analyst → Conversational AI Agent
+# Roadmap: AI Financial Analyst Agent
 
 **Last updated:** 2026-05-07  
-**Status:** Phase 4A + 4B complete — Phase 5 (Multimodal) next
+**Status:** Phase 4 complete — Phase 5 (Multimodal) next
 
 ---
 
-## Overview
+## Architecture
 
-This document is the authoritative implementation roadmap for transforming the AI Financial Analyst Agent from a single-turn, stateless pipeline into a full conversational AI agent comparable in experience to ChatGPT or Claude.
+```
+Browser (React 19 + Vite, port 5173)
+  ↕ @react-oauth/google — Google Sign-In popup
+  ↕ fetch() credentials:include — REST (JSON)
+  ↕ EventSource credentials:include — SSE streaming
+FastAPI 0.115 (port 8000, uvicorn)
+  ↕ session_manager: user_id → ConversationalAgent (LRU, 30-min TTL)
+ConversationalAgent  ← Flash-Lite intent classifier (5 intents)
+  ↓ financial_analysis      ↓ memory_query      ↓ financial_question   ↓ off_topic
+run_pipeline()        search summaries     primary LLM answer    rejection
+  ↓
+Researcher → Quant Analyst → Editor → Markdown report
+```
 
 **Guiding constraints:**
-- All existing infrastructure (circuit breaker, injection filter, budget tracker, caching, grounding check, test suite) is preserved and extended — never replaced.
-- The inner Researcher → Quant → Editor pipeline remains a black box to the chat layer.
-- Free-tier API limits (Gemini Flash: 15 RPM, 1,500 RPD) govern all sequencing decisions.
-- Every phase must leave the test suite fully green before the next begins.
-
----
-
-## Architecture Decision: Streamlit → FastAPI + React
-
-**Strategy: Streamlit for Phases 1–3, migrate to FastAPI + React in Phase 4.**
-
-Streamlit 1.45.1 supports `st.chat_message` / `st.chat_input` — sufficient for validating the conversational AI behaviour. It cannot, however, deliver the production-quality UX the roadmap requires: true SSE streaming, a file workspace sidebar, bidirectional UI updates, or full typography control. The migration happens once the AI logic is proven, not before.
-
----
-
-## Recommended Additions (Beyond Original Scope)
-
-Capabilities not in the original request that significantly strengthen the product:
-
-| # | Feature | Value |
-|---|---------|-------|
-| 1 | **Portfolio mode** | Analyse a weighted set of tickers as one portfolio (combined P/E, CAGR, diversification score) |
-| 2 | **Comparison mode** | Side-by-side table for "AAPL vs MSFT" — one compact report instead of two full runs |
-| 3 | **FRED macro context** | Federal Reserve Economic Data (free API) — inject interest rates, CPI into analysis |
-| 4 | **Excel export with live formulas** | CAGR formula in cells, not just pre-computed values |
-| 5 | **Provenance UI** | "Show Source" on every number → opens the exact tool call that produced it (already in `run_artifacts.json`) |
-| 6 | **Session authentication** | `DEMO_PASSWORD` env-var HTTP Basic Auth before Phase 4 deploys publicly |
-| 7 | **Watchlist + alerts** | Save tickers; background scheduler re-runs weekly and reports changes |
+- All existing Python infrastructure (circuit breaker, injection filter, budget tracker, caching, grounding check) is preserved and extended — never replaced.
+- The inner Researcher → Quant → Editor pipeline is a black box to the chat layer.
+- Free-tier Gemini limits (15 RPM, 1,500 RPD) govern all sequencing decisions.
+- Every phase must leave the test suite and `npm run build` fully green before the next begins.
 
 ---
 
 ## Phase Summary
 
-| Phase | Name | Status | Complexity | New Packages |
-|-------|------|--------|-----------|--------------|
-| **1** | Conversational Core | ✅ **Complete** | Medium | None |
-| **2** | Memory System | ✅ **Complete** | Medium | None |
-| **2.5** | Memory Bug Fix + Conversation Persistence | ✅ **Complete** | Low | None |
-| **3** | Streamlit Streaming + Intervention | ~~Dropped~~ — implemented in Phase 4B | — | — |
-| **4A** | FastAPI Backend + Google Auth | ✅ **Complete** | High | fastapi, uvicorn, google-auth, python-jose |
-| **4B** | React + Vite Frontend | ✅ **Complete** | High | react, vite, tanstack-router/query |
-| **5** | Multimodal | Planned | Medium-High | plotly, pandas, weasyprint, pdfplumber, python-docx, openpyxl |
-| **6** | Refinement + Comparison | Planned | Medium | None |
-| **7** | Polish + Provenance + Vector Memory | Planned | Medium | sentence-transformers |
-
-See [MEMORY_ARCHITECTURE.md](MEMORY_ARCHITECTURE.md) for the full design of Phases 2.5, 4A, 4B, and the vector memory strategy.
+| Phase | Name | Status | Key Deliverables |
+|-------|------|--------|-----------------|
+| **1** | Conversational Core | ✅ Complete | Chat UI, 5-intent routing, pipeline-as-tool |
+| **2** | Memory System | ✅ Complete | SQLite preferences + analysis summaries, memory-aware system prompt |
+| **2.5** | Memory Bug Fix + Conversation Persistence | ✅ Complete | `memory_query` intent, conversation history in SQLite, sidebar |
+| **3** | Streamlit Streaming | Dropped | Streaming implemented properly in Phase 4B |
+| **4A** | FastAPI Backend + Google Auth | ✅ Complete | Google OAuth, JWT httpOnly cookie, DB migration, SSE endpoint |
+| **4B** | React + Vite Frontend | ✅ Complete | Login page, chat interface, markdown rendering, SSE streaming, memory panel |
+| **5** | Multimodal | Planned | CSV/PDF upload, Plotly charts, PDF/Word/Excel export |
+| **6** | Refinement + Comparison | Planned | Result editing, AAPL vs MSFT side-by-side, feedback ratings |
+| **7** | Polish + Vector Memory | Planned | Typography system, provenance panel, sentence-transformers semantic search |
 
 ---
 
-## Phase 1 — Conversational Core ✅
+## Completed Phases
 
-**Delivered:** 2026-05-06 · Commit `14d426f`
+### Phase 1 — Conversational Core
+**Commit:** `14d426f`
 
-**Goal:** Accept free-form natural language. Classify intent. Route to appropriate handler. Reject off-topic requests politely.
+Five-intent routing (Flash-Lite classifier):
 
-### What was built
+| Intent | Handler |
+|--------|---------|
+| `financial_analysis` | Full Researcher → Quant → Editor pipeline |
+| `financial_question` | Primary LLM with conversation history context |
+| `memory_query` | Returns stored analysis summaries from SQLite |
+| `off_topic` | Polite rejection template (zero API cost) |
+| `clarification_needed` | Asks for more context |
 
-A `ConversationalAgent` that sits above the existing pipeline and handles all user messages before deciding whether to invoke the analysis pipeline at all.
+**New:** `core/conversation_state.py`, `agents/intent_classifier.py`, `agents/conversational_agent.py`, `ui/chat_app.py` (archived)
 
-**Intent taxonomy (classified by Flash-Lite):**
+---
 
-| Intent | Behaviour |
-|--------|-----------|
-| `financial_analysis` | Invokes Researcher → Quant → Editor pipeline; returns full report |
-| `financial_question` | Answered directly by primary LLM with conversation history context |
-| `off_topic` | Politely declined with no pipeline or LLM cost |
-| `clarification_needed` | Prompts the user for more information |
+### Phase 2 — Memory System
+**Commit:** `726475c`
 
-### New files
+- `LongTermMemory`: SQLite via aiosqlite — preferences + analysis summaries
+- `ShortTermMemory`: token-budget context window (3,000-token cap, no DB)
+- `MemoryManager`: `build_memory_context()` injects ≤500-token string into system prompt; `maybe_extract_preferences()` (regex-gated Flash-Lite); `maybe_save_analysis_summary()` (Flash-Lite) after each pipeline run
 
-| File | Description |
-|------|-------------|
-| `ai_financial_analyst/core/conversation_state.py` | `ConversationState` TypedDict (session_id, messages, intent, tickers). Kept entirely separate from `AgentState`. |
-| `ai_financial_analyst/agents/intent_classifier.py` | Flash-Lite JSON classifier with regex fallback for ticker extraction. Fails safely to `financial_question` on any error. |
-| `ai_financial_analyst/agents/conversational_agent.py` | `ConversationalAgent` — session-scoped, async `process_message()`. Passes `step_callback` through to the pipeline for live UI updates. |
-| `ui/chat_app.py` | Streamlit chat UI: `st.chat_input` + `st.chat_message`, live TAO stream, debug downloads in sidebar. |
-| `tests/unit/test_intent_classifier.py` | 10 unit tests covering intent routing, fallbacks, and JSON fence stripping. |
-| `tests/integration/test_conversational_agent.py` | 11 integration tests covering routing, state management, history injection, and error handling. |
+---
 
-### Modified files
+### Phase 2.5 — Memory Bug Fix + Conversation Persistence
+**Commit:** `0d900f0`
 
-| File | Change |
-|------|--------|
-| `ai_financial_analyst/agents/orchestrator.py` | Added `run_pipeline_from_tool()` sync wrapper for future `@tool` use in Phase 4. |
+**Bug fixed:** "What did we find about AAPL earlier?" was classified as `financial_analysis` (because AAPL is present) and re-ran the pipeline. Root cause: no `memory_query` intent existed. Fixed with a fifth intent and a dedicated handler that searches stored summaries.
 
-### Verification
+**Conversation persistence:** `conversations` + `messages` tables in SQLite. Every turn saved in real time. Auto-resumes the most recent conversation on app restart.
+
+---
+
+### Phase 4A — FastAPI Backend + Google Auth
+**Commit:** `d547316` (partial) · Bugs fixed in `8bcf2af` area
+
+- Google ID token validation (`google-auth`) → JWT signed with `FASTAPI_JWT_SECRET` → httpOnly `fin_session` cookie (30-day expiry)
+- DB migration on startup: adds `user_id` column to all tables backward-compatibly
+- `session_manager`: user-scoped `ConversationalAgent` LRU cache (30-min TTL)
+- SSE pattern: `POST /chat/{conv_id}` starts pipeline → returns `event_id` → `GET /stream/{event_id}` delivers tool-step events + final response via `EventSource`
+
+---
+
+### Phase 4B — React + Vite Frontend
+**Commit:** `d547316` (partial) · Post-deploy fixes in subsequent commits
+
+**Stack:** React 19 · Vite 6 · TypeScript · Tailwind CSS · TanStack Router/Query · `@react-oauth/google` · `react-markdown` + `remark-gfm`
+
+**Components:**
+- `LoginPage` — Google Sign-In button → POST /auth/google
+- `ChatInterface` — loads history on mount, manages streaming state
+- `ChatBubble` — user (violet) / assistant (with inline tool steps) / markdown-rendered reports
+- `ConversationList` — TanStack Query, delete-on-hover, time labels
+- `MemoryPanel` — collapsible; shows preferences + past analyses + clear button
+- `useStreamingChat` — POST → `EventSource` → `onStep`/`onComplete`/`onError`
+
+---
+
+## Running Locally
 
 ```bash
-streamlit run ui/chat_app.py
-# "Analyse AAPL"           → pipeline runs, full report rendered
-# "What is a P/E ratio?"   → direct LLM answer, no pipeline
-# "What's the weather?"    → polite rejection
-pytest tests/unit/ tests/integration/ tests/adversarial/ -v
-# → 84/84 passing
+# 1. Fill in .env (see .env.example for all required keys)
+conda activate fin-agent
+pip install -e ".[server]"
+
+# Terminal 1 — backend
+uvicorn backend.main:app --reload --port 8000
+
+# Terminal 2 — frontend
+cd frontend
+cp .env.local.example .env.local   # add VITE_GOOGLE_CLIENT_ID
+npm run dev
+# → http://localhost:5173
 ```
+
+**Required env vars:**
+
+| Variable | Purpose |
+|---|---|
+| `GOOGLE_API_KEY` | Gemini AI (aistudio.google.com) |
+| `GOOGLE_CLIENT_ID` | Google OAuth client ID |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
+| `FASTAPI_JWT_SECRET` | JWT signing — generate with `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `TAVILY_API_KEY` | Web search (app.tavily.com) |
+| `LANGSMITH_API_KEY` | Tracing (smith.langchain.com) |
 
 ---
 
-## Phase 2 — Memory System ✅
+## Test Count
 
-**Delivered:** 2026-05-07
-
-**Goal:** The agent remembers within a session and across sessions.
-
-### What was built
-
-**Short-term memory** (`memory/short_term.py`) — stateless utility that selects the most recent messages fitting a 3,000-token budget (estimated at `len // 4`). Used in `_handle_financial_question` to manage the LLM context window.
-
-**Long-term memory** (`memory/long_term.py`) — SQLite at `.memory/memory.db` (gitignored) using `aiosqlite` (already a dependency). Two tables:
-- `preferences(key, value, updated_at)` — user-stated preferences, upserted per key
-- `analysis_summaries(session_id, tickers, summary_text, run_id, created_at)` — one paragraph per completed pipeline run, retrieved by LIKE search
-
-**MemoryManager** (`memory/memory_manager.py`) — facade providing:
-- `build_memory_context(messages, query) → str` — ≤500-token string injected into the system prompt, combining known preferences and relevant past analyses
-- `maybe_extract_preferences(message)` — regex pre-filter (avoids LLM call on every message) + Flash-Lite extraction; only fires when explicit preference signals are detected
-- `maybe_save_analysis_summary(...)` — Flash-Lite one-paragraph summary saved after each pipeline run
-
-### New files
-
-| File | Description |
-|------|-------------|
-| `ai_financial_analyst/memory/__init__.py` | Module exports |
-| `ai_financial_analyst/memory/short_term.py` | `ShortTermMemory` — token-budget context window |
-| `ai_financial_analyst/memory/long_term.py` | `LongTermMemory` — SQLite preferences + summaries |
-| `ai_financial_analyst/memory/memory_manager.py` | `MemoryManager` facade + UI accessors |
-| `tests/unit/test_short_term_memory.py` | 7 unit tests |
-| `tests/unit/test_long_term_memory.py` | 14 unit tests |
-| `tests/unit/test_memory_manager.py` | 14 unit tests |
-
-### Modified files
-
-| File | Change |
-|------|--------|
-| `agents/conversational_agent.py` | Init `MemoryManager`; inject memory context into system prompt; save analysis summary after each pipeline run; use `ShortTermMemory` for context window |
-| `ui/chat_app.py` | Memory sidebar panel: preferences list, past analysis count, "Clear memory" button |
-| `.gitignore` | Added `.memory/` |
-
-### Verification
-
-```bash
-streamlit run ui/chat_app.py
-# "I prefer conservative analysis"             → sidebar shows investment_style: conservative
-# "Analyse AAPL"                               → analysis runs; summary saved to .memory/memory.db
-# "What did you find about AAPL last time?"    → agent surfaces stored summary in response
-# Click "Clear memory"                         → sidebar shows 0 analyses, no preferences
-pytest tests/unit/ tests/integration/ tests/adversarial/ -v
-# → 133/133 passing
-```
+| After Phase | Python Tests | Frontend |
+|-------------|-------------|---------|
+| Baseline | 57 | — |
+| Phase 1 ✅ | 98 | — |
+| Phase 2 ✅ | 138 | — |
+| Phase 2.5 ✅ | 156 | — |
+| Phase 4A + 4B ✅ | **156** | `npm run build` ✅ (zero TS errors) |
+| Phase 5 (target) | ~180 | — |
 
 ---
 
-## Phase 3 — Real-Time Streaming and User Intervention
+## Planned Phases
 
-**Goal:** Show tool calls inside chat bubbles as they happen. Allow the user to stop or redirect the pipeline mid-execution.
+### Phase 5 — Multimodal
+CSV/PDF upload → structured summary · Plotly charts from analysis data · PDF/Word/Excel export with live formulas. Key constraint: CSV is parsed to a fixed-schema JSON summary only (no arbitrary pandas operations — preserves the no-REPL invariant).
 
-### Architecture
+### Phase 6 — Refinement + Comparison
+Partial pipeline re-execution (Editor-only for structural edits, SOP-chain-only for numerical edits). Side-by-side "AAPL vs MSFT" comparison table. Thumbs-up/down feedback stored in SQLite.
 
-**`StreamBus`** — an `asyncio.Queue` the pipeline writes typed events to. Event types: `tool_start`, `tool_result`, `agent_transition`, `thinking`, `complete`, `error`. The UI consumes these via the `step_callback` hook that already exists in every agent.
-
-**`InterruptSignal`** — a mutable dataclass stored in `st.session_state`. Fields: `should_stop: bool`, `modification: str | None`. The pipeline reads it at every `step_callback` invocation. If `should_stop` is set, it raises `UserInterruptError`, which `_safe_node` catches and converts to a partial report.
-
-### New files
-
-| File | Description |
-|------|-------------|
-| `ai_financial_analyst/core/stream_bus.py` | `StreamBus` with typed event dataclasses |
-| `ai_financial_analyst/core/interrupt_signal.py` | `InterruptSignal` dataclass |
-
-### Modified files
-
-| File | Change |
-|------|--------|
-| `agents/orchestrator.py` | `_safe_node` checks `InterruptSignal.should_stop` after each node |
-| `agents/researcher.py`, `quant_analyst.py`, `editor.py` | Replace bare `step_callback` calls with `stream_bus.emit(ToolStartEvent / ToolResultEvent)` |
-| `ui/chat_app.py` | Render `StreamBus` events inline in chat bubbles via `st.empty()` placeholders; "Stop Analysis" button; LLM reasoning in collapsible `st.expander` (hidden by default) |
-
-### Key technical constraint
-
-Streamlit's full-rerun model requires careful use of `st.empty()` with `with` blocks persisted via `session_state`. The `step_callback` is called synchronously from within `asyncio.run()`, so `st.empty()` updates render in real time without a WebSocket.
-
-### Verification
-
-```
-"Analyse AAPL" → tool calls appear step-by-step inside the chat bubble
-Click "Stop Analysis" mid-run → partial report within 3 seconds, no crash
-```
-
----
-
-## Phase 4 — Task Planning, Clarification + FastAPI/React Migration
-
-### Part A — Task Planning and Self-Correction
-
-**Goal:** For complex or ambiguous queries, show a plan and ask for confirmation. Ask one clarifying question at a time. Retry partial failures before halting.
-
-**`PlannerAgent`** (`agents/planner.py`) — produces a `TaskPlan` Pydantic model:
-
-```python
-class TaskPlan(BaseModel):
-    steps: list[PlanStep]
-    estimated_api_calls: int
-    clarifications_needed: list[str]
-```
-
-Uses Flash-Lite (budget-preserving). Pre-checks: if `estimated_api_calls > remaining_budget * 0.5`, warns the user before starting.
-
-**Planning gate** in `ConversationalAgent`:
-- Simple query (single ticker, clear intent) → skip to execution
-- Complex query (3+ tickers, ambiguous, multi-intent) → generate plan → display → await confirmation
-
-**`ClarificationHandler`** (`agents/clarification_handler.py`) — asks one question at a time, stores the pending plan in `ConversationState`.
-
-**`_safe_node` improvement** — on `PartialStateError`, attempts one retry with reduced `max_iterations=3` before halting.
-
----
-
-### Part B — FastAPI + React Migration
-
-**Backend structure:**
-
-```
-backend/
-  main.py
-  routers/
-    chat.py          POST /chat, SSE /stream/{session_id}
-    files.py         GET/POST/DELETE /files + version history
-    memory.py        GET/DELETE /memory, PATCH /memory/preferences
-    feedback.py      POST /feedback
-  core/
-    session_manager.py   LRU cache of ConversationalAgent instances (30-min TTL)
-```
-
-**Frontend structure:**
-
-```
-frontend/
-  src/components/
-    ChatInterface.tsx
-    ChatBubble.tsx           user / assistant / tool-call variants
-    ToolCallBubble.tsx       streaming tool events
-    PlanConfirmation.tsx     numbered checklist + Proceed/Modify buttons
-    WorkspaceSidebar.tsx     file browser with rename/delete/download/versions
-    MemoryPanel.tsx
-  src/styles/
-    design_tokens.css        Inter font, tabular-nums, dark/light mode
-```
-
-**Key decisions:**
-- **SSE, not WebSocket** — unidirectional server-to-client stream; simpler and sufficient for tool event streaming
-- **Legacy entrypoints preserved** — `ui/app.py` and `ui/chat_app.py` continue to work; zero test regression
-- **Single-process sessions** — `session_manager.py` LRU cache; fine for personal/demo use
-- **`DEMO_PASSWORD` auth** — env-var HTTP Basic Auth added before any public deploy
-
-**New packages:** `fastapi>=0.115`, `uvicorn[standard]>=0.30`, `python-multipart>=0.0.9`
-
-### Verification
-
-```bash
-uvicorn backend.main:app --reload
-npm run dev   # frontend
-# Chat input → FastAPI → SSE → tool events stream to browser in real time
-# Task plan displayed for multi-ticker queries
-# Workspace file list shows created reports
-```
-
----
-
-## Phase 5 — Multimodal: File Upload, Charts, Export
-
-**Goal:** Accept user-provided files (CSV, PDF). Generate interactive Plotly charts. Export reports to PDF, Word, and Excel.
-
-### New tools
-
-| Tool | Description |
-|------|-------------|
-| `tools/file_parser.py` | CSV → fixed-schema pandas summary JSON; PDF → pdfplumber text → Flash-Lite summary. Formula injection check on CSV cell values (`=`, `+HYPERLINK`). |
-| `tools/chart_generator.py` | Returns serialised Plotly JSON (client renders interactively). Types: `price_history`, `pe_comparison`, `metric_bar`. No image generation — preserves the no-REPL security model. |
-| `tools/pdf_exporter.py` | Markdown → HTML (markdown-it-py) → PDF (weasyprint). Saves to workspace. |
-| `tools/docx_exporter.py` | Markdown → Word (python-docx) with proper heading styles. |
-| `tools/xlsx_exporter.py` | `raw_data` + `analysis` → structured Excel workbook. CAGR formula written as a live cell formula, not a pre-computed value. |
-
-**New packages:** `pdfplumber>=0.11`, `weasyprint>=62.0`, `plotly>=5.24`, `pandas>=2.2`, `markdown-it-py>=3.0`, `python-docx>=1.1`, `openpyxl>=3.1`
-
-**Security note:** CSV data is never exposed to arbitrary pandas operations. The file parser produces only a fixed-schema JSON summary — the "no Python REPL" invariant is preserved.
-
-### Verification
-
-```
-Upload a CSV                            → agent acknowledges columns and shape
-"Show AAPL price history as a chart"   → Plotly chart rendered inline in chat
-"Export as PDF"                         → PDF downloads from workspace
-```
-
----
-
-## Phase 6 — Iterative Refinement, Comparison Mode, and Feedback
-
-**Goal:** Allow users to refine results. Add comparison mode. Collect thumbs-up/down ratings.
-
-### Refinement handler (`agents/refinement_handler.py`)
-
-Detects "modify the previous result" intent and routes to the minimum necessary re-execution:
-- Structural modification (*"add a risks section"*) → re-run Editor node only
-- Numerical modification (*"assume 15% revenue growth"*) → re-run calculator + SOP chain only
-
-Saves the previous version as `report_v{n}.md` in the workspace before overwriting.
-
-### Comparison agent (`agents/comparison_agent.py`)
-
-*"AAPL vs MSFT"* → runs the pipeline per ticker, then generates a compact side-by-side comparison table (P/E, CAGR, sector premium, bull/bear). Returns one comparison report instead of two full reports.
-
-### Feedback store (`memory/feedback_store.py`)
-
-SQLite table: `feedback(message_id, session_id, rating, flag_reason, timestamp)`. The `MemoryManager` surfaces recent ratings to calibrate response verbosity.
-
-**UI change:** 👍/👎 and "Flag" buttons added to each `ChatBubble`.
-
-### Key technical challenge
-
-Partial pipeline re-execution — calling only the Editor node or only the SOP LLM chain — requires exposing those sub-steps as independently callable units without breaking the full pipeline flow.
-
-### Verification
-
-```
-"Make the bear case more pessimistic"   → editor re-runs, report_v2.md saved in workspace
-"Compare AAPL vs MSFT"                  → side-by-side comparison table rendered
-👍 on a response                         → rating written to feedback.db
-```
-
----
-
-## Phase 7 — UI Polish, Provenance, and Hardening
-
-**Goal:** Final visual pass. Surface the existing provenance data (already captured in `run_artifacts.json`) in the UI. Error boundaries. Keyboard shortcuts.
-
-### Design system
-
-- **Fonts:** Inter (body text) + JetBrains Mono (all numbers/code)
-- **Tabular figures:** CSS `font-variant-numeric: tabular-nums` on every number column so financial tables align correctly
-- **Themes:** `prefers-color-scheme` dark/light mode via CSS custom properties in `design_tokens.css`
-
-### Provenance panel
-
-Every number in the report gets a "Show Source" button. Clicking it opens a side panel that shows the exact tool call from `run_artifacts.json` that produced that figure — making the AI's reasoning auditable without leaving the chat. This data is already collected; Phase 7 surfaces it.
-
-### Memory management UI (`MemoryPanel.tsx`)
-
-- Past analyses table with per-row delete and export
-- Preferences editor: displays stored preferences in natural language ("You told me: I prefer conservative picks"), not raw JSON
-- "Clear All Memory" button with a confirmation modal
-
-### Error boundaries
-
-- React `ErrorBoundary` components catch rendering errors and show a fallback UI instead of a blank screen
-- FastAPI returns structured errors: `{"error_type": ..., "detail": ..., "suggestion": ...}` — the `suggestion` field gives the user actionable guidance (e.g., *"Gemini rate limit hit — wait 60 seconds and retry"*)
-
-### Keyboard shortcuts
-
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl+K` | Focus chat input |
-| `Ctrl+/` | Toggle memory panel |
-| `Esc` | Stop analysis |
-
-### Export menu (`ExportMenu.tsx`)
-
-Download report as: Markdown (existing) · PDF · Word · Excel (with live formulas)
-
-### Verification
-
-```
-Every number in the report → "Show Source" button present and functional
-Memory panel → preferences shown as natural language sentences
-Dark mode → app renders correctly via prefers-color-scheme
-All keyboard shortcuts functional
-Error boundary → renders fallback on component crash, no blank screen
-```
-
----
-
-## Files That Must Never Break
-
-These are the invariant files that every phase must leave intact and passing:
-
-| File | Why |
-|------|-----|
-| `ai_financial_analyst/core/sanitizer.py` | Injection filter + canary token — security baseline |
-| `ai_financial_analyst/core/llm.py` | Circuit breaker + budget callback — rate limit resilience |
-| `ai_financial_analyst/core/state.py` | `AgentState` contract — changing this breaks all three pipeline agents |
-| `tests/` | All tests must remain green after every phase |
-
----
-
-## Test Count by Phase
-
-| After Phase | Tests |
-|-------------|-------|
-| Baseline | 57 |
-| Phase 1 ✅ | **98** |
-| Phase 2 ✅ | **138** |
-| Phase 2.5 ✅ | **156** |
-| Phase 4A + 4B ✅ | **156** (Python suite; frontend covered by type-checking + build) |
-| Phase 5 (target) | ~180 |
+### Phase 7 — Polish + Vector Memory
+Typography system (Inter body, JetBrains Mono numbers). "Show Source" provenance button on every number in the report (data already in `run_artifacts.json`). Upgrade memory retrieval from LIKE search to `sentence-transformers` vector similarity when `count_summaries() > 200`.

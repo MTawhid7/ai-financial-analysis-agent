@@ -2,88 +2,104 @@
 
 ## Project Overview
 
-Conversational AI Financial Analyst Agent built as a portfolio/prototype project. Uses a ReAct + Multi-Agent architecture with LangGraph. Accepts natural language queries, classifies intent, and routes requests — running a structured multi-agent pipeline for stock analysis or answering general finance questions directly.
+Conversational AI Financial Analyst Agent. Uses a ReAct + Multi-Agent architecture with LangGraph. Natural language input, Google OAuth authentication, per-user persistent memory, and real-time SSE streaming through a FastAPI + React stack.
 
-**This is not a production system.** It is a hire-worthy portfolio showcase of agentic AI engineering patterns.
+**This is not a production system.** Portfolio showcase of agentic AI engineering patterns.
 
 ---
 
 ## Environment Setup
 
 ```bash
-conda activate fin-agent        # always activate before working
-pip install -e ".[dev]"         # installs project + dev tools editable
-cp .env.example .env            # then fill in the 3 API keys
+conda activate fin-agent
+pip install -e ".[server]"   # AI + FastAPI server deps
+cp .env.example .env         # fill in all required keys (see below)
 ```
 
-### Required API Keys (all free tier)
-- `GOOGLE_API_KEY` — [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
-- `TAVILY_API_KEY` — [app.tavily.com/sign-in](https://app.tavily.com/sign-in) (1,000 free searches/month)
-- `LANGSMITH_API_KEY` — [smith.langchain.com](https://smith.langchain.com)
+### Required API Keys
 
-Note: LangSmith env vars changed in v0.8 — use `LANGSMITH_API_KEY` and `LANGSMITH_TRACING=true`, not the old `LANGCHAIN_*` names.
+| Variable | Service | Where to get |
+|---|---|---|
+| `GOOGLE_API_KEY` | Gemini AI | aistudio.google.com/apikey |
+| `GOOGLE_CLIENT_ID` | Google OAuth | console.cloud.google.com/apis/credentials |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth | same as above |
+| `FASTAPI_JWT_SECRET` | JWT signing | `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `TAVILY_API_KEY` | Web search | app.tavily.com |
+| `LANGSMITH_API_KEY` | Tracing | smith.langchain.com |
+
+Note: LangSmith vars changed in v0.8 — use `LANGSMITH_API_KEY` + `LANGSMITH_TRACING=true`.
 
 ---
 
 ## Running the Project
 
 ```bash
-# Production UI (FastAPI + React) — recommended
-pip install -e ".[server]"
-uvicorn backend.main:app --reload --port 8000   # Terminal 1
-cd frontend && npm run dev                       # Terminal 2
-# Open http://localhost:5173
+# Terminal 1 — FastAPI backend
+conda activate fin-agent
+uvicorn backend.main:app --reload --port 8000
 
-# Legacy Streamlit UI (dry-run demos only — archived)
-streamlit run ui/app.py
+# Terminal 2 — React frontend
+cd frontend
+cp .env.local.example .env.local   # add VITE_GOOGLE_CLIENT_ID
+npm run dev
+# Open http://localhost:5173
 ```
 
-Add `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `FASTAPI_JWT_SECRET` to `.env`.
-See `.env.example` for all required variables.
+Google OAuth setup: create an OAuth 2.0 Client (Web application) in Google Cloud Console with Authorised JavaScript origin `http://localhost:5173`.
+
+Legacy Streamlit UI (dry-run demos only):
+```bash
+streamlit run ui/app.py
+```
 
 ---
 
 ## Running Tests
 
 ```bash
-pytest tests/unit/          # fast, no API calls — always run these first
+pytest tests/unit/          # fast, no API calls — run first
 pytest tests/integration/   # agent logic with mocked LLM/tools
 pytest tests/adversarial/   # security: prompt injection payload detection
-pytest tests/e2e/           # full pipeline with pre-recorded mocked responses
 
-# Full suite with coverage
+# Full Python suite with coverage
 pytest --cov=ai_financial_analyst --cov-report=term-missing
+
+# Frontend build check (must pass with zero TS errors)
+cd frontend && npm run build
 ```
 
-All four layers must pass before any feature is complete. Current status: **156/156** (unit + integration + adversarial). Frontend: `npm run build` in `frontend/` must pass (zero TypeScript errors).
+Current status: **156/156** Python tests passing + frontend build clean.
 
 ---
 
 ## Architecture
 
-Three-layer system: React + Vite frontend → FastAPI backend → Python AI pipeline.
-
 ```
-React + Vite (port 5173)
-    ↕ Google OAuth (@react-oauth/google)
-    ↕ REST + SSE (httpOnly JWT cookie)
-FastAPI backend (port 8000)
-    ↕ session_manager: user_id → ConversationalAgent
-ConversationalAgent  ← intent classifier (Flash-Lite)
-    ↓ financial_analysis          ↓ financial_question   ↓ off_topic / memory_query
-Orchestrator                 Primary LLM             Direct response
-    ↓
-Researcher → Quant Analyst → Editor → Markdown Report
+React 19 + Vite (port 5173)
+  ↕ Google OAuth popup (@react-oauth/google)
+  ↕ fetch credentials:include — REST
+  ↕ EventSource credentials:include — SSE
+FastAPI 0.115 (port 8000)
+  ↕ session_manager: user_id → ConversationalAgent (LRU, 30-min TTL)
+ConversationalAgent  ← Flash-Lite intent classifier (5 intents)
+  ↓ financial_analysis    ↓ memory_query    ↓ financial_question    ↓ off_topic
+run_pipeline()       search summaries    primary LLM + history   rejection
+  ↓
+Researcher → Quant Analyst → Editor → Markdown report
 ```
 
 | Component | File | Responsibilities |
 |---|---|---|
-| ConversationalAgent | `agents/conversational_agent.py` | Intent routing, session state, LLM answers, memory query handler |
-| IntentClassifier | `agents/intent_classifier.py` | Flash-Lite JSON classifier; 5 intents including `memory_query` |
-| Researcher | `agents/researcher.py` | yfinance + Tavily fetch; max 5 iterations per ticker |
-| Quant Analyst | `agents/quant_analyst.py` | CAGR, P/E vs benchmark, SOP analysis, bull/bear cases |
-| Editor | `agents/editor.py` | SOP rubric check, grounding check, disclaimer enforced |
-| Orchestrator | `agents/orchestrator.py` | LangGraph StateGraph, SQLite checkpointing, safe wrappers |
+| FastAPI app | `backend/main.py` | CORS, lifespan DB migration, router registration |
+| Auth | `backend/routers/auth.py` | Google ID token → JWT httpOnly cookie |
+| Chat + SSE | `backend/routers/chat.py` | POST /chat → event_id; GET /stream → EventSource |
+| Session manager | `backend/core/session_manager.py` | user_id → ConversationalAgent LRU cache |
+| ConversationalAgent | `agents/conversational_agent.py` | Routing, memory injection, pipeline calls |
+| IntentClassifier | `agents/intent_classifier.py` | Flash-Lite JSON classifier; 5 intents |
+| Researcher | `agents/researcher.py` | yfinance + Tavily; max 5 iterations/ticker |
+| Quant Analyst | `agents/quant_analyst.py` | CAGR, P/E vs benchmark, bull/bear cases |
+| Editor | `agents/editor.py` | SOP rubric, grounding check, disclaimer |
+| Orchestrator | `agents/orchestrator.py` | LangGraph StateGraph + SQLite checkpointing |
 
 ---
 
@@ -91,84 +107,64 @@ Researcher → Quant Analyst → Editor → Markdown Report
 
 | Path | Purpose |
 |---|---|
-| `ai_financial_analyst/core/conversation_state.py` | `ConversationState` TypedDict — chat layer state (separate from pipeline) |
+| `backend/main.py` | FastAPI entry point |
+| `backend/core/database.py` | Idempotent schema migration (runs on startup) |
+| `backend/core/auth.py` | JWT + Google ID token validation |
+| `backend/core/event_store.py` | event_id → asyncio.Queue registry for SSE |
+| `frontend/src/hooks/useStreamingChat.ts` | POST /chat → EventSource /stream |
+| `frontend/src/lib/api.ts` | Typed fetch wrappers for all FastAPI endpoints |
 | `ai_financial_analyst/core/state.py` | `AgentState` TypedDict — inner pipeline contract |
-| `ai_financial_analyst/core/llm.py` | Gemini client with `tenacity` retry + circuit breaker + Flash-Lite fallback |
-| `ai_financial_analyst/core/sanitizer.py` | Prompt injection filter (full-content rejection) + canary token |
-| `ai_financial_analyst/core/budget_tracker.py` | Free-tier API call counter; warns at 80%; tracks model degradation |
-| `ai_financial_analyst/core/cache.py` | `diskcache` 4-hour TTL for yfinance + Tavily results |
-| `ai_financial_analyst/core/tracing.py` | `run_trace.json` builder + LangSmith hooks |
-| `ai_financial_analyst/core/artifacts.py` | Full untruncated API/LLM response storage |
-| `ai_financial_analyst/memory/long_term.py` | SQLite memory: preferences, analysis summaries, conversations, messages |
+| `ai_financial_analyst/core/conversation_state.py` | `ConversationState` TypedDict — chat layer |
+| `ai_financial_analyst/core/llm.py` | Gemini client: retry + circuit breaker + Flash-Lite fallback |
+| `ai_financial_analyst/core/sanitizer.py` | Injection filter (full-content rejection) + canary token |
+| `ai_financial_analyst/memory/long_term.py` | SQLite: preferences, summaries, conversations, messages (user-scoped) |
 | `ai_financial_analyst/memory/memory_manager.py` | Memory facade: context injection, preference extraction, summary saving |
 | `ai_financial_analyst/tools/calculator.py` | AST-validated numexpr evaluator (no REPL) |
-| `ai_financial_analyst/data/benchmarks.json` | Static GICS sector P/E averages (no API call) |
-| `ui/chat_app.py` | Conversational chat UI: live TAO stream, conversation history, memory panel |
-| `ui/app.py` | Classic form UI with dry-run replay |
-| `docs/MEMORY_ARCHITECTURE.md` | Design doc: memory tiers, auth plan, DB schema, retrieval strategy |
-| `docs/AI_Financial_Analyst_Agent_PRD.docx` | Full product requirements document |
-
----
-
-## Models
-
-| Model | Use |
-|---|---|
-| `gemini-3-flash-preview` | Primary ReAct reasoning loop |
-| `gemini-3.1-flash-lite-preview` | Sanitizer extraction sub-tasks (optional) |
-
-`max_retries=1` is set on both LLM instances. In `langchain-google-genai` 4.x, `max_retries=0` means "use SDK default (5 retries)" — setting `1` disables the SDK layer so only our `tenacity` circuit-breaker retries.
 
 ---
 
 ## Critical Design Decisions (Do Not Change Without Review)
 
 ### No Python REPL
-`CalculatorTool` uses `numexpr` with a three-level AST guard:
-1. Node-type whitelist — only arithmetic AST node types
-2. Name allowlist (`_SAFE_NAMES`) — blocks `__import__`, `os`, etc.
-3. Function allowlist (`_SAFE_FUNCTIONS`) — blocks all calls except `sqrt`, `log`, etc.
-4. Constant type check — string/bytes literals rejected
-
-Changing to a general REPL is a security regression.
+`CalculatorTool` uses `numexpr` with a three-level AST guard (node whitelist, name allowlist, function allowlist). Changing to a general REPL is a security regression.
 
 ### Full-Content Injection Rejection
-`ContentSanitizer._regex_filter()` rejects the **entire content block** when any injection pattern matches. Sentence-level `[REDACTED]` replacement was insufficient — surrounding context still guided adversarial behaviour. Do not revert to partial stripping.
+`ContentSanitizer._regex_filter()` rejects the **entire content block** on any injection pattern match. Sentence-level redaction is insufficient — surrounding context still guides adversarial behaviour.
 
 ### Sequential Agent Execution
-Agents run one at a time. Do **not** make them concurrent — this saturates the free-tier 15 RPM limit and triggers the circuit breaker.
+Agents run one at a time. Concurrent execution saturates the free-tier 15 RPM limit and triggers the circuit breaker.
 
 ### `AgentState` Return Pattern
-All agent nodes return via `AgentState(**{**state, "key": value, ...})` — **not** `AgentState(**state, key=value)`. TypedDict spreads all keys as kwargs; duplicate keys cause `TypeError: got multiple values for keyword argument`.
+All agent nodes return `AgentState(**{**state, "key": value})` — never `AgentState(**state, key=value)`. The latter causes `TypeError: got multiple values for keyword argument`.
 
-### max_iterations = 5
-The Researcher agent hard-caps at 5 tool calls per ticker. Increasing this risks exhausting the free-tier RPD limit on multi-ticker runs.
+### `ConversationState` vs `AgentState` — Two Separate TypedDicts
+`ConversationState` is the chat layer (session ID, messages, intent). `AgentState` is the pipeline (raw_data, analysis, report). Never merged — the agent calls `run_pipeline()` and receives the final report; it never touches `AgentState` directly.
 
-### Tavily over DuckDuckGo
-Tavily is LangChain's default search tool, purpose-built for AI agents. `DuckDuckGoSearchRun` is a legacy tool. Google Custom Search API is closed to new signups in 2026. Do not revert.
+### Five-Intent Taxonomy
+`memory_query` must remain a distinct intent. Without it, "What did we find about AAPL earlier?" gets classified as `financial_analysis` (AAPL is present) and re-runs the full pipeline instead of returning the stored summary.
 
-### ConversationState vs AgentState — Two Separate TypedDicts
-`ConversationState` (in `core/conversation_state.py`) is owned by the `ConversationalAgent` and holds chat-level state: messages, session ID, last intent, pending tickers. `AgentState` (in `core/state.py`) is owned by the inner Researcher → Quant → Editor pipeline. They must never be merged — the chat layer is a routing layer, not a pipeline participant. The `ConversationalAgent` calls `run_pipeline()` and receives back the final report; it never reads or writes `AgentState` directly.
+### user_id Scoping
+All `LongTermMemory` queries include `WHERE user_id = ?`. The FastAPI DB migration adds `user_id TEXT DEFAULT 'default'` to all tables — safe to run on existing databases. Existing tests use `user_id="default"` implicitly.
 
-### Intent Classification Uses Sub-LLM (Flash-Lite)
-The intent classifier in `agents/intent_classifier.py` uses `get_subllm()` (Flash-Lite) rather than the primary LLM (Flash). This preserves the primary model's 15 RPM budget for actual analysis. The classifier is a cheap JSON extraction call — Flash-Lite is sufficient.
-
-### Five-Intent Taxonomy — `memory_query` Is Distinct From `financial_analysis`
-The classifier uses five intents: `financial_analysis`, `financial_question`, `memory_query`, `off_topic`, `clarification_needed`. `memory_query` is essential: without it, a message like "What did we find about AAPL earlier?" triggers the full pipeline because it contains a ticker. The classifier prompt includes explicit examples of retrospective phrases ("earlier", "last time", "what did we find") that force `memory_query` even when a ticker is present. Do not merge or remove this intent.
+### Flash-Lite for Classification
+`IntentClassifier` and `MemoryManager` preference extraction use `get_subllm()` (Flash-Lite). Primary LLM (Flash) is reserved for analysis reasoning.
 
 ---
 
-## Package Versions (Pinned — Do Not Upgrade Without Testing)
+## Package Versions (Pinned)
 
-| Package | Version | Notes |
-|---|---|---|
-| `langchain` | 1.2.17 | Major version jump from 0.3.x |
-| `langgraph` | 1.1.10 | `langgraph.prebuilt` deprecated in 1.x |
-| `langgraph-checkpoint-sqlite` | 3.0.3 | Separate package required for `SqliteSaver` |
-| `langchain-google-genai` | 4.2.2 | Now uses `google-genai` SDK; `max_retries` quirk |
-| `langchain-tavily` | 0.2.18 | Official Tavily + LangChain integration |
-| `yfinance` | 1.3.0 | |
-| `langsmith` | 0.8.0 | Env var names changed: `LANGSMITH_*` |
+| Package | Version |
+|---|---|
+| `langchain` | 1.2.17 |
+| `langgraph` | 1.1.10 |
+| `langgraph-checkpoint-sqlite` | 3.0.3 |
+| `langchain-google-genai` | 4.2.2 |
+| `langchain-tavily` | 0.2.18 |
+| `yfinance` | 1.3.0 |
+| `langsmith` | 0.8.0 |
+| `fastapi` | ≥0.115 |
+| `google-auth` | ≥2.29 |
+| `python-jose[cryptography]` | ≥3.3 |
 
 ---
 
@@ -176,10 +172,10 @@ The classifier uses five intents: `financial_analysis`, `financial_question`, `m
 
 | Service | Limit | Mitigation |
 |---|---|---|
-| Gemini Flash | ~1,500 RPD, 15 RPM | Circuit breaker (3 × 429 in 30s → halt) + budget tracker |
-| Gemini Flash-Lite | ~1,500 RPD, 30 RPM | Used only for sanitizer sub-tasks |
-| Tavily | 1,000 credits/month | 4-hour diskcache for repeated queries |
-| yfinance | Unofficial API, no hard limit | 4-hour diskcache |
+| Gemini Flash | ~1,500 RPD, 15 RPM | Circuit breaker (3×429 in 30s) + Flash-Lite fallback |
+| Gemini Flash-Lite | ~1,500 RPD, 30 RPM | Sub-tasks only (classification, summaries) |
+| Tavily | 1,000 credits/month | 4-hour diskcache |
+| yfinance | No hard limit | 4-hour diskcache |
 
 ---
 
@@ -187,8 +183,9 @@ The classifier uses five intents: `financial_analysis`, `financial_question`, `m
 
 | Error | Cause | Fix |
 |---|---|---|
-| `CircuitBreakerError` | 3× 429 within 30s | Wait ~1 min; use `--dry-run` for demo |
-| `PartialStateError` | Agent boundary missing required field | Check `iteration_log` in trace for upstream tool failure |
-| `SanitizationAlert` | Canary token in agent output | Potential injection — inspect `run_trace.json` |
-| `TypeError: got multiple values` | `AgentState(**state, key=val)` pattern | Use `AgentState(**{**state, "key": val})` instead |
-| `GOOGLE_API_KEY not set` | `.env` not loaded | Run from project root; ensure `python-dotenv` loaded |
+| `CircuitBreakerError` | 3× 429 within 30s | Wait ~1 min; system auto-falls back to Flash-Lite |
+| `PartialStateError` | Missing required state at agent boundary | Check `run_trace.json` iteration_log |
+| `SanitizationAlert` | Canary token in agent output | Inspect `run_artifacts.json` |
+| `401 Unauthorized` on `/auth/me` at startup | Expected — no session cookie yet | Not a bug; handled by `useAuth` catch returning null |
+| `button?type=standard 403` | Google button iframe with undefined params | Cosmetic only; sign-in still works |
+| `GOOGLE_API_KEY not set` | `.env` not loaded | Run from project root |

@@ -96,6 +96,15 @@ async def get_me(user: CurrentUser = Depends(get_current_user)) -> UserProfile:
 
 @router.post("/logout")
 async def logout(response: Response) -> dict:
-    """Clear the session cookie."""
-    response.delete_cookie(key=COOKIE_NAME)
+    """Clear the session cookie.
+
+    delete_cookie must match the original set_cookie attributes (httponly, samesite)
+    so every browser recognises them as the same cookie to delete.
+    """
+    response.delete_cookie(
+        key=COOKIE_NAME,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+    )
     return {"status": "logged out"}
