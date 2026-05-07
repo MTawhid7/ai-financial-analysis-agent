@@ -25,6 +25,7 @@ class RequestBudgetTracker:
         self._sub_calls = 0
         self._cache_hits = 0
         self._warned = False
+        self._model_degraded = False
 
     # ------------------------------------------------------------------
     # Mutation
@@ -41,6 +42,14 @@ class RequestBudgetTracker:
     def record_cache_hit(self) -> None:
         self._cache_hits += 1
 
+    def record_model_degradation(self) -> None:
+        """Record that the primary model was rate-limited and Flash-Lite fallback was used."""
+        if not self._model_degraded:
+            self._model_degraded = True
+            logger.warning(
+                "Model degradation recorded: Flash rate-limited, falling back to Flash-Lite."
+            )
+
     # ------------------------------------------------------------------
     # Inspection
     # ------------------------------------------------------------------
@@ -48,6 +57,11 @@ class RequestBudgetTracker:
     @property
     def total_calls(self) -> int:
         return self._primary_calls + self._sub_calls
+
+    @property
+    def model_degraded(self) -> bool:
+        """True if the primary model was rate-limited at least once this session."""
+        return self._model_degraded
 
     def get_stats(self) -> dict:
         return {
@@ -59,6 +73,7 @@ class RequestBudgetTracker:
             "budget_used_pct": round(
                 self.total_calls / self._daily_budget * 100, 1
             ),
+            "model_degraded": self._model_degraded,
         }
 
     # ------------------------------------------------------------------

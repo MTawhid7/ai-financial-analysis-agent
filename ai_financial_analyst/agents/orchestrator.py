@@ -23,7 +23,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from ..core.artifacts import RunArtifacts
 from ..core.budget_tracker import RequestBudgetTracker
-from ..core.llm import CircuitBreakerError, get_primary_llm, get_subllm
+from ..core.llm import CircuitBreakerError, get_primary_llm_with_fallback, get_subllm
 from ..core.state import AgentState, PartialStateError
 from ..core.tracing import RunStatus, RunTracer
 from ..tools import web_search as web_search_module
@@ -181,7 +181,7 @@ async def run_pipeline(
         (final_state, trace_path)
     """
     budget = RequestBudgetTracker()
-    primary_llm = get_primary_llm(budget_tracker=budget)
+    primary_llm = get_primary_llm_with_fallback(budget_tracker=budget)
     subllm = get_subllm(budget_tracker=budget)
 
     web_search_module.configure(subllm=subllm)

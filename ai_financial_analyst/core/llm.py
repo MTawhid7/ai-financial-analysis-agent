@@ -1,4 +1,4 @@
-"""Gemini LLM client with tenacity retry, jitter, and circuit breaker."""
+"""Gemini LLM client with tenacity retry, jitter, circuit breaker, and rate-limit fallback."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import tenacity
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.runnables.base import Runnable
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,9 @@ _sub_cb = _CircuitBreaker()
 
 def _is_rate_limit(exc: BaseException) -> bool:
     msg = str(exc).lower()
-    return "429" in msg or "resource exhausted" in msg or "quota" in msg
+    return any(
+        term in msg for term in ("429", "resource exhausted", "quota", "503", "unavailable", "500")
+    )
 
 
 def _retry_on_rate_limit(circuit_breaker: _CircuitBreaker) -> Callable:
@@ -100,9 +103,29 @@ class _BudgetCallbackHandler(BaseCallbackHandler):
         self._record_fn()
 
 
+class _PrimaryLLM(ChatGoogleGenerativeAI):
+    @_retry_on_rate_limit(_primary_cb)
+    async def ainvoke(self, *args, **kwargs):
+        return await super().ainvoke(*args, **kwargs)
+
+    @_retry_on_rate_limit(_primary_cb)
+    def invoke(self, *args, **kwargs):
+        return super().invoke(*args, **kwargs)
+
+
+class _SubLLM(ChatGoogleGenerativeAI):
+    @_retry_on_rate_limit(_sub_cb)
+    async def ainvoke(self, *args, **kwargs):
+        return await super().ainvoke(*args, **kwargs)
+
+    @_retry_on_rate_limit(_sub_cb)
+    def invoke(self, *args, **kwargs):
+        return super().invoke(*args, **kwargs)
+
+
 def get_primary_llm(budget_tracker=None):
     """Return Gemini Flash LLM for the core ReAct reasoning loop."""
-    llm = ChatGoogleGenerativeAI(
+    llm = _PrimaryLLM(
         model=_PRIMARY_MODEL,
         google_api_key=os.environ["GOOGLE_API_KEY"],
         temperature=0.1,
@@ -113,7 +136,7 @@ def get_primary_llm(budget_tracker=None):
         max_retries=1,
     )
     if budget_tracker:
-        return llm.with_config(
+        llm = llm.with_config(
             {"callbacks": [_BudgetCallbackHandler(budget_tracker.record_primary_call)]}
         )
     return llm
@@ -121,7 +144,7 @@ def get_primary_llm(budget_tracker=None):
 
 def get_subllm(budget_tracker=None):
     """Return Gemini Flash-Lite LLM for summarisation and sanitisation sub-tasks."""
-    llm = ChatGoogleGenerativeAI(
+    llm = _SubLLM(
         model=_SUB_MODEL,
         google_api_key=os.environ["GOOGLE_API_KEY"],
         temperature=0.0,
@@ -129,10 +152,70 @@ def get_subllm(budget_tracker=None):
         max_retries=1,
     )
     if budget_tracker:
-        return llm.with_config(
+        llm = llm.with_config(
             {"callbacks": [_BudgetCallbackHandler(budget_tracker.record_sub_call)]}
         )
     return llm
+
+
+class RateLimitFallbackLLM(Runnable):
+    """LangChain Runnable that transparently falls back to Flash-Lite when the
+    primary model (Flash) is rate-limited.
+
+    Catches CircuitBreakerError (circuit tripped after 3× 429 in 30s) and
+    tenacity.RetryError (5 retries exhausted) from the primary, then delegates
+    the same call to the fallback model. Non-rate-limit exceptions propagate
+    normally.
+
+    Compatible with LangChain chain composition:  prompt | llm  works because
+    this class extends Runnable and inherits __or__ / __ror__.
+    """
+
+    def __init__(self, primary: Any, fallback: Any, budget_tracker: Any = None) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._budget_tracker = budget_tracker
+
+    # ------------------------------------------------------------------
+    # LangChain Runnable interface
+    # ------------------------------------------------------------------
+
+    def invoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        try:
+            return self._primary.invoke(input, config=config, **kwargs)
+        except (CircuitBreakerError, tenacity.RetryError) as exc:
+            self._on_rate_limit_fallback(exc)
+            return self._fallback.invoke(input, config=config, **kwargs)
+
+    async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        try:
+            return await self._primary.ainvoke(input, config=config, **kwargs)
+        except (CircuitBreakerError, tenacity.RetryError) as exc:
+            self._on_rate_limit_fallback(exc)
+            return await self._fallback.ainvoke(input, config=config, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _on_rate_limit_fallback(self, exc: BaseException) -> None:
+        logger.warning(
+            "Primary model (Flash) rate-limited — falling back to Flash-Lite. Cause: %s",
+            str(exc)[:120],
+        )
+        if self._budget_tracker is not None:
+            self._budget_tracker.record_model_degradation()
+
+
+def get_primary_llm_with_fallback(budget_tracker=None) -> RateLimitFallbackLLM:
+    """Return a Flash LLM that automatically falls back to Flash-Lite on rate limits.
+
+    Use this in place of get_primary_llm() for all pipeline and agent entry points.
+    The returned object is a LangChain Runnable and works in prompt | llm chains.
+    """
+    primary = get_primary_llm(budget_tracker)
+    fallback = get_subllm(budget_tracker)
+    return RateLimitFallbackLLM(primary, fallback, budget_tracker)
 
 
 def content_to_str(content: Any) -> str:

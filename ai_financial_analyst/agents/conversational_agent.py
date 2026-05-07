@@ -26,7 +26,7 @@ from ..core.conversation_state import (
     get_recent_context,
     new_session,
 )
-from ..core.llm import content_to_str, get_primary_llm, get_subllm
+from ..core.llm import content_to_str, get_primary_llm_with_fallback, get_subllm
 from .intent_classifier import IntentType, classify
 from .orchestrator import run_pipeline
 
@@ -67,7 +67,7 @@ class ConversationalAgent:
 
     def __init__(self) -> None:
         self.budget = RequestBudgetTracker()
-        self._primary_llm = get_primary_llm(budget_tracker=self.budget)
+        self._primary_llm = get_primary_llm_with_fallback(budget_tracker=self.budget)
         self._subllm = get_subllm(budget_tracker=self.budget)
 
     async def process_message(

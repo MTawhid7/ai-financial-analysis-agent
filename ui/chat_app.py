@@ -80,6 +80,13 @@ with st.sidebar:
     )
     st.metric("Cache Hits", budget_stats.get("cache_hits", 0))
 
+    if budget_stats.get("model_degraded"):
+        st.warning(
+            "⚠️ **Flash rate-limited** — switched to Flash-Lite. "
+            "Response quality may be reduced. Wait ~1 min for the primary model to recover.",
+            icon="⚠️",
+        )
+
     st.divider()
 
     debug_mode = st.checkbox(

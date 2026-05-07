@@ -28,7 +28,7 @@ from ai_financial_analyst.agents.conversational_agent import (
 def agent():
     """Return a ConversationalAgent with mocked LLM instances."""
     with (
-        patch("ai_financial_analyst.agents.conversational_agent.get_primary_llm") as mock_primary,
+        patch("ai_financial_analyst.agents.conversational_agent.get_primary_llm_with_fallback") as mock_primary,
         patch("ai_financial_analyst.agents.conversational_agent.get_subllm") as mock_sub,
     ):
         mock_primary.return_value = MagicMock()
