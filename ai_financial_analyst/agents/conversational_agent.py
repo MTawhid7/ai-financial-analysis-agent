@@ -63,15 +63,16 @@ _CLARIFICATION_RESPONSE = (
 class ConversationalAgent:
     """Session-scoped conversational agent wrapping the financial pipeline.
 
-    Create one instance per chat session and keep it in session state.
-    The budget_tracker and memory accumulate across the entire session.
+    Create one instance per user session.  Pass user_id so memory is scoped
+    per user; defaults to "default" for backward-compatible Streamlit use.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, user_id: str = "default") -> None:
+        self.user_id = user_id
         self.budget = RequestBudgetTracker()
         self._primary_llm = get_primary_llm_with_fallback(budget_tracker=self.budget)
         self._subllm = get_subllm(budget_tracker=self.budget)
-        self._memory = MemoryManager(LongTermMemory(), subllm=self._subllm)
+        self._memory = MemoryManager(LongTermMemory(user_id=user_id), subllm=self._subllm)
 
     async def process_message(
         self,

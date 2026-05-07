@@ -28,15 +28,18 @@ Note: LangSmith env vars changed in v0.8 — use `LANGSMITH_API_KEY` and `LANGSM
 ## Running the Project
 
 ```bash
-# Conversational chat UI — Phase 1+ (recommended)
-streamlit run ui/chat_app.py
+# Production UI (FastAPI + React) — recommended
+pip install -e ".[server]"
+uvicorn backend.main:app --reload --port 8000   # Terminal 1
+cd frontend && npm run dev                       # Terminal 2
+# Open http://localhost:5173
 
-# Classic single-turn form UI
+# Legacy Streamlit UI (dry-run demos only — archived)
 streamlit run ui/app.py
-
-# Demo replay without any API calls (for interviews)
-# In the classic UI: check "Dry-run mode" and upload a run_trace.json
 ```
+
+Add `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `FASTAPI_JWT_SECRET` to `.env`.
+See `.env.example` for all required variables.
 
 ---
 
@@ -52,20 +55,23 @@ pytest tests/e2e/           # full pipeline with pre-recorded mocked responses
 pytest --cov=ai_financial_analyst --cov-report=term-missing
 ```
 
-All four layers must pass before any feature is complete. Current status: **156/156** (unit + integration + adversarial).
+All four layers must pass before any feature is complete. Current status: **156/156** (unit + integration + adversarial). Frontend: `npm run build` in `frontend/` must pass (zero TypeScript errors).
 
 ---
 
 ## Architecture
 
-Two-layer system: a conversational agent on top, the analysis pipeline below.
+Three-layer system: React + Vite frontend → FastAPI backend → Python AI pipeline.
 
 ```
-User (natural language)
-    ↓
+React + Vite (port 5173)
+    ↕ Google OAuth (@react-oauth/google)
+    ↕ REST + SSE (httpOnly JWT cookie)
+FastAPI backend (port 8000)
+    ↕ session_manager: user_id → ConversationalAgent
 ConversationalAgent  ← intent classifier (Flash-Lite)
-    ↓ financial_analysis          ↓ financial_question   ↓ off_topic
-Orchestrator                 Primary LLM             Rejection template
+    ↓ financial_analysis          ↓ financial_question   ↓ off_topic / memory_query
+Orchestrator                 Primary LLM             Direct response
     ↓
 Researcher → Quant Analyst → Editor → Markdown Report
 ```

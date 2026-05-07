@@ -26,6 +26,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+server = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "google-auth>=2.29",
+    "python-jose[cryptography]>=3.3",
+]
 dev = [
     "pytest==8.3.5",
     "pytest-asyncio==0.25.3",
@@ -36,7 +43,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["ai_financial_analyst*", "ui*"]
+include = ["ai_financial_analyst*", "backend*", "ui*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

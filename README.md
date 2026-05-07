@@ -105,17 +105,23 @@ cp .env.example .env
 ### Run
 
 ```bash
-# Conversational chat interface (recommended — Phase 1+)
-conda activate fin-agent
-streamlit run ui/chat_app.py
+# Install Python deps (including FastAPI server)
+pip install -e ".[server]"
 
-# Classic single-turn form with dry-run replay
-streamlit run ui/app.py
+# Terminal 1 — FastAPI backend
+uvicorn backend.main:app --reload --port 8000
+
+# Terminal 2 — React frontend
+cd frontend && npm install && npm run dev
+# Open http://localhost:5173
 ```
 
-**Chat mode**: type naturally — *"Analyse AAPL"*, *"What is a P/E ratio?"*, *"Compare Tesla and Ford"*. The agent classifies your intent and routes it automatically.
+Sign in with Google → start chatting. Say *"Analyse AAPL"* for a full pipeline run, or *"What is CAGR?"* for a direct answer. Past analyses are remembered across sessions.
 
-**Classic mode**: enter comma-separated tickers and click **Run Analysis**. Includes dry-run replay for zero-API demo.
+**Legacy Streamlit UI** (dry-run demos only):
+```bash
+streamlit run ui/app.py   # Classic form with dry-run replay
+```
 
 ### Demo without API calls (dry-run)
 

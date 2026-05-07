@@ -6,9 +6,8 @@ Four tables:
   conversations        — one row per chat thread (title, timestamps)
   messages             — all user and assistant turns, linked to conversations
 
-Uses lazy initialisation: the database and schema are created on the first
-async call. `CREATE TABLE IF NOT EXISTS` makes all additions backward-compatible
-with existing databases created in earlier phases.
+All preference/summary/conversation queries are scoped by user_id.
+Defaults to "default" for backward compatibility with Streamlit and tests.
 """
 
 from __future__ import annotations
@@ -26,10 +25,15 @@ _DEFAULT_DB_PATH = ".memory/memory.db"
 
 
 class LongTermMemory:
-    """Persistent cross-session memory store."""
+    """Persistent cross-session memory store.
 
-    def __init__(self, db_path: str = _DEFAULT_DB_PATH) -> None:
+    The user_id parameter scopes all queries to a single user.
+    Defaults to "default" for backward compatibility with Streamlit and tests.
+    """
+
+    def __init__(self, db_path: str = _DEFAULT_DB_PATH, user_id: str = "default") -> None:
         self._db_path = db_path
+        self._user_id = user_id
         self._initialized = False
 
     # ------------------------------------------------------------------
@@ -45,11 +49,10 @@ class LongTermMemory:
     async def _init_db(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self._db_path) as db:
-            # Phase 2 tables
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS preferences (
-                    key   TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
+                    key        TEXT PRIMARY KEY,
+                    value      TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 )
             """)
@@ -63,7 +66,6 @@ class LongTermMemory:
                     created_at   REAL    NOT NULL
                 )
             """)
-            # Phase 2.5 tables
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS conversations (
                     id         TEXT PRIMARY KEY,
@@ -87,6 +89,15 @@ class LongTermMemory:
                 "CREATE INDEX IF NOT EXISTS idx_messages_conv"
                 " ON messages(conversation_id, created_at)"
             )
+            # user_id columns added by backend migration at startup;
+            # silently ignore if already present.
+            for table in ("preferences", "analysis_summaries", "conversations", "messages"):
+                try:
+                    await db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN user_id TEXT DEFAULT 'default'"
+                    )
+                except Exception:
+                    pass
             await db.commit()
 
     # ------------------------------------------------------------------
@@ -97,8 +108,10 @@ class LongTermMemory:
         await self._ensure_init()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO preferences (key, value, updated_at) VALUES (?, ?, ?)",
-                (key.strip(), value.strip(), time.time()),
+                "INSERT INTO preferences (key, value, updated_at, user_id) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
+                " updated_at=excluded.updated_at, user_id=excluded.user_id",
+                (key.strip(), value.strip(), time.time(), self._user_id),
             )
             await db.commit()
 
@@ -106,7 +119,8 @@ class LongTermMemory:
         await self._ensure_init()
         async with aiosqlite.connect(self._db_path) as db:
             async with db.execute(
-                "SELECT key, value FROM preferences ORDER BY key"
+                "SELECT key, value FROM preferences WHERE user_id = ? ORDER BY key",
+                (self._user_id,),
             ) as cursor:
                 rows = await cursor.fetchall()
         return {row[0]: row[1] for row in rows}
@@ -126,9 +140,10 @@ class LongTermMemory:
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
                 "INSERT INTO analysis_summaries"
-                " (session_id, tickers, summary_text, run_id, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (session_id, ", ".join(tickers), summary_text.strip(), run_id, time.time()),
+                " (session_id, tickers, summary_text, run_id, created_at, user_id)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, ", ".join(tickers), summary_text.strip(), run_id,
+                 time.time(), self._user_id),
             )
             await db.commit()
 
@@ -139,9 +154,9 @@ class LongTermMemory:
         async with aiosqlite.connect(self._db_path) as db:
             async with db.execute(
                 "SELECT tickers, summary_text, created_at FROM analysis_summaries"
-                " WHERE tickers LIKE ? OR summary_text LIKE ?"
+                " WHERE user_id = ? AND (tickers LIKE ? OR summary_text LIKE ?)"
                 " ORDER BY created_at DESC LIMIT ?",
-                (like, like, limit),
+                (self._user_id, like, like, limit),
             ) as cursor:
                 rows = await cursor.fetchall()
         return [{"tickers": r[0], "summary": r[1], "created_at": r[2]} for r in rows]
@@ -151,8 +166,8 @@ class LongTermMemory:
         async with aiosqlite.connect(self._db_path) as db:
             async with db.execute(
                 "SELECT tickers, summary_text, created_at FROM analysis_summaries"
-                " ORDER BY created_at DESC LIMIT ?",
-                (limit,),
+                " WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                (self._user_id, limit),
             ) as cursor:
                 rows = await cursor.fetchall()
         return [{"tickers": r[0], "summary": r[1], "created_at": r[2]} for r in rows]
@@ -160,7 +175,10 @@ class LongTermMemory:
     async def count_summaries(self) -> int:
         await self._ensure_init()
         async with aiosqlite.connect(self._db_path) as db:
-            async with db.execute("SELECT COUNT(*) FROM analysis_summaries") as cursor:
+            async with db.execute(
+                "SELECT COUNT(*) FROM analysis_summaries WHERE user_id = ?",
+                (self._user_id,),
+            ) as cursor:
                 row = await cursor.fetchone()
         return row[0] if row else 0
 
@@ -174,9 +192,9 @@ class LongTermMemory:
         now = time.time()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT OR IGNORE INTO conversations (id, title, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?)",
-                (conversation_id, title[:80], now, now),
+                "INSERT OR IGNORE INTO conversations (id, title, user_id, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, title[:80], self._user_id, now, now),
             )
             await db.commit()
 
@@ -184,8 +202,8 @@ class LongTermMemory:
         await self._ensure_init()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "UPDATE conversations SET title = ? WHERE id = ?",
-                (title[:80], conversation_id),
+                "UPDATE conversations SET title = ? WHERE id = ? AND user_id = ?",
+                (title[:80], conversation_id, self._user_id),
             )
             await db.commit()
 
@@ -193,8 +211,8 @@ class LongTermMemory:
         await self._ensure_init()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                (time.time(), conversation_id),
+                "UPDATE conversations SET updated_at = ? WHERE id = ? AND user_id = ?",
+                (time.time(), conversation_id, self._user_id),
             )
             await db.commit()
 
@@ -204,8 +222,8 @@ class LongTermMemory:
         async with aiosqlite.connect(self._db_path) as db:
             async with db.execute(
                 "SELECT id, title, created_at, updated_at FROM conversations"
-                " ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
+                " WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
+                (self._user_id, limit),
             ) as cursor:
                 rows = await cursor.fetchall()
         return [
@@ -217,7 +235,10 @@ class LongTermMemory:
         await self._ensure_init()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
-            await db.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+            await db.execute(
+                "DELETE FROM conversations WHERE id = ? AND user_id = ?",
+                (conversation_id, self._user_id),
+            )
             await db.commit()
 
     # ------------------------------------------------------------------
@@ -236,9 +257,11 @@ class LongTermMemory:
         await self._ensure_init()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO messages (id, conversation_id, role, content, intent, tickers, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (str(uuid.uuid4()), conversation_id, role, content, intent, tickers, time.time()),
+                "INSERT INTO messages"
+                " (id, conversation_id, role, content, intent, tickers, created_at, user_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), conversation_id, role, content,
+                 intent, tickers, time.time(), self._user_id),
             )
             await db.commit()
 
@@ -253,13 +276,7 @@ class LongTermMemory:
             ) as cursor:
                 rows = await cursor.fetchall()
         return [
-            {
-                "role": r[0],
-                "content": r[1],
-                "intent": r[2],
-                "tickers": r[3],
-                "created_at": r[4],
-            }
+            {"role": r[0], "content": r[1], "intent": r[2], "tickers": r[3], "created_at": r[4]}
             for r in rows
         ]
 
@@ -268,12 +285,19 @@ class LongTermMemory:
     # ------------------------------------------------------------------
 
     async def delete_all(self) -> None:
-        """Permanently delete all stored preferences, summaries, and conversations."""
+        """Permanently delete all data for this user."""
         await self._ensure_init()
         async with aiosqlite.connect(self._db_path) as db:
-            await db.execute("DELETE FROM preferences")
-            await db.execute("DELETE FROM analysis_summaries")
-            await db.execute("DELETE FROM messages")
-            await db.execute("DELETE FROM conversations")
+            await db.execute("DELETE FROM preferences WHERE user_id = ?", (self._user_id,))
+            await db.execute(
+                "DELETE FROM analysis_summaries WHERE user_id = ?", (self._user_id,)
+            )
+            # Delete messages for all conversations owned by this user
+            await db.execute(
+                "DELETE FROM messages WHERE conversation_id IN"
+                " (SELECT id FROM conversations WHERE user_id = ?)",
+                (self._user_id,),
+            )
+            await db.execute("DELETE FROM conversations WHERE user_id = ?", (self._user_id,))
             await db.commit()
-        logger.info("Long-term memory cleared.")
+        logger.info("Long-term memory cleared for user %s.", self._user_id[:8])
