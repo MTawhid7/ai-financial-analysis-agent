@@ -1,7 +1,7 @@
 # Roadmap: AI Financial Analyst → Conversational AI Agent
 
 **Last updated:** 2026-05-07  
-**Status:** Phase 2 complete — Phase 3 in queue
+**Status:** Phase 2 complete — Phase 2.5 + Phase 4 (auth) next
 
 ---
 
@@ -47,11 +47,15 @@ Capabilities not in the original request that significantly strengthen the produ
 |-------|------|--------|-----------|--------------|
 | **1** | Conversational Core | ✅ **Complete** | Medium | None |
 | **2** | Memory System | ✅ **Complete** | Medium | None |
+| **2.5** | Memory Bug Fix + Conversation Persistence | Planned | Low | None |
 | **3** | Streaming + Intervention | Planned | High | None |
-| **4** | Planning + FastAPI/React | Planned | High | fastapi, uvicorn |
+| **4A** | FastAPI Backend + Google Auth | Planned | High | fastapi, uvicorn, google-auth, python-jose |
+| **4B** | React Frontend + Conversation UI | Planned | High | (frontend npm deps) |
 | **5** | Multimodal | Planned | Medium-High | plotly, pandas, weasyprint, pdfplumber, python-docx, openpyxl |
 | **6** | Refinement + Comparison | Planned | Medium | None |
-| **7** | Polish + Provenance | Planned | Low-Medium | None |
+| **7** | Polish + Provenance + Vector Memory | Planned | Medium | sentence-transformers |
+
+See [MEMORY_ARCHITECTURE.md](MEMORY_ARCHITECTURE.md) for the full design of Phases 2.5, 4A, 4B, and the vector memory strategy.
 
 ---
 
@@ -404,8 +408,8 @@ These are the invariant files that every phase must leave intact and passing:
 | After Phase | Tests |
 |-------------|-------|
 | Baseline | 57 |
-| Phase 1 ✅ | **84** |
-| Phase 2 ✅ | **133** |
-| Phase 3 (target) | ~115 |
-| Phase 4 (target) | ~130 |
-| Phase 5+ (target) | ~160+ |
+| Phase 1 ✅ | **98** |
+| Phase 2 ✅ | **138** |
+| Phase 2.5 (target) | ~155 |
+| Phase 3 (target) | ~170 |
+| Phase 4 (target) | ~200+ |
