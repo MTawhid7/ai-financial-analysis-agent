@@ -91,6 +91,24 @@ async def run_migrations() -> None:
             except Exception:
                 pass  # Column already exists — expected on subsequent startups
 
+        # Phase 5: reports table (stores full pipeline output for export)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id              TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                user_id         TEXT NOT NULL,
+                tickers         TEXT NOT NULL,
+                report_markdown TEXT NOT NULL,
+                raw_data_json   TEXT DEFAULT '{}',
+                analysis_json   TEXT DEFAULT '{}',
+                created_at      REAL NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reports_conv"
+            " ON reports(conversation_id, created_at DESC)"
+        )
+
         # Indexes for user-scoped queries
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_conversations_user"

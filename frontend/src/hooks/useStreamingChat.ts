@@ -10,9 +10,18 @@ export interface StepEvent {
   ok?: boolean;
 }
 
+export interface ChartDescriptor {
+  ticker: string;
+  chart_type: string;
+  title: string;
+  figure: { data: object[]; layout: object };
+}
+
 export interface CompleteEvent {
   type: "complete";
   response: string;
+  charts?: ChartDescriptor[];
+  report_id?: string | null;
 }
 
 export interface ErrorEvent {
@@ -35,15 +44,13 @@ export function useStreamingChat() {
       conversationId: string,
       message: string,
       onStep: (e: StepEvent) => void,
-      onComplete: (response: string) => void,
+      onComplete: (event: CompleteEvent) => void,
       onError: (detail: string) => void
     ) => {
-      // Abort any in-flight stream
       abort();
 
       try {
         const { event_id } = await sendMessage(conversationId, message);
-
         const es = createEventSource(event_id);
         esRef.current = es;
 
@@ -55,9 +62,10 @@ export function useStreamingChat() {
             return;
           }
 
-          if (data.type === "step") onStep(data);
-          else if (data.type === "complete") {
-            onComplete(data.response);
+          if (data.type === "step") {
+            onStep(data);
+          } else if (data.type === "complete") {
+            onComplete(data);
             es.close();
             esRef.current = null;
           } else if (data.type === "error") {

@@ -1,6 +1,8 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { StepEvent } from "../../hooks/useStreamingChat";
+import { PlotlyChart } from "../PlotlyChart";
+import { ExportMenu } from "./ExportMenu";
+import type { StepEvent, ChartDescriptor } from "../../hooks/useStreamingChat";
 
 interface UserBubbleProps {
   content: string;
@@ -10,6 +12,8 @@ interface AssistantBubbleProps {
   content: string;
   isStreaming?: boolean;
   stepEvents?: StepEvent[];
+  charts?: ChartDescriptor[];
+  reportId?: string | null;
 }
 
 export function UserBubble({ content }: UserBubbleProps) {
@@ -22,7 +26,13 @@ export function UserBubble({ content }: UserBubbleProps) {
   );
 }
 
-export function AssistantBubble({ content, isStreaming, stepEvents }: AssistantBubbleProps) {
+export function AssistantBubble({
+  content,
+  isStreaming,
+  stepEvents,
+  charts,
+  reportId,
+}: AssistantBubbleProps) {
   return (
     <div className="flex gap-3">
       <div className="flex-shrink-0 w-7 h-7 rounded-full bg-zinc-800 border border-zinc-700 flex items-center justify-center text-sm mt-0.5">
@@ -59,6 +69,20 @@ export function AssistantBubble({ content, isStreaming, stepEvents }: AssistantB
               {content}
             </ReactMarkdown>
           </div>
+        )}
+
+        {/* Interactive charts (shown after pipeline completes) */}
+        {!isStreaming && charts && charts.length > 0 && (
+          <div className="space-y-1 mt-2">
+            {charts.map((chart, i) => (
+              <PlotlyChart key={i} figure={chart.figure} title={chart.title} />
+            ))}
+          </div>
+        )}
+
+        {/* Export menu (shown when a saved report is available) */}
+        {!isStreaming && reportId && (
+          <ExportMenu reportId={reportId} />
         )}
       </div>
     </div>

@@ -169,7 +169,49 @@ async def _run_pipeline_and_enqueue(
             message, state, step_callback=step_callback
         )
         await _persist_turn(conversation_id, user_id, message, response_text, new_state)
-        queue.put_nowait({"type": "complete", "response": response_text})
+
+        # If this was a financial analysis, generate charts and save the report for export.
+        charts: list[dict] = []
+        report_id: str | None = None
+        final_state = getattr(agent, "last_analysis_state", None)
+        if final_state:
+            agent.last_analysis_state = None  # consume immediately
+
+            # Generate Plotly charts (non-blocking, best-effort)
+            try:
+                from ai_financial_analyst.tools.chart_generator import generate_all_charts
+                charts = generate_all_charts(final_state)
+            except Exception as exc:
+                logger.warning("Chart generation failed: %s", exc)
+
+            # Persist report to the reports table for later export
+            try:
+                import json as _json
+                report_id = str(uuid.uuid4())
+                tickers_str = ", ".join(final_state.get("tickers", []))
+                async with aiosqlite.connect(get_db_path()) as db:
+                    await db.execute(
+                        "INSERT INTO reports (id, conversation_id, user_id, tickers,"
+                        " report_markdown, raw_data_json, analysis_json, created_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            report_id, conversation_id, user_id, tickers_str,
+                            final_state.get("report_markdown", ""),
+                            _json.dumps(final_state.get("raw_data", {}), default=str),
+                            _json.dumps(final_state.get("analysis", {}), default=str),
+                            time.time(),
+                        ),
+                    )
+                    await db.commit()
+            except Exception as exc:
+                logger.warning("Could not save report for export: %s", exc)
+
+        queue.put_nowait({
+            "type": "complete",
+            "response": response_text,
+            "charts": charts,
+            "report_id": report_id,
+        })
     except Exception as exc:
         logger.exception("Pipeline error for conversation %s", conversation_id)
         queue.put_nowait({"type": "error", "detail": str(exc)})

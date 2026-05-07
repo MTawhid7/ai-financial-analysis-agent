@@ -148,3 +148,51 @@ export async function getSummaries(limit = 20): Promise<SummaryOut[]> {
 export async function clearAllMemory(): Promise<void> {
   await fetch(`${API_BASE}/memory/clear`, { method: "POST", credentials: "include" });
 }
+
+// ---------------------------------------------------------------------------
+// File upload
+// ---------------------------------------------------------------------------
+
+export async function uploadFile(file: File): Promise<Record<string, unknown>> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${API_BASE}/files/upload`, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Upload failed");
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+export interface ExportAvailability {
+  pdf: boolean;
+  docx: boolean;
+  xlsx: boolean;
+}
+
+export async function getExportAvailable(): Promise<ExportAvailability> {
+  const res = await fetch(`${API_BASE}/export/available`, { credentials: "include" });
+  if (!res.ok) return { pdf: false, docx: true, xlsx: true };
+  return res.json();
+}
+
+async function _exportBlob(url: string): Promise<Blob> {
+  const res = await fetch(url, { method: "POST", credentials: "include" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Export failed");
+  }
+  return res.blob();
+}
+
+export const exportPdf  = (id: string) => _exportBlob(`${API_BASE}/export/pdf/${id}`);
+export const exportDocx = (id: string) => _exportBlob(`${API_BASE}/export/docx/${id}`);
+export const exportXlsx = (id: string) => _exportBlob(`${API_BASE}/export/xlsx/${id}`);

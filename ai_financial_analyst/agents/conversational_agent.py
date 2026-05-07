@@ -73,6 +73,9 @@ class ConversationalAgent:
         self._primary_llm = get_primary_llm_with_fallback(budget_tracker=self.budget)
         self._subllm = get_subllm(budget_tracker=self.budget)
         self._memory = MemoryManager(LongTermMemory(user_id=user_id), subllm=self._subllm)
+        # Stores the last AgentState from a financial_analysis run so the
+        # FastAPI layer can generate charts and save the report for export.
+        self.last_analysis_state: dict | None = None
 
     async def process_message(
         self,
@@ -216,6 +219,9 @@ class ConversationalAgent:
                 f"The pipeline completed with status **{status}** but did not produce a report. "
                 f"Errors: {errors}"
             )
+
+        # Expose the full pipeline state for chart generation and export.
+        self.last_analysis_state = final_state
 
         try:
             await self._memory.maybe_save_analysis_summary(
