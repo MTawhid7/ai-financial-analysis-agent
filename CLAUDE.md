@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Conversational AI Financial Analyst Agent. Uses a ReAct + Multi-Agent architecture with LangGraph. Natural language input, Google OAuth authentication, per-user persistent memory, and real-time SSE streaming through a FastAPI + React stack.
+Conversational AI Financial Analyst Agent. Uses a ReAct + Multi-Agent architecture with LangGraph. Natural language input, Google OAuth authentication, per-user persistent memory, real-time SSE streaming, interactive Plotly charts, multi-format export, and result comparison/refinement — delivered through a FastAPI + React stack.
 
 **This is not a production system.** Portfolio showcase of agentic AI engineering patterns.
 
@@ -47,11 +47,6 @@ npm run dev
 
 Google OAuth setup: create an OAuth 2.0 Client (Web application) in Google Cloud Console with Authorised JavaScript origin `http://localhost:5173`.
 
-Legacy Streamlit UI (dry-run demos only):
-```bash
-streamlit run ui/app.py
-```
-
 ---
 
 ## Running Tests
@@ -81,21 +76,26 @@ React 19 + Vite (port 5173)
   ↕ EventSource credentials:include — SSE
 FastAPI 0.115 (port 8000)
   ↕ session_manager: user_id → ConversationalAgent (LRU, 30-min TTL)
-ConversationalAgent  ← Flash-Lite intent classifier (5 intents)
-  ↓ financial_analysis    ↓ memory_query    ↓ financial_question    ↓ off_topic
-run_pipeline()       search summaries    primary LLM + history   rejection
+ConversationalAgent  ← Flash-Lite intent classifier (7 intents)
+  ↓ financial_analysis  ↓ comparison  ↓ refinement  ↓ memory_query  ↓ financial_question  ↓ off_topic
+run_pipeline()       comparison_    refinement_    search          primary LLM      rejection
+                     agent          handler        summaries       + history
   ↓
-Researcher → Quant Analyst → Editor → Markdown report
+Researcher → Quant Analyst → Editor → Report + Charts + run_artifacts.json
 ```
 
 | Component | File | Responsibilities |
 |---|---|---|
 | FastAPI app | `backend/main.py` | CORS, lifespan DB migration, router registration |
 | Auth | `backend/routers/auth.py` | Google ID token → JWT httpOnly cookie |
-| Chat + SSE | `backend/routers/chat.py` | POST /chat → event_id; GET /stream → EventSource |
+| Chat + SSE | `backend/routers/chat.py` | POST /chat → event_id; GET /stream → EventSource; generates charts + saves report |
+| Files + Export | `backend/routers/files.py` | POST /files/upload; POST /export/{pdf,docx,xlsx}; GET /reports/{id}/sources |
+| Feedback | `backend/routers/feedback.py` | POST /feedback (👍/👎); GET /feedback/stats |
 | Session manager | `backend/core/session_manager.py` | user_id → ConversationalAgent LRU cache |
-| ConversationalAgent | `agents/conversational_agent.py` | Routing, memory injection, pipeline calls |
-| IntentClassifier | `agents/intent_classifier.py` | Flash-Lite JSON classifier; 5 intents |
+| ConversationalAgent | `agents/conversational_agent.py` | 7-intent routing, memory injection, pipeline calls |
+| IntentClassifier | `agents/intent_classifier.py` | Flash-Lite JSON classifier; 7 intents |
+| ComparisonAgent | `agents/comparison_agent.py` | Multi-ticker pipeline + Flash comparison table |
+| RefinementHandler | `agents/refinement_handler.py` | DB report retrieval + Flash LLM modification |
 | Researcher | `agents/researcher.py` | yfinance + Tavily; max 5 iterations/ticker |
 | Quant Analyst | `agents/quant_analyst.py` | CAGR, P/E vs benchmark, bull/bear cases |
 | Editor | `agents/editor.py` | SOP rubric, grounding check, disclaimer |
@@ -113,23 +113,28 @@ Researcher → Quant Analyst → Editor → Markdown report
 | `backend/core/event_store.py` | event_id → asyncio.Queue registry for SSE |
 | `frontend/src/hooks/useStreamingChat.ts` | POST /chat → EventSource /stream |
 | `frontend/src/lib/api.ts` | Typed fetch wrappers for all FastAPI endpoints |
+| `frontend/src/components/chat/ProvenancePanel.tsx` | "View Sources" — metric → tool → step citations |
+| `frontend/src/components/PlotlyChart.tsx` | Lazy-loaded Plotly chart renderer |
 | `ai_financial_analyst/core/state.py` | `AgentState` TypedDict — inner pipeline contract |
 | `ai_financial_analyst/core/conversation_state.py` | `ConversationState` TypedDict — chat layer |
 | `ai_financial_analyst/core/llm.py` | Gemini client: retry + circuit breaker + Flash-Lite fallback |
 | `ai_financial_analyst/core/sanitizer.py` | Injection filter (full-content rejection) + canary token |
-| `ai_financial_analyst/memory/long_term.py` | SQLite: preferences, summaries, conversations, messages (user-scoped) |
+| `ai_financial_analyst/memory/long_term.py` | SQLite: preferences, summaries, conversations, messages, reports, feedback (user-scoped) |
 | `ai_financial_analyst/memory/memory_manager.py` | Memory facade: context injection, preference extraction, summary saving |
 | `ai_financial_analyst/tools/calculator.py` | AST-validated numexpr evaluator (no REPL) |
+| `ai_financial_analyst/tools/chart_generator.py` | Plotly JSON: price, P/E comparison, key financials |
+| `ai_financial_analyst/tools/file_parser.py` | CSV (pandas fixed-schema + formula injection scrub) + PDF (pdfplumber + Flash-Lite) |
+| `ai_financial_analyst/tools/xlsx_exporter.py` | Excel workbook with live CAGR formula cells |
 
 ---
 
 ## Critical Design Decisions (Do Not Change Without Review)
 
 ### No Python REPL
-`CalculatorTool` uses `numexpr` with a three-level AST guard (node whitelist, name allowlist, function allowlist). Changing to a general REPL is a security regression.
+`CalculatorTool` uses `numexpr` with a three-level AST guard (node whitelist, name allowlist, function allowlist). CSV files are similarly restricted — only a fixed-schema JSON summary is produced, never arbitrary pandas operations. Changing either to a general REPL is a security regression.
 
 ### Full-Content Injection Rejection
-`ContentSanitizer._regex_filter()` rejects the **entire content block** on any injection pattern match. Sentence-level redaction is insufficient — surrounding context still guides adversarial behaviour.
+`ContentSanitizer._regex_filter()` rejects the **entire content block** on any injection pattern match. Sentence-level redaction is insufficient. CSV cell values starting with `=`, `+`, `-`, `@` are also scrubbed before the summary reaches the LLM.
 
 ### Sequential Agent Execution
 Agents run one at a time. Concurrent execution saturates the free-tier 15 RPM limit and triggers the circuit breaker.
@@ -140,14 +145,17 @@ All agent nodes return `AgentState(**{**state, "key": value})` — never `AgentS
 ### `ConversationState` vs `AgentState` — Two Separate TypedDicts
 `ConversationState` is the chat layer (session ID, messages, intent). `AgentState` is the pipeline (raw_data, analysis, report). Never merged — the agent calls `run_pipeline()` and receives the final report; it never touches `AgentState` directly.
 
-### Five-Intent Taxonomy
-`memory_query` must remain a distinct intent. Without it, "What did we find about AAPL earlier?" gets classified as `financial_analysis` (AAPL is present) and re-runs the full pipeline instead of returning the stored summary.
+### Seven-Intent Taxonomy
+Each intent routes to a distinct handler. Critical intents that must remain separate:
+- `memory_query` — without it, "What did we find about AAPL earlier?" triggers the full pipeline (AAPL present)
+- `comparison` — without it, "Compare AAPL vs MSFT" runs full analysis instead of generating a comparison table
+- `refinement` — without it, "Make the bear case more pessimistic" re-runs the full pipeline unnecessarily
 
 ### user_id Scoping
 All `LongTermMemory` queries include `WHERE user_id = ?`. The FastAPI DB migration adds `user_id TEXT DEFAULT 'default'` to all tables — safe to run on existing databases. Existing tests use `user_id="default"` implicitly.
 
-### Flash-Lite for Classification
-`IntentClassifier` and `MemoryManager` preference extraction use `get_subllm()` (Flash-Lite). Primary LLM (Flash) is reserved for analysis reasoning.
+### Flash-Lite for Classification and Summarisation
+`IntentClassifier`, `MemoryManager` preference extraction, analysis summarisation, and PDF summarisation all use `get_subllm()` (Flash-Lite). Primary LLM (Flash) is reserved for analysis reasoning, financial questions, comparison tables, and refinements.
 
 ---
 
@@ -165,6 +173,12 @@ All `LongTermMemory` queries include `WHERE user_id = ?`. The FastAPI DB migrati
 | `fastapi` | ≥0.115 |
 | `google-auth` | ≥2.29 |
 | `python-jose[cryptography]` | ≥3.3 |
+| `plotly` | ≥5.24 |
+| `pandas` | ≥2.2 |
+| `pdfplumber` | ≥0.11 |
+| `weasyprint` | ≥62.0 |
+| `python-docx` | ≥1.1 |
+| `openpyxl` | ≥3.1 |
 
 ---
 
@@ -173,7 +187,7 @@ All `LongTermMemory` queries include `WHERE user_id = ?`. The FastAPI DB migrati
 | Service | Limit | Mitigation |
 |---|---|---|
 | Gemini Flash | ~1,500 RPD, 15 RPM | Circuit breaker (3×429 in 30s) + Flash-Lite fallback |
-| Gemini Flash-Lite | ~1,500 RPD, 30 RPM | Sub-tasks only (classification, summaries) |
+| Gemini Flash-Lite | ~1,500 RPD, 30 RPM | Sub-tasks only (classification, summaries, PDF parsing) |
 | Tavily | 1,000 credits/month | 4-hour diskcache |
 | yfinance | No hard limit | 4-hour diskcache |
 
@@ -188,4 +202,5 @@ All `LongTermMemory` queries include `WHERE user_id = ?`. The FastAPI DB migrati
 | `SanitizationAlert` | Canary token in agent output | Inspect `run_artifacts.json` |
 | `401 Unauthorized` on `/auth/me` at startup | Expected — no session cookie yet | Not a bug; handled by `useAuth` catch returning null |
 | `button?type=standard 403` | Google button iframe with undefined params | Cosmetic only; sign-in still works |
+| PDF export `501 Not Implemented` | weasyprint not installed | `pip install weasyprint`; macOS may need `brew install pango` |
 | `GOOGLE_API_KEY not set` | `.env` not loaded | Run from project root |

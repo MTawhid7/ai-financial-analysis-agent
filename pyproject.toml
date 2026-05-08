@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-financial-analyst"
-version = "0.1.0"
-description = "Autonomous AI Financial Analyst Agent using ReAct + Multi-Agent Architecture"
+version = "1.0.0"
+description = "Conversational AI Financial Analyst Agent — ReAct + Multi-Agent + FastAPI + React"
 requires-python = ">=3.11"
 dependencies = [
     "langchain==1.2.17",
@@ -19,7 +19,6 @@ dependencies = [
     "pydantic>=2.10,<3.0",
     "tenacity==9.1.2",
     "diskcache==5.6.3",
-    "streamlit==1.45.1",
     "langsmith==0.8.0",
     "numexpr==2.10.2",
     "python-dotenv==1.1.0",
@@ -27,12 +26,13 @@ dependencies = [
 
 [project.optional-dependencies]
 server = [
+    # FastAPI stack
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "python-multipart>=0.0.9",
     "google-auth>=2.29",
     "python-jose[cryptography]>=3.3",
-    # Phase 5 — Multimodal
+    # Multimodal (Phase 5)
     "plotly>=5.24",
     "pandas>=2.2",
     "pdfplumber>=0.11",
@@ -51,7 +51,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["ai_financial_analyst*", "backend*", "ui*"]
+include = ["ai_financial_analyst*", "backend*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -60,5 +60,5 @@ testpaths = ["tests"]
 addopts = "-v"
 
 [tool.coverage.run]
-source = ["ai_financial_analyst", "ui"]
+source = ["ai_financial_analyst", "backend"]
 omit = ["tests/*"]

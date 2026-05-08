@@ -70,3 +70,10 @@ errors.jsonl
 # === Logs ===
 *.log
 logs/
+
+# === Frontend build output ===
+frontend/dist/
+frontend/node_modules/
+
+# === Workspace (user-generated export files) ===
+workspace/
