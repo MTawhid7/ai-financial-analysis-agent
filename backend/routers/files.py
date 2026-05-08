@@ -74,6 +74,40 @@ async def upload_file(
 # ---------------------------------------------------------------------------
 
 
+@router.get("/reports/{report_id}/sources")
+async def get_report_sources(
+    report_id: str,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """Return the analysis citations for a report (used by the provenance panel)."""
+    async with aiosqlite.connect(get_db_path()) as db:
+        async with db.execute(
+            "SELECT tickers, analysis_json FROM reports WHERE id = ? AND user_id = ?",
+            (report_id, user.id),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+
+    analysis = json.loads(row[1] or "{}")
+    # Extract only the citations sub-dict so the response stays compact
+    citations_by_ticker: dict = {}
+    for ticker, ta in analysis.items():
+        cit = ta.get("citations", {})
+        metrics: dict = {}
+        for metric, source in cit.items():
+            metrics[metric] = {
+                "value": ta.get(metric),
+                "source_tool": source.get("source_tool"),
+                "observation_step": source.get("observation_step"),
+            }
+        if metrics:
+            citations_by_ticker[ticker] = metrics
+
+    return {"tickers": row[0], "analysis": citations_by_ticker}
+
+
 @router.get("/export/available")
 async def export_available() -> dict:
     """Return which export formats are supported on this server."""

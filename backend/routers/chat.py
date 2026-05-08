@@ -60,6 +60,8 @@ async def send_message(
             queue=queue,
             conversation_id=conversation_id,
             user_id=user.id,
+            # Pass conversation_id to process_message so refinement_handler
+            # can look up the latest stored report for this conversation.
         )
     )
 
@@ -166,7 +168,9 @@ async def _run_pipeline_and_enqueue(
 
     try:
         response_text, new_state = await agent.process_message(
-            message, state, step_callback=step_callback
+            message, state,
+            step_callback=step_callback,
+            conversation_id=conversation_id,
         )
         await _persist_turn(conversation_id, user_id, message, response_text, new_state)
 

@@ -1,24 +1,112 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
-/* Base resets */
+/* ── Fonts ── */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+
+/* ── Base ── */
 *, *::before, *::after { box-sizing: border-box; }
 
 body {
   margin: 0;
   font-family: Inter, system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
-  background: #09090b;
+  -moz-osx-font-smoothing: grayscale;
+  background: #09090b;   /* zinc-950 */
   color: #fafafa;
 }
 
-#root {
-  height: 100dvh;
-  overflow: hidden;
+#root { height: 100dvh; overflow: hidden; }
+
+/* ── Tabular numerals — financial tables never misalign ── */
+table, .tabular-nums, [data-metric] {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
 }
 
-/* Custom scrollbar */
+/* ── Monospace for numbers/code ── */
+code, kbd, pre, .font-mono {
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+}
+
+/* ── Prose overrides — dark theme financial report rendering ── */
+.prose {
+  --tw-prose-body: #d4d4d8;
+  --tw-prose-headings: #fafafa;
+  --tw-prose-bold: #fafafa;
+  --tw-prose-links: #a78bfa;
+  --tw-prose-code: #e4e4e7;
+  --tw-prose-pre-bg: #18181b;
+  --tw-prose-th-borders: #3f3f46;
+  --tw-prose-td-borders: #27272a;
+  --tw-prose-hr: #3f3f46;
+  --tw-prose-bullets: #71717a;
+  --tw-prose-counters: #71717a;
+  --tw-prose-quotes: #a1a1aa;
+  --tw-prose-quote-borders: #52525b;
+}
+
+.prose h1 { font-size: 1.25rem; font-weight: 600; margin-top: 1.5rem; }
+.prose h2 { font-size: 1.05rem; font-weight: 600; margin-top: 1.25rem; border-bottom: 1px solid #3f3f46; padding-bottom: 0.25rem; }
+.prose h3 { font-size: 0.95rem; font-weight: 600; margin-top: 1rem; }
+.prose p  { margin: 0.5rem 0; line-height: 1.65; }
+
+/* Financial tables — tight, right-aligned numbers */
+.prose table {
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  border-collapse: collapse;
+  width: 100%;
+}
+.prose th {
+  background: #27272a;
+  padding: 0.35rem 0.6rem;
+  text-align: left;
+  font-weight: 600;
+  color: #e4e4e7;
+  border: 1px solid #3f3f46;
+}
+.prose td {
+  padding: 0.3rem 0.6rem;
+  border: 1px solid #27272a;
+  color: #d4d4d8;
+}
+/* Right-align numeric cells (second column onwards in metric tables) */
+.prose td:not(:first-child) {
+  text-align: right;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.78rem;
+}
+
+.prose code:not(pre code) {
+  background: #27272a;
+  padding: 0.1em 0.35em;
+  border-radius: 0.25rem;
+  font-size: 0.82em;
+}
+
+.prose blockquote {
+  border-left: 3px solid #52525b;
+  padding-left: 0.75rem;
+  color: #a1a1aa;
+  font-style: normal;
+}
+
+.prose ul > li::marker { color: #71717a; }
+.prose ol > li::marker { color: #71717a; }
+.prose hr { border-color: #3f3f46; }
+
+/* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 9999px; }
 ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+
+/* ── Smooth scrolling ── */
+html { scroll-behavior: smooth; }
+
+/* ── Focus ring ── */
+:focus-visible {
+  outline: 2px solid #7c3aed;
+  outline-offset: 2px;
+}

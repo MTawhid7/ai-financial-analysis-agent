@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 load_dotenv()
 
 from .core.database import run_migrations
-from .routers import auth, chat, conversations, files, memory
+from .routers import auth, chat, conversations, feedback, files, memory
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -54,6 +54,7 @@ app.include_router(auth.router)
 app.include_router(chat.router)
 app.include_router(conversations.router)
 app.include_router(memory.router)
+app.include_router(feedback.router)
 app.include_router(files.router)
 
 

@@ -196,3 +196,49 @@ async function _exportBlob(url: string): Promise<Blob> {
 export const exportPdf  = (id: string) => _exportBlob(`${API_BASE}/export/pdf/${id}`);
 export const exportDocx = (id: string) => _exportBlob(`${API_BASE}/export/docx/${id}`);
 export const exportXlsx = (id: string) => _exportBlob(`${API_BASE}/export/xlsx/${id}`);
+
+// ---------------------------------------------------------------------------
+// Feedback
+// ---------------------------------------------------------------------------
+
+export async function submitFeedback(
+  conversationId: string,
+  messageIndex: number,
+  rating: 1 | -1,
+): Promise<void> {
+  await fetch(`${API_BASE}/feedback`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      conversation_id: conversationId,
+      message_index: messageIndex,
+      rating,
+    }),
+  });
+}
+
+export async function getFeedbackStats(
+  conversationId: string,
+): Promise<Record<number, 1 | -1>> {
+  const res = await fetch(`${API_BASE}/feedback/stats/${conversationId}`, {
+    credentials: "include",
+  });
+  if (!res.ok) return {};
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Sources (provenance — returns analysis citations for a report)
+// ---------------------------------------------------------------------------
+
+export async function getReportSources(reportId: string): Promise<{
+  tickers: string;
+  analysis: Record<string, unknown>;
+}> {
+  const res = await fetch(`${API_BASE}/reports/${reportId}/sources`, {
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error("Sources not found");
+  return res.json();
+}

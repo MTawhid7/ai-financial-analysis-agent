@@ -1,7 +1,7 @@
 # Roadmap: AI Financial Analyst Agent
 
-**Last updated:** 2026-05-07  
-**Status:** Phase 4 complete — Phase 5 (Multimodal) next
+**Last updated:** 2026-05-08  
+**Status:** Phases 1–7 complete
 
 ---
 
@@ -39,9 +39,9 @@ Researcher → Quant Analyst → Editor → Markdown report
 | **3** | Streamlit Streaming | Dropped | Streaming implemented properly in Phase 4B |
 | **4A** | FastAPI Backend + Google Auth | ✅ Complete | Google OAuth, JWT httpOnly cookie, DB migration, SSE endpoint |
 | **4B** | React + Vite Frontend | ✅ Complete | Login page, chat interface, markdown rendering, SSE streaming, memory panel |
-| **5** | Multimodal | Planned | CSV/PDF upload, Plotly charts, PDF/Word/Excel export |
-| **6** | Refinement + Comparison | Planned | Result editing, AAPL vs MSFT side-by-side, feedback ratings |
-| **7** | Polish + Vector Memory | Planned | Typography system, provenance panel, sentence-transformers semantic search |
+| **5** | Multimodal | ✅ Complete | CSV/PDF upload, Plotly charts, PDF/Word/Excel export |
+| **6** | Refinement + Comparison | ✅ Complete | Comparison intent, result refinement, 👍/👎 feedback |
+| **7** | Polish + Provenance | ✅ Complete | Typography system, provenance panel, memory management UI |
 
 ---
 

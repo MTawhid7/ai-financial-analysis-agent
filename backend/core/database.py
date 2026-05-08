@@ -91,6 +91,18 @@ async def run_migrations() -> None:
             except Exception:
                 pass  # Column already exists — expected on subsequent startups
 
+        # Phase 6: feedback table (👍/👎 ratings per message)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id              TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                user_id         TEXT NOT NULL,
+                message_index   INTEGER NOT NULL,
+                rating          INTEGER NOT NULL,  -- 1 = thumbs up, -1 = thumbs down
+                created_at      REAL NOT NULL
+            )
+        """)
+
         # Phase 5: reports table (stores full pipeline output for export)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS reports (

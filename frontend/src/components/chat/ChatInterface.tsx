@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { getConversation, type MessageOut } from "../../lib/api";
+import {
+  getConversation,
+  getFeedbackStats,
+  type MessageOut,
+} from "../../lib/api";
 import {
   useStreamingChat,
   type ChartDescriptor,
@@ -19,6 +23,7 @@ interface DisplayMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  messageIndex?: number;
   isStreaming?: boolean;
   stepEvents?: StepEvent[];
   charts?: ChartDescriptor[];
@@ -37,14 +42,27 @@ export function ChatInterface({ conversationId }: Props) {
     enabled: !!conversationId,
   });
 
+  const { data: feedbackStats = {} } = useQuery({
+    queryKey: ["feedback", conversationId],
+    queryFn: () => getFeedbackStats(conversationId),
+    enabled: !!conversationId,
+  });
+
   useEffect(() => {
     if (detail) {
+      let assistantIdx = 0;
       setMessages(
-        detail.messages.map((m: MessageOut, i: number) => ({
-          id: `${conversationId}-${i}`,
-          role: m.role,
-          content: m.content,
-        }))
+        detail.messages.map((m: MessageOut, i: number) => {
+          const msg: DisplayMessage = {
+            id: `${conversationId}-${i}`,
+            role: m.role,
+            content: m.content,
+          };
+          if (m.role === "assistant") {
+            msg.messageIndex = assistantIdx++;
+          }
+          return msg;
+        })
       );
     }
   }, [detail, conversationId]);
@@ -53,7 +71,6 @@ export function ChatInterface({ conversationId }: Props) {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Build a descriptive message when a file is parsed
   const handleFileParsed = (summary: Record<string, unknown>, filename: string) => {
     const ext = filename.split(".").pop()?.toLowerCase();
     let description = `📎 **${filename}** uploaded.`;
@@ -63,29 +80,29 @@ export function ChatInterface({ conversationId }: Props) {
       const cols = (summary.columns as string[] | undefined)?.join(", ");
       if (shape) description += ` ${shape.rows} rows × ${shape.columns} columns.`;
       if (cols) description += ` Columns: ${cols}.`;
-      if ((summary.formula_cells_removed as number) > 0)
-        description += ` ⚠️ ${summary.formula_cells_removed} formula cell(s) were sanitised.`;
+      const removed = summary.formula_cells_removed as number | undefined;
+      if (removed && removed > 0)
+        description += ` ⚠️ ${removed} formula cell(s) were sanitised.`;
     } else if (ext === "pdf") {
       const pages = summary.pages as number | undefined;
       if (pages) description += ` ${pages} page(s).`;
       const s = summary.summary as string | undefined;
       if (s) description += `\n\n${s}`;
     }
-
     description += "\n\nWhat would you like to do with this file?";
 
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `file-${Date.now()}`,
-        role: "assistant",
-        content: description,
-      },
-    ]);
+    setMessages((prev) => [...prev, {
+      id: `file-${Date.now()}`,
+      role: "assistant",
+      content: description,
+    }]);
   };
 
   const handleSend = async (text: string) => {
     if (isStreaming) return;
+
+    // Count current assistant messages to determine next messageIndex
+    const nextAssistantIdx = messages.filter((m) => m.role === "assistant").length;
 
     const userMsg: DisplayMessage = { id: `user-${Date.now()}`, role: "user", content: text };
     const assistantId = `assistant-${Date.now()}`;
@@ -93,6 +110,7 @@ export function ChatInterface({ conversationId }: Props) {
       id: assistantId,
       role: "assistant",
       content: "",
+      messageIndex: nextAssistantIdx,
       isStreaming: true,
       stepEvents: [],
     };
@@ -151,11 +169,16 @@ export function ChatInterface({ conversationId }: Props) {
             <div>
               <p className="text-zinc-300 font-medium">AI Financial Analyst</p>
               <p className="text-zinc-500 text-sm mt-1 max-w-xs">
-                Ask me to analyse stocks, upload a CSV or PDF, or recall past research.
+                Analyse stocks, compare companies, or ask financial questions.
               </p>
             </div>
             <div className="flex flex-wrap gap-2 justify-center mt-2">
-              {["Analyse AAPL", "What is P/E ratio?", "Compare MSFT and GOOGL"].map((s) => (
+              {[
+                "Analyse AAPL",
+                "Compare AAPL vs MSFT",
+                "What is a P/E ratio?",
+                "What did we find about NVDA?",
+              ].map((s) => (
                 <button
                   key={s}
                   onClick={() => handleSend(s)}
@@ -175,10 +198,17 @@ export function ChatInterface({ conversationId }: Props) {
             <AssistantBubble
               key={msg.id}
               content={msg.content}
+              messageIndex={msg.messageIndex}
+              conversationId={conversationId}
               isStreaming={msg.isStreaming}
               stepEvents={msg.stepEvents}
               charts={msg.charts}
               reportId={msg.reportId}
+              existingRating={
+                msg.messageIndex !== undefined
+                  ? (feedbackStats[msg.messageIndex] as 1 | -1 | undefined) ?? null
+                  : null
+              }
             />
           )
         )}
@@ -187,7 +217,7 @@ export function ChatInterface({ conversationId }: Props) {
         <div ref={bottomRef} />
       </div>
 
-      {/* Input area with file upload */}
+      {/* Input area */}
       <div className="border-t border-zinc-800">
         <div className="flex items-center gap-2 px-4 pt-2">
           <FileUploadZone onParsed={handleFileParsed} disabled={isStreaming} />
