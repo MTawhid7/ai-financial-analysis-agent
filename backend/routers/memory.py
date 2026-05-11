@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import time
 
-import aiosqlite
 from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel
+from sqlalchemy import select, delete
 
-from ..core.database import get_db_path
+from ..core.database import async_session_factory
 from ..core.deps import CurrentUser, get_current_user
+from ..core.models import Preference, AnalysisSummary
 
 router = APIRouter(prefix="/memory", tags=["memory"])
 
@@ -36,13 +37,12 @@ class PreferencePatch(BaseModel):
 async def get_preferences(
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, str]:
-    async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute(
-            "SELECT key, value FROM preferences WHERE user_id = ? ORDER BY key",
-            (user.id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-    return {r[0]: r[1] for r in rows}
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(Preference).where(Preference.user_id == user.id).order_by(Preference.key)
+        )
+        rows = result.scalars().all()
+    return {r.key: r.value for r in rows}
 
 
 @router.patch("/preferences", status_code=status.HTTP_204_NO_CONTENT)
@@ -50,14 +50,17 @@ async def upsert_preference(
     body: PreferencePatch,
     user: CurrentUser = Depends(get_current_user),
 ) -> None:
-    async with aiosqlite.connect(get_db_path()) as db:
-        await db.execute(
-            "INSERT INTO preferences (key, value, updated_at, user_id) VALUES (?, ?, ?, ?)"
-            " ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
-            " WHERE user_id = ?",
-            (body.key, body.value, time.time(), user.id, user.id),
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(Preference).where(Preference.key == body.key, Preference.user_id == user.id)
         )
-        await db.commit()
+        pref = result.scalar_one_or_none()
+        if pref:
+            pref.value = body.value
+            pref.updated_at = time.time()
+        else:
+            session.add(Preference(key=body.key, value=body.value, user_id=user.id))
+        await session.commit()
 
 
 @router.delete("/preferences/{key}", status_code=status.HTTP_204_NO_CONTENT)
@@ -65,11 +68,11 @@ async def delete_preference(
     key: str,
     user: CurrentUser = Depends(get_current_user),
 ) -> None:
-    async with aiosqlite.connect(get_db_path()) as db:
-        await db.execute(
-            "DELETE FROM preferences WHERE key = ? AND user_id = ?", (key, user.id)
+    async with async_session_factory() as session:
+        await session.execute(
+            delete(Preference).where(Preference.key == key, Preference.user_id == user.id)
         )
-        await db.commit()
+        await session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -90,14 +93,16 @@ async def list_summaries(
     offset: int = 0,
     user: CurrentUser = Depends(get_current_user),
 ) -> list[SummaryOut]:
-    async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute(
-            "SELECT id, tickers, summary_text, created_at FROM analysis_summaries"
-            " WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-            (user.id, limit, offset),
-        ) as cursor:
-            rows = await cursor.fetchall()
-    return [SummaryOut(id=r[0], tickers=r[1], summary_text=r[2], created_at=r[3]) for r in rows]
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(AnalysisSummary)
+            .where(AnalysisSummary.user_id == user.id)
+            .order_by(AnalysisSummary.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        rows = result.scalars().all()
+    return [SummaryOut(id=r.id, tickers=r.tickers, summary_text=r.summary_text, created_at=r.created_at) for r in rows]
 
 
 @router.delete("/summaries/{summary_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -105,12 +110,11 @@ async def delete_summary(
     summary_id: int,
     user: CurrentUser = Depends(get_current_user),
 ) -> None:
-    async with aiosqlite.connect(get_db_path()) as db:
-        await db.execute(
-            "DELETE FROM analysis_summaries WHERE id = ? AND user_id = ?",
-            (summary_id, user.id),
+    async with async_session_factory() as session:
+        await session.execute(
+            delete(AnalysisSummary).where(AnalysisSummary.id == summary_id, AnalysisSummary.user_id == user.id)
         )
-        await db.commit()
+        await session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +127,7 @@ async def clear_all_memory(
     user: CurrentUser = Depends(get_current_user),
 ) -> None:
     """Delete all preferences and analysis summaries for the current user."""
-    async with aiosqlite.connect(get_db_path()) as db:
-        await db.execute("DELETE FROM preferences WHERE user_id = ?", (user.id,))
-        await db.execute("DELETE FROM analysis_summaries WHERE user_id = ?", (user.id,))
-        await db.commit()
+    async with async_session_factory() as session:
+        await session.execute(delete(Preference).where(Preference.user_id == user.id))
+        await session.execute(delete(AnalysisSummary).where(AnalysisSummary.user_id == user.id))
+        await session.commit()

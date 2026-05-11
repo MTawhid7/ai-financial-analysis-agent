@@ -16,11 +16,9 @@ import tempfile
 import uuid
 from pathlib import Path
 
-import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
-from ..core.database import get_db_path
 from ..core.deps import CurrentUser, get_current_user
 from ..core import session_manager
 
@@ -99,19 +97,21 @@ async def get_report_sources(
     user: CurrentUser = Depends(get_current_user),
 ) -> dict:
     """Return citations + web source URLs for a report."""
-    async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute(
-            "SELECT tickers, analysis_json, raw_data_json FROM reports"
-            " WHERE id = ? AND user_id = ?",
-            (report_id, user.id),
-        ) as cursor:
-            row = await cursor.fetchone()
+    from sqlalchemy import select
+    from ..core.database import async_session_factory
+    from ..core.models import Report
 
-    if not row:
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(Report).where(Report.id == report_id, Report.user_id == user.id)
+        )
+        report = result.scalar_one_or_none()
+
+    if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
 
-    analysis = json.loads(row[1] or "{}")
-    raw_data = json.loads(row[2] or "{}")
+    analysis = json.loads(report.analysis_json or "{}")
+    raw_data = json.loads(report.raw_data_json or "{}")
 
     # Build citations per ticker
     citations_by_ticker: dict = {}
@@ -144,7 +144,7 @@ async def get_report_sources(
                     })
 
     return {
-        "tickers": row[0],
+        "tickers": report.tickers,
         "analysis": citations_by_ticker,
         "web_sources": web_sources,
     }
@@ -167,22 +167,24 @@ async def export_available() -> dict:
 
 
 async def _load_report(report_id: str, user_id: str) -> dict:
-    async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute(
-            "SELECT tickers, report_markdown, raw_data_json, analysis_json"
-            " FROM reports WHERE id = ? AND user_id = ?",
-            (report_id, user_id),
-        ) as cursor:
-            row = await cursor.fetchone()
+    from sqlalchemy import select
+    from ..core.database import async_session_factory
+    from ..core.models import Report
 
-    if not row:
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(Report).where(Report.id == report_id, Report.user_id == user_id)
+        )
+        report = result.scalar_one_or_none()
+
+    if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
 
     return {
-        "tickers": row[0],
-        "report_markdown": row[1],
-        "raw_data": json.loads(row[2] or "{}"),
-        "analysis": json.loads(row[3] or "{}"),
+        "tickers": report.tickers,
+        "report_markdown": report.report_markdown,
+        "raw_data": json.loads(report.raw_data_json or "{}"),
+        "analysis": json.loads(report.analysis_json or "{}"),
     }
 
 

@@ -14,7 +14,9 @@ interface PlotProps {
 // is undefined — without it React.lazy throws "Element type is invalid".
 const Plot = lazy<ComponentType<PlotProps>>(() =>
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  import("react-plotly.js").then((mod: any) => ({ default: mod.default ?? mod }))
+  import("react-plotly.js").then((mod: any) => ({
+    default: mod.default?.default || mod.default || mod
+  }))
 );
 
 interface Props {

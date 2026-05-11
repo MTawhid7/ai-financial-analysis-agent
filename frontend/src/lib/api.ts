@@ -24,6 +24,8 @@ export interface MessageOut {
   content: string;
   intent: string;
   tickers: string;
+  charts?: any[];
+  report_id?: string;
   created_at: number;
 }
 

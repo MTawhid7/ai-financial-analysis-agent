@@ -41,7 +41,7 @@ flowchart LR
     MGR -->|run_financial_analysis| Pipeline
     MGR -->|compare_stocks| Pipeline
     MGR -->|edit_report_section| DB2[("📋 reports\ntable")]
-    MGR -->|recall_past_analysis| DB[("🧠 SQLite\nmemory.db")]
+    MGR -->|recall_past_analysis| DB[("🐘 Postgres\nSupabase")]
     MGR -->|answer_finance_question| LLM["Gemini Flash\n(direct answer)"]
     MGR -->|generate_chart| Charts["📊 Plotly JSON"]
     MGR -->|reject_request| Reject["Polite rejection"]
@@ -144,7 +144,7 @@ ai_financial_analyst/
     sanitizer.py             Injection filter + canary token
     budget_tracker.py / cache.py / tracing.py / artifacts.py
   memory/
-    long_term.py             SQLite: preferences, summaries, conversations, messages, reports
+    long_term.py             SQLAlchemy/Postgres: preferences, summaries, conversations, messages, reports
     memory_manager.py        Facade: context injection, preference extraction, summary saving
     short_term.py            Token-budget context window
   tools/
@@ -202,7 +202,7 @@ docs/
 - Canary token detection in agent output
 - All tool inputs validated with Pydantic v2 `extra='forbid'`
 - JWT in httpOnly cookie (not accessible to JavaScript)
-- Per-user data isolation via `user_id` scoping on all SQLite queries
+- Per-user data isolation via `user_id` scoping on all Postgres queries
 
 ---
 

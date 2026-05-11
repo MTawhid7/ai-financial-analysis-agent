@@ -39,10 +39,6 @@ export function ChatInterface({ conversationId, initialMessage, onInitialMessage
   const { streamMessage } = useStreamingChat();
   const qc = useQueryClient();
   const initialSentRef = useRef(false);
-  // Guard: only load from DB once per component instance. Without this, getConversation
-  // resolving for a brand-new conversation wipes locally-added streaming messages.
-  const dbLoadedRef = useRef(false);
-
   const { data: detail } = useQuery({
     queryKey: ["conversation", conversationId],
     queryFn: () => getConversation(conversationId),
@@ -50,17 +46,36 @@ export function ChatInterface({ conversationId, initialMessage, onInitialMessage
   });
 
   useEffect(() => {
-    if (detail && !dbLoadedRef.current) {
-      dbLoadedRef.current = true;
-      setMessages(
-        detail.messages.map((m: MessageOut, i: number) => ({
-          id: `${conversationId}-${i}`,
-          role: m.role,
-          content: m.content,
-        }))
-      );
+    // Only update from DB if we're not actively streaming locally
+    // This allows background refetches to safely update the UI when navigating
+    if (detail && !isStreaming) {
+      setMessages((prev) => {
+        // Guard against stale DB state overwriting optimistic local messages
+        if (prev.length > detail.messages.length) {
+          return prev;
+        }
+
+        return detail.messages.map((m: MessageOut, i: number) => {
+          const existing = prev[i];
+          // Preserve local ephemeral step events if the content hasn't changed
+          if (existing && existing.role === m.role && existing.content === m.content) {
+            return {
+              ...existing,
+              charts: m.charts ?? existing.charts,
+              reportId: m.report_id ?? existing.reportId,
+            };
+          }
+          return {
+            id: `${conversationId}-${i}`,
+            role: m.role,
+            content: m.content,
+            charts: m.charts,
+            reportId: m.report_id,
+          };
+        });
+      });
     }
-  }, [detail, conversationId]);
+  }, [detail, conversationId, isStreaming]);
 
   // Fire initialMessage on first mount (from landing input)
   useEffect(() => {
@@ -186,6 +201,9 @@ export function ChatInterface({ conversationId, initialMessage, onInitialMessage
             .then(() => qc.invalidateQueries({ queryKey: ["conversations"] }))
             .catch(() => {});
         }
+        
+        // Refetch the conversation from DB to cement the persisted charts/reports
+        qc.invalidateQueries({ queryKey: ["conversation", conversationId] });
       },
       (errDetail) => {
         setMessages((prev) =>

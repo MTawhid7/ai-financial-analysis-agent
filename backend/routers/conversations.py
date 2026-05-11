@@ -12,12 +12,13 @@ from __future__ import annotations
 import time
 import uuid
 
-import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import select, delete, update
 
-from ..core.database import get_db_path
+from ..core.database import async_session_factory
 from ..core.deps import CurrentUser, get_current_user
+from ..core.models import Conversation, Message
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -34,6 +35,8 @@ class MessageOut(BaseModel):
     content: str
     intent: str
     tickers: str
+    charts: list[dict] | None = None
+    report_id: str | None = None
     created_at: float
 
 
@@ -55,14 +58,16 @@ class UpdateTitleRequest(BaseModel):
 async def list_conversations(
     user: CurrentUser = Depends(get_current_user),
 ) -> list[ConversationSummary]:
-    async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute(
-            "SELECT id, title, created_at, updated_at FROM conversations"
-            " WHERE user_id = ? ORDER BY updated_at DESC LIMIT 50",
-            (user.id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-    return [ConversationSummary(id=r[0], title=r[1], created_at=r[2], updated_at=r[3]) for r in rows]
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(Conversation)
+            .where(Conversation.user_id == user.id)
+            .order_by(Conversation.updated_at.desc())
+            .limit(50)
+        )
+        rows = result.scalars().all()
+    
+    return [ConversationSummary(id=r.id, title=r.title, created_at=r.created_at, updated_at=r.updated_at) for r in rows]
 
 
 @router.post("", response_model=ConversationSummary, status_code=status.HTTP_201_CREATED)
@@ -72,13 +77,19 @@ async def create_conversation(
 ) -> ConversationSummary:
     conv_id = str(uuid.uuid4())
     now = time.time()
-    async with aiosqlite.connect(get_db_path()) as db:
-        await db.execute(
-            "INSERT INTO conversations (id, title, user_id, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (conv_id, body.title[:80], user.id, now, now),
-        )
-        await db.commit()
+    
+    conv = Conversation(
+        id=conv_id,
+        title=body.title[:80],
+        user_id=user.id,
+        created_at=now,
+        updated_at=now
+    )
+    
+    async with async_session_factory() as session:
+        session.add(conv)
+        await session.commit()
+        
     return ConversationSummary(id=conv_id, title=body.title[:80], created_at=now, updated_at=now)
 
 
@@ -87,28 +98,35 @@ async def get_conversation(
     conversation_id: str,
     user: CurrentUser = Depends(get_current_user),
 ) -> ConversationDetail:
-    async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute(
-            "SELECT id, title FROM conversations WHERE id = ? AND user_id = ?",
-            (conversation_id, user.id),
-        ) as cursor:
-            conv_row = await cursor.fetchone()
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == user.id)
+        )
+        conv = result.scalar_one_or_none()
 
-        if not conv_row:
+        if not conv:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
-        async with db.execute(
-            "SELECT role, content, intent, tickers, created_at FROM messages"
-            " WHERE conversation_id = ? ORDER BY created_at",
-            (conversation_id,),
-        ) as cursor:
-            msg_rows = await cursor.fetchall()
+        msg_result = await session.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.asc())
+        )
+        msg_rows = msg_result.scalars().all()
 
     messages = [
-        MessageOut(role=r[0], content=r[1], intent=r[2] or "", tickers=r[3] or "", created_at=r[4])
+        MessageOut(
+            role=r.role, 
+            content=r.content, 
+            intent=r.intent or "", 
+            tickers=r.tickers or "", 
+            charts=r.charts or [],
+            report_id=r.report_id,
+            created_at=r.created_at
+        )
         for r in msg_rows
     ]
-    return ConversationDetail(id=conv_row[0], title=conv_row[1], messages=messages)
+    return ConversationDetail(id=conv.id, title=conv.title, messages=messages)
 
 
 @router.patch("/{conversation_id}", response_model=ConversationSummary)
@@ -118,22 +136,20 @@ async def update_title(
     user: CurrentUser = Depends(get_current_user),
 ) -> ConversationSummary:
     now = time.time()
-    async with aiosqlite.connect(get_db_path()) as db:
-        await db.execute(
-            "UPDATE conversations SET title = ?, updated_at = ?"
-            " WHERE id = ? AND user_id = ?",
-            (body.title[:80], now, conversation_id, user.id),
+    async with async_session_factory() as session:
+        await session.execute(
+            update(Conversation)
+            .where(Conversation.id == conversation_id, Conversation.user_id == user.id)
+            .values(title=body.title[:80], updated_at=now)
         )
-        await db.commit()
-        async with db.execute(
-            "SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?",
-            (conversation_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        await session.commit()
+        
+        result = await session.execute(select(Conversation).where(Conversation.id == conversation_id))
+        conv = result.scalar_one_or_none()
 
-    if not row:
+    if not conv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    return ConversationSummary(id=row[0], title=row[1], created_at=row[2], updated_at=row[3])
+    return ConversationSummary(id=conv.id, title=conv.title, created_at=conv.created_at, updated_at=conv.updated_at)
 
 
 @router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -141,12 +157,8 @@ async def delete_conversation(
     conversation_id: str,
     user: CurrentUser = Depends(get_current_user),
 ) -> None:
-    async with aiosqlite.connect(get_db_path()) as db:
-        await db.execute(
-            "DELETE FROM messages WHERE conversation_id = ?", (conversation_id,)
-        )
-        await db.execute(
-            "DELETE FROM conversations WHERE id = ? AND user_id = ?",
-            (conversation_id, user.id),
-        )
-        await db.commit()
+    async with async_session_factory() as session:
+        await session.execute(delete(Message).where(Message.conversation_id == conversation_id))
+        await session.execute(delete(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == user.id))
+        await session.commit()
+

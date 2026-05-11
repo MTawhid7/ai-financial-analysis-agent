@@ -9,11 +9,9 @@ from __future__ import annotations
 import time
 import uuid
 
-import aiosqlite
 from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel, Field
 
-from ..core.database import get_db_path
 from ..core.deps import CurrentUser, get_current_user
 
 router = APIRouter(prefix="/feedback", tags=["feedback"])
@@ -34,19 +32,32 @@ async def submit_feedback(
     body: FeedbackRequest,
     user: CurrentUser = Depends(get_current_user),
 ) -> None:
+    from ..core.database import async_session_factory
+    from ..core.models import Feedback
+    
     if not body.is_valid_rating:
         return  # silently ignore invalid ratings
 
-    async with aiosqlite.connect(get_db_path()) as db:
-        # Upsert: one rating per (user, conversation, message_index)
-        await db.execute(
-            "INSERT INTO feedback (id, conversation_id, user_id, message_index, rating, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT DO NOTHING",
-            (str(uuid.uuid4()), body.conversation_id, user.id,
-             body.message_index, body.rating, time.time()),
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+        result = await session.execute(
+            select(Feedback).where(
+                Feedback.conversation_id == body.conversation_id,
+                Feedback.user_id == user.id,
+                Feedback.message_index == body.message_index
+            )
         )
-        await db.commit()
+        fb = result.scalar_one_or_none()
+        if not fb:
+            session.add(Feedback(
+                id=str(uuid.uuid4()),
+                conversation_id=body.conversation_id,
+                user_id=user.id,
+                message_index=body.message_index,
+                rating=body.rating,
+                created_at=time.time()
+            ))
+            await session.commit()
 
 
 @router.get("/stats/{conversation_id}")
@@ -55,11 +66,17 @@ async def feedback_stats(
     user: CurrentUser = Depends(get_current_user),
 ) -> dict:
     """Return per-message rating for a conversation."""
-    async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute(
-            "SELECT message_index, rating FROM feedback"
-            " WHERE conversation_id = ? AND user_id = ?",
-            (conversation_id, user.id),
-        ) as cursor:
-            rows = await cursor.fetchall()
-    return {r[0]: r[1] for r in rows}
+    from sqlalchemy import select
+    from ..core.database import async_session_factory
+    from ..core.models import Feedback
+    
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(Feedback).where(
+                Feedback.conversation_id == conversation_id,
+                Feedback.user_id == user.id
+            )
+        )
+        rows = result.scalars().all()
+        
+    return {r.message_index: r.rating for r in rows}

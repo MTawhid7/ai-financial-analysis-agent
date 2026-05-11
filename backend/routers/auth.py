@@ -10,12 +10,10 @@ from __future__ import annotations
 import logging
 import time
 
-import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 
 from ..core.auth import AuthError, COOKIE_NAME, create_jwt, verify_google_id_token
-from ..core.database import get_db_path
 from ..core.deps import CurrentUser, get_current_user
 
 logger = logging.getLogger(__name__)
@@ -36,6 +34,10 @@ class UserProfile(BaseModel):
 @router.post("/google")
 async def google_sign_in(body: GoogleTokenRequest, response: Response) -> UserProfile:
     """Validate a Google ID token, upsert the user, and set a session cookie."""
+    from sqlalchemy import select
+    from ..core.database import async_session_factory
+    from ..core.models import User
+    
     try:
         payload = verify_google_id_token(body.id_token)
     except AuthError as exc:
@@ -47,17 +49,20 @@ async def google_sign_in(body: GoogleTokenRequest, response: Response) -> UserPr
     picture_url: str = payload.get("picture", "")
     now = time.time()
 
-    async with aiosqlite.connect(get_db_path()) as db:
-        await db.execute(
-            "INSERT INTO users (id, email, display_name, picture_url, created_at, last_seen_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT(id) DO UPDATE SET"
-            "   display_name=excluded.display_name,"
-            "   picture_url=excluded.picture_url,"
-            "   last_seen_at=excluded.last_seen_at",
-            (user_id, email, display_name, picture_url, now, now),
-        )
-        await db.commit()
+    async with async_session_factory() as session:
+        result = await session.execute(select(User).where(User.id == user_id))
+        user_row = result.scalar_one_or_none()
+        
+        if user_row:
+            user_row.display_name = display_name
+            user_row.picture_url = picture_url
+            user_row.last_seen_at = now
+        else:
+            session.add(User(
+                id=user_id, email=email, display_name=display_name,
+                picture_url=picture_url, created_at=now, last_seen_at=now
+            ))
+        await session.commit()
 
     jwt_token = create_jwt(user_id, email)
     response.set_cookie(
@@ -81,17 +86,18 @@ async def google_sign_in(body: GoogleTokenRequest, response: Response) -> UserPr
 @router.get("/me")
 async def get_me(user: CurrentUser = Depends(get_current_user)) -> UserProfile:
     """Return the authenticated user's profile from the database."""
-    async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute(
-            "SELECT id, email, display_name, picture_url FROM users WHERE id = ?",
-            (user.id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+    from sqlalchemy import select
+    from ..core.database import async_session_factory
+    from ..core.models import User
+    
+    async with async_session_factory() as session:
+        result = await session.execute(select(User).where(User.id == user.id))
+        user_row = result.scalar_one_or_none()
 
-    if not row:
+    if not user_row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    return UserProfile(id=row[0], email=row[1], display_name=row[2], picture_url=row[3])
+    return UserProfile(id=user_row.id, email=user_row.email, display_name=user_row.display_name, picture_url=user_row.picture_url)
 
 
 @router.post("/logout")

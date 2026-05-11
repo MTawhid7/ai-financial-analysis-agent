@@ -25,7 +25,7 @@ cd frontend && npm run dev
 |---|---|
 | `http://localhost:8000/health` in browser | `{"status":"ok"}` |
 | `http://localhost:5173` in browser | Login page renders |
-| FastAPI terminal shows | `Database migrations complete: .memory/memory.db` then `FastAPI backend ready` |
+| FastAPI terminal shows | `Running database migrations via SQLAlchemy...` then `FastAPI backend ready` |
 
 ---
 
