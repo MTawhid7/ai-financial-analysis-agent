@@ -20,6 +20,9 @@ body {
 
 #root { height: 100dvh; overflow: hidden; }
 
+/* ── Textarea global reset — prevents browser default border/chrome inside containers ── */
+textarea { border: none; outline: none; background: transparent; }
+
 /* ── Tabular numerals — financial tables never misalign ── */
 table, .tabular-nums, [data-metric] {
   font-variant-numeric: tabular-nums;

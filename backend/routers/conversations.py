@@ -105,7 +105,7 @@ async def get_conversation(
             msg_rows = await cursor.fetchall()
 
     messages = [
-        MessageOut(role=r[0], content=r[1], intent=r[2], tickers=r[3], created_at=r[4])
+        MessageOut(role=r[0], content=r[1], intent=r[2] or "", tickers=r[3] or "", created_at=r[4])
         for r in msg_rows
     ]
     return ConversationDetail(id=conv_row[0], title=conv_row[1], messages=messages)

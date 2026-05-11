@@ -199,10 +199,10 @@ export function ChatPage() {
                 ))}
               </div>
 
-              {/* Gemini-style rounded input */}
+              {/* Gemini-style rounded input — single seamless box, no nested textarea border */}
               <div className={[
-                "w-full rounded-2xl border bg-zinc-900 px-4 py-3",
-                "transition-all duration-150",
+                "w-full rounded-2xl border bg-zinc-900 px-4 pt-4 pb-3",
+                "flex flex-col gap-2 transition-all duration-150",
                 landingBusy
                   ? "border-zinc-800 opacity-60"
                   : "border-zinc-700 focus-within:border-zinc-500",
@@ -215,11 +215,11 @@ export function ChatPage() {
                   onInput={handleLandingInput}
                   placeholder="Ask about stocks, request analysis, compare companies…"
                   disabled={landingBusy}
-                  rows={1}
-                  className="w-full resize-none bg-transparent text-[14px] text-zinc-200 placeholder-zinc-600 outline-none leading-relaxed"
+                  rows={2}
+                  className="w-full resize-none border-0 shadow-none bg-transparent appearance-none text-[14px] text-zinc-200 placeholder-zinc-600 outline-none leading-relaxed"
                   style={{ maxHeight: 160 }}
                 />
-                <div className="flex justify-end mt-2">
+                <div className="flex justify-end">
                   <button
                     onClick={() => handleLandingSend(landingText)}
                     disabled={!landingCanSend}

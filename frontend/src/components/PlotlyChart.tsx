@@ -1,11 +1,20 @@
-import { Suspense, lazy } from "react";
-import type { Layout, Data } from "plotly.js";
+import { Suspense, lazy, type ComponentType } from "react";
+import type { Layout, Data, Config } from "plotly.js";
 
-// react-plotly.js is a CommonJS module. Without the .then() normalisation,
-// Vite's ESM dynamic import resolves to the namespace object { default, ... }
-// and React.lazy crashes with "Element type is invalid" on first load.
-const Plot = lazy(() =>
-  import("react-plotly.js").then((mod) => ({ default: mod.default }))
+interface PlotProps {
+  data: Data[];
+  layout?: Partial<Layout>;
+  config?: Partial<Config>;
+  style?: React.CSSProperties;
+  useResizeHandler?: boolean;
+}
+
+// react-plotly.js is a CommonJS module. Vite may resolve it as { default: Component }
+// or as the module itself. The `?? mod` fallback handles builds where mod.default
+// is undefined — without it React.lazy throws "Element type is invalid".
+const Plot = lazy<ComponentType<PlotProps>>(() =>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  import("react-plotly.js").then((mod: any) => ({ default: mod.default ?? mod }))
 );
 
 interface Props {
@@ -29,7 +38,7 @@ export function PlotlyChart({ figure, title }: Props) {
         <Plot
           data={figure.data as Data[]}
           layout={{
-            ...figure.layout as Partial<Layout>,
+            ...(figure.layout as Partial<Layout>),
             autosize: true,
             height: 280,
             margin: { l: 50, r: 20, t: 40, b: 50 },
