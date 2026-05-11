@@ -36,7 +36,7 @@ code, kbd, pre, .font-mono {
   --tw-prose-body: #d4d4d8;
   --tw-prose-headings: #fafafa;
   --tw-prose-bold: #fafafa;
-  --tw-prose-links: #a78bfa;
+  --tw-prose-links: #d4d4d8;
   --tw-prose-code: #e4e4e7;
   --tw-prose-pre-bg: #18181b;
   --tw-prose-th-borders: #3f3f46;
@@ -106,17 +106,16 @@ code, kbd, pre, .font-mono {
 .prose ol > li::marker { color: #71717a; }
 .prose hr { border-color: #3f3f46; margin: 1.5rem 0; }
 
-/* Citation superscript badges */
+/* Citation superscript badges — zinc tones (no violet) */
 .citation-badge {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 0.65rem;
   font-weight: 600;
   font-family: "JetBrains Mono", monospace;
-  color: #a78bfa;
-  background: #1e1b4b;
-  border: 1px solid #4c1d95;
+  color: #d4d4d8;
+  background: #3f3f46;
+  border: 1px solid #52525b;
   border-radius: 3px;
   padding: 0 3px;
   margin: 0 1px;
@@ -126,7 +125,7 @@ code, kbd, pre, .font-mono {
   font-size: 0.6em;
   transition: background 0.15s;
 }
-.citation-badge:hover { background: #2e1065; }
+.citation-badge:hover { background: #52525b; }
 
 /* ── Animations ── */
 @keyframes fadeInUp {
@@ -152,6 +151,6 @@ html { scroll-behavior: smooth; }
 
 /* ── Focus ring ── */
 :focus-visible {
-  outline: 2px solid #7c3aed;
+  outline: 2px solid #52525b;
   outline-offset: 2px;
 }

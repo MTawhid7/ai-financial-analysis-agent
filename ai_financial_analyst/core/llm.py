@@ -198,6 +198,17 @@ class RateLimitFallbackLLM(Runnable):
     # Internal
     # ------------------------------------------------------------------
 
+    def bind_tools(self, tools, **kwargs):
+        """Return a new RateLimitFallbackLLM with both models bound to the same tools.
+
+        Required so that manager.py can call self._primary_llm.bind_tools(tools)
+        without hitting AttributeError — RateLimitFallbackLLM wraps two
+        ChatGoogleGenerativeAI instances, both of which support bind_tools.
+        """
+        new_primary = self._primary.bind_tools(tools, **kwargs)
+        new_fallback = self._fallback.bind_tools(tools, **kwargs)
+        return RateLimitFallbackLLM(new_primary, new_fallback, self._budget_tracker)
+
     def _on_rate_limit_fallback(self, exc: BaseException) -> None:
         logger.warning(
             "Primary model (Flash) rate-limited — falling back to Flash-Lite. Cause: %s",

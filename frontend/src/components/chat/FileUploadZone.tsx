@@ -50,7 +50,7 @@ export function FileUploadZone({ onParsed, disabled }: Props) {
         "flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs cursor-pointer",
         "transition-all duration-150 select-none",
         dragging
-          ? "border-violet-500 bg-violet-950/40 text-violet-300"
+          ? "border-zinc-500 bg-zinc-800/40 text-zinc-300"
           : "border-zinc-700/60 text-zinc-600 hover:border-zinc-600 hover:text-zinc-400",
         isDisabled ? "opacity-40 cursor-not-allowed pointer-events-none" : "",
       ].join(" ")}

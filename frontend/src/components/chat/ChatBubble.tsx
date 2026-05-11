@@ -22,7 +22,7 @@ interface AssistantBubbleProps {
 export function UserBubble({ content }: UserBubbleProps) {
   return (
     <div className="flex justify-end animate-fade-in-up">
-      <div className="max-w-[78%] rounded-2xl rounded-tr-sm bg-violet-600 px-4 py-3 text-sm text-white shadow-sm whitespace-pre-wrap break-words leading-relaxed">
+      <div className="max-w-[78%] rounded-2xl rounded-tr-sm bg-zinc-700 px-4 py-3 text-sm text-zinc-100 shadow-sm whitespace-pre-wrap break-words leading-relaxed">
         {content}
       </div>
     </div>

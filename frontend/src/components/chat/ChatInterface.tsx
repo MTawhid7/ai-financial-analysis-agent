@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { getConversation, type MessageOut } from "../../lib/api";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { getConversation, updateConversationTitle, uploadFile, type MessageOut } from "../../lib/api";
 import {
   useStreamingChat,
   type ChartDescriptor,
@@ -9,10 +9,11 @@ import {
 } from "../../hooks/useStreamingChat";
 import { AssistantBubble, TypingIndicator, UserBubble } from "./ChatBubble";
 import { MessageInput } from "./MessageInput";
-import { FileUploadZone } from "./FileUploadZone";
 
 interface Props {
   conversationId: string;
+  initialMessage?: string;
+  onInitialMessageConsumed?: () => void;
 }
 
 interface DisplayMessage {
@@ -25,18 +26,19 @@ interface DisplayMessage {
   reportId?: string | null;
 }
 
-const SUGGESTION_CHIPS = [
-  "Analyse AAPL",
-  "Compare AAPL vs MSFT",
-  "What is a P/E ratio?",
-  "What did we find about NVDA?",
-];
+interface PendingAttachment {
+  filename: string;
+  description: string;
+}
 
-export function ChatInterface({ conversationId }: Props) {
+export function ChatInterface({ conversationId, initialMessage, onInitialMessageConsumed }: Props) {
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [pendingAttachment, setPendingAttachment] = useState<PendingAttachment | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const { streamMessage } = useStreamingChat();
+  const qc = useQueryClient();
+  const initialSentRef = useRef(false);
 
   const { data: detail } = useQuery({
     queryKey: ["conversation", conversationId],
@@ -56,54 +58,81 @@ export function ChatInterface({ conversationId }: Props) {
     }
   }, [detail, conversationId]);
 
+  // Fire initialMessage on first mount (from landing input)
+  useEffect(() => {
+    if (initialMessage && !initialSentRef.current) {
+      initialSentRef.current = true;
+      handleSend(initialMessage);
+      onInitialMessageConsumed?.();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialMessage]);
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Build descriptive message for uploaded files
-  const handleFileParsed = (summary: Record<string, unknown>, filename: string) => {
+  // Build description string from file summary (used in pendingAttachment)
+  const buildFileDescription = (summary: Record<string, unknown>, filename: string): string => {
     const ext = filename.split(".").pop()?.toLowerCase() ?? "";
-    let description = `📎 **${filename}** uploaded.`;
+    let desc = `File: ${filename}`;
 
     if (ext === "csv") {
       const shape = summary.shape as { rows: number; columns: number } | undefined;
       const cols = (summary.columns as string[] | undefined)?.slice(0, 8).join(", ");
-      if (shape) description += ` ${shape.rows.toLocaleString()} rows × ${shape.columns} columns.`;
-      if (cols) description += ` Columns: ${cols}${(summary.columns as string[])?.length > 8 ? "…" : ""}.`;
+      if (shape) desc += ` (${shape.rows.toLocaleString()} rows × ${shape.columns} columns)`;
+      if (cols) desc += `. Columns: ${cols}${(summary.columns as string[])?.length > 8 ? "…" : ""}`;
       const removed = summary.formula_cells_removed as number | undefined;
-      if (removed && removed > 0)
-        description += ` ⚠️ ${removed} formula injection(s) removed.`;
+      if (removed && removed > 0) desc += `. ⚠️ ${removed} formula injection(s) removed`;
     } else if (ext === "pdf") {
       const pages = summary.pages as number | undefined;
-      if (pages) description += ` ${pages} page(s).`;
+      if (pages) desc += ` (${pages} pages)`;
       const s = summary.summary as string | undefined;
-      if (s) description += `\n\n${s}`;
+      if (s) desc += `.\n\nSummary: ${s}`;
     } else if (["xlsx", "xls"].includes(ext)) {
       const sheets = summary.sheets as Record<string, unknown> | undefined;
       const sheetNames = sheets ? Object.keys(sheets).join(", ") : "";
-      if (sheetNames) description += ` Sheets: ${sheetNames}.`;
+      if (sheetNames) desc += `. Sheets: ${sheetNames}`;
     } else if (ext === "docx") {
       const s = summary.summary as string | undefined;
-      if (s) description += `\n\n${s}`;
+      if (s) desc += `.\n\nSummary: ${s}`;
     } else if (["txt", "md"].includes(ext)) {
       const chars = summary.char_count as number | undefined;
-      if (chars) description += ` ${chars.toLocaleString()} characters.`;
+      if (chars) desc += ` (${chars.toLocaleString()} characters)`;
       const excerpt = summary.excerpt as string | undefined;
-      if (excerpt) description += `\n\n${excerpt}`;
+      if (excerpt) desc += `.\n\nExcerpt: ${excerpt}`;
     } else if (ext === "json") {
       const keys = summary.top_level_keys as string[] | undefined;
-      if (keys) description += ` Keys: ${keys.join(", ")}.`;
+      if (keys) desc += `. Keys: ${keys.join(", ")}`;
     }
-    description += "\n\nWhat would you like to do with this file?";
+    return desc;
+  };
 
-    setMessages((prev) => [
-      ...prev,
-      { id: `file-${Date.now()}`, role: "assistant", content: description },
-    ]);
+  const handleFileUpload = async (file: File) => {
+    try {
+      const summary = await uploadFile(file);
+      if (summary.error) {
+        setPendingAttachment({ filename: file.name, description: `Upload error: ${summary.error}` });
+        return;
+      }
+      const description = buildFileDescription(summary, file.name);
+      setPendingAttachment({ filename: file.name, description });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setPendingAttachment({ filename: file.name, description: `Upload error: ${msg}` });
+    }
   };
 
   const handleSend = async (text: string) => {
     if (isStreaming) return;
+
+    // If there's a pending attachment, prepend its context to the message
+    const isFirstMsg = messages.filter((m) => m.role === "user").length === 0;
+    const fullText = pendingAttachment
+      ? `[Attached file: ${pendingAttachment.filename}]\n${pendingAttachment.description}\n\nUser question: ${text}`
+      : text;
+
+    setPendingAttachment(null);
 
     const userMsg: DisplayMessage = { id: `user-${Date.now()}`, role: "user", content: text };
     const assistantId = `assistant-${Date.now()}`;
@@ -120,7 +149,7 @@ export function ChatInterface({ conversationId }: Props) {
 
     await streamMessage(
       conversationId,
-      text,
+      fullText,
       (step) => {
         setMessages((prev) =>
           prev.map((m) =>
@@ -145,6 +174,14 @@ export function ChatInterface({ conversationId }: Props) {
           )
         );
         setIsStreaming(false);
+
+        // Auto-title: after first exchange, set title from user's first message
+        if (isFirstMsg) {
+          const title = text.slice(0, 60).trim();
+          updateConversationTitle(conversationId, title)
+            .then(() => qc.invalidateQueries({ queryKey: ["conversations"] }))
+            .catch(() => {});
+        }
       },
       (errDetail) => {
         setMessages((prev) =>
@@ -163,7 +200,7 @@ export function ChatInterface({ conversationId }: Props) {
     <div className="flex flex-col h-full">
       {/* Messages scroll area */}
       <div className="flex-1 overflow-y-auto px-6 py-8 space-y-8">
-        {messages.length === 0 && (
+        {messages.length === 0 && !initialMessage && (
           <div className="flex flex-col items-center justify-center h-full gap-6 text-center">
             <div className="w-12 h-12 rounded-2xl bg-zinc-800 border border-zinc-700 flex items-center justify-center">
               <svg className="w-6 h-6 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -179,17 +216,6 @@ export function ChatInterface({ conversationId }: Props) {
                 Ask about stocks, compare companies, upload financial documents,
                 or recall past research.
               </p>
-            </div>
-            <div className="flex flex-wrap gap-2 justify-center max-w-md">
-              {SUGGESTION_CHIPS.map((s) => (
-                <button
-                  key={s}
-                  onClick={() => handleSend(s)}
-                  className="text-sm px-4 py-2 rounded-full border border-zinc-700 text-zinc-400 hover:border-violet-500 hover:text-violet-400 hover:bg-violet-950/30 transition-all duration-150"
-                >
-                  {s}
-                </button>
-              ))}
             </div>
           </div>
         )}
@@ -215,10 +241,13 @@ export function ChatInterface({ conversationId }: Props) {
 
       {/* Input area */}
       <div className="border-t border-zinc-800/60">
-        <div className="px-4 pt-2 pb-1">
-          <FileUploadZone onParsed={handleFileParsed} disabled={isStreaming} />
-        </div>
-        <MessageInput onSend={handleSend} disabled={isStreaming} />
+        <MessageInput
+          onSend={handleSend}
+          disabled={isStreaming}
+          pendingAttachment={pendingAttachment}
+          onAttach={handleFileUpload}
+          onClearAttachment={() => setPendingAttachment(null)}
+        />
       </div>
     </div>
   );

@@ -155,7 +155,7 @@ function CitationBadge({ n, sourceTool, ticker, webSources }: BadgeProps) {
                   href={linkUrl}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 text-[10px] text-violet-400 hover:text-violet-300 mt-0.5"
+                  className="inline-flex items-center gap-1 text-[10px] text-zinc-400 hover:text-zinc-200 mt-0.5"
                   onClick={(e) => e.stopPropagation()}
                 >
                   Open source
@@ -284,7 +284,7 @@ export function CitationRenderer({ content, ticker, webSources }: CitationRender
                       href={ref.url}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="text-violet-500 hover:text-violet-400 break-all"
+                      className="text-zinc-400 hover:text-zinc-200 break-all"
                     >
                       {ref.webSource
                         ? new URL(ref.url).hostname.replace("www.", "")

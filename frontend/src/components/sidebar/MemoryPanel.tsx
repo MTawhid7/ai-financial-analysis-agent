@@ -54,7 +54,7 @@ export function MemoryPanel() {
           <span>🧠</span>
           Memory
           {(prefEntries.length > 0 || summaries.length > 0) && (
-            <span className="ml-1 rounded-full bg-violet-900 text-violet-300 px-1.5 py-0.5 text-[10px]">
+            <span className="ml-1 rounded-full bg-zinc-700 text-zinc-300 px-1.5 py-0.5 text-[10px]">
               {prefEntries.length + summaries.length}
             </span>
           )}
@@ -95,7 +95,7 @@ export function MemoryPanel() {
               <div className="space-y-2">
                 {summaries.map((s) => (
                   <div key={s.id} className="bg-zinc-800 rounded p-2 space-y-0.5">
-                    <p className="text-[10px] font-medium text-violet-400 font-mono">
+                    <p className="text-[10px] font-medium text-zinc-400 font-mono">
                       [{s.tickers}]
                     </p>
                     <p className="text-[11px] text-zinc-400 leading-relaxed line-clamp-2">
