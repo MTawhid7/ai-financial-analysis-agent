@@ -58,7 +58,6 @@ def _normalise_period(raw: str) -> str:
         return s
     if s in _PERIOD_ALIASES:
         return _PERIOD_ALIASES[s]
-    # Numeric patterns: "10y", "5yr", "6m", "2mo" etc.
     import re
     m = re.match(r"^(\d+)\s*(y(?:r|ear)?s?|mo(?:nth)?s?|d(?:ay)?s?)$", s)
     if m:
@@ -69,7 +68,64 @@ def _normalise_period(raw: str) -> str:
             return f"{n}mo" if n in {"1","3","6"} else ("6mo" if int(n) > 3 else "1mo")
         if unit.startswith("d"):
             return "5d" if int(n) <= 7 else "1mo"
-    return "1y"  # safe default
+    return "1y"
+
+
+def _normalise_date(raw: str) -> str | None:
+    """Convert any date expression to YYYY-MM-DD string, or None if not parseable."""
+    if not raw or not raw.strip():
+        return None
+    s = raw.strip()
+    import re
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+    if re.match(r"^(19|20)\d{2}$", s.strip()):
+        return f"{s.strip()}-01-01"
+    try:
+        from dateutil import parser as dp
+        from datetime import datetime
+        dt = dp.parse(s, fuzzy=True, dayfirst=False)
+        if 1900 <= dt.year <= datetime.now().year + 1:
+            return dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    m = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{4})", s.lower())
+    if m:
+        mm = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+              "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+        return f"{m.group(2)}-{mm[m.group(1)[:3]]:02d}-01"
+    return None
+
+
+# Known historical events → (start, end | None) date ranges
+_NAMED_EVENTS: dict[str, tuple[str, str | None]] = {
+    "covid crash": ("2020-02-15", "2020-06-30"),
+    "covid":        ("2020-01-01", "2021-12-31"),
+    "pandemic":     ("2020-01-01", "2021-12-31"),
+    "2008 financial crisis": ("2008-01-01", "2009-06-30"),
+    "financial crisis":      ("2008-01-01", "2009-06-30"),
+    "gfc":           ("2008-01-01", "2009-06-30"),
+    "dot com":       ("2000-01-01", "2002-12-31"),
+    "dotcom":        ("2000-01-01", "2002-12-31"),
+    "dot-com bubble":("2000-01-01", "2002-12-31"),
+    "2022 bear market":  ("2022-01-01", "2022-12-31"),
+    "2022 correction":   ("2022-01-01", "2022-12-31"),
+    "ai rally":  ("2023-01-01", None),
+    "ai boom":   ("2023-01-01", None),
+    "great recession": ("2007-12-01", "2009-06-30"),
+    "flash crash":     ("2010-05-01", "2010-06-30"),
+    "taper tantrum":   ("2013-05-01", "2013-12-31"),
+    "rate hike cycle": ("2022-03-01", "2023-12-31"),
+}
+
+
+def _event_date_range(query: str) -> tuple[str | None, str | None]:
+    """Return (start, end) if query mentions a named historical event, else (None, None)."""
+    q = query.lower()
+    for event, (start, end) in _NAMED_EVENTS.items():
+        if event in q:
+            return start, end
+    return None, None
 
 _MANAGER_SYSTEM = """\
 You are an expert AI Financial Analyst assistant. You help users with:
@@ -272,6 +328,9 @@ def build_tools(
         chart_type: str,
         ticker: str = "",
         period: str = "1y",
+        start_date: str = "",
+        end_date: str = "",
+        overlays: list[str] | None = None,
         compare_tickers: list[str] | None = None,
     ) -> str:
         """Generate an interactive financial chart — always use this for any chart request.
@@ -280,57 +339,73 @@ def build_tools(
           Price action:
             candlestick  — OHLCV bars + volume + SMA-50/200 (best default for price)
             price        — simple close-price line
-            rsi          — RSI(14) momentum oscillator
-            macd         — MACD(12,26,9) with signal and histogram
+            price_rsi    — candlestick (top) + RSI-14 panel (bottom)
+            price_macd   — candlestick (top) + MACD panel (bottom)
+            rsi          — RSI(14) standalone
+            macd         — MACD(12,26,9) standalone
 
-          Fundamental trends (annual history, no period parameter needed):
-            revenue_trend  — Revenue vs Net Income grouped bars (last 5Y)
-            margin_trend   — Gross / Operating / Net margins over time
+          Fundamental trends (annual; period/dates not needed):
+            revenue_trend  — Revenue vs Net Income bars
+            margin_trend   — Gross / Operating / Net margins
             cashflow       — Operating CF vs Free Cash Flow
-            debt_profile   — Debt vs Cash position
+            debt_profile   — Debt structure vs Cash
 
-          Comparison (requires compare_tickers list):
-            relative_performance — normalised % return across multiple tickers
+          Comparison (requires compare_tickers):
+            relative_performance — normalised % return across tickers
 
           Risk:
             drawdown — max drawdown from rolling peak
 
-          From pipeline data:
-            pe, metrics, radar
+          Pipeline data: pe, metrics, radar
 
-        PERIOD — map the user's time expression exactly:
-          "1mo"  = 1 month          "3mo" = 3 months     "6mo" = 6 months
-          "1y"   = 1 year (default) "2y"  = 2 years      "5y"  = 5 years
-          "10y"  = 10 years         "ytd" = year-to-date "max" = all history
+        PERIOD — always extract from the user's message:
+          "1mo" "3mo" "6mo" "1y" "2y" "5y" "10y" "ytd" "max"
+          "last 10 years"/"decade" → "10y"  |  "year to date" → "ytd"
+          "all time"/"since IPO"   → "max"  |  "last quarter" → "3mo"
 
-          Natural language → period value:
-            "last month" / "1 month"         → "1mo"
-            "past quarter" / "3 months"      → "3mo"
-            "last 6 months" / "half a year"  → "6mo"
-            "one year" / "1 year" / "1Y"     → "1y"
-            "two years" / "24 months"        → "2y"
-            "5 years" / "five years"         → "5y"
-            "10 years" / "ten years" / "decade" → "10y"
-            "year to date" / "YTD"           → "ytd"
-            "all time" / "since IPO" / "max" → "max"
+        DATE RANGES — use when the user specifies specific dates or a named event:
+          start_date / end_date: "YYYY-MM-DD", "March 2020", "Jan 2021", or "2020"
+          Named events → dates (pass start_date and end_date, leave period as default):
+            "COVID crash"          → start_date="2020-02-15", end_date="2020-06-30"
+            "2008 financial crisis"→ start_date="2008-01-01", end_date="2009-06-30"
+            "dot-com bubble"       → start_date="2000-01-01", end_date="2002-12-31"
+            "2022 bear market"     → start_date="2022-01-01", end_date="2022-12-31"
+            "AI rally"             → start_date="2023-01-01" (no end_date)
+          "from January 2020 to December 2021" → start_date="2020-01-01", end_date="2021-12-31"
 
-        IMPORTANT: Always extract the period from the user's message.
-          "Plot NVDA over the last 10 years" → period="10y"
-          "Show AAPL price for 5 years"      → period="5y"
-          "MSFT chart last quarter"          → period="3mo"
+        OVERLAYS — add to candlestick / price charts:
+          "bollinger" or "bb" — Bollinger Bands (20-day, ±2σ)
+          "ema" — EMA-20 and EMA-50
+          "ema_20", "ema_50", "ema_200" — specific EMA period
 
-        For relative_performance: pass compare_tickers list; ticker can be empty.
+        TICKER ALIASES — these are auto-resolved, no need to convert manually:
+          "Nasdaq" → QQQ  |  "S&P 500" → SPY  |  "Dow" → DIA
+          "semiconductors" → SOXX  |  "gold" → GLD  |  "bitcoin" → BTC-USD
+          "VIX" / "volatility" → ^VIX
+
+        EXAMPLES:
+          "AAPL with Bollinger Bands"              → chart_type="candlestick", overlays=["bollinger"]
+          "MSFT with EMA-20"                       → chart_type="candlestick", overlays=["ema_20"]
+          "NVDA price with RSI"                    → chart_type="price_rsi"
+          "TSLA from March 2020 to Dec 2021"       → start_date="2020-03-01", end_date="2021-12-31"
+          "AAPL during COVID crash"                → start_date="2020-02-15", end_date="2020-06-30"
+          "Nasdaq vs S&P 500 this year"            → chart_type="relative_performance", compare_tickers=["QQQ","SPY"], period="ytd"
 
         Args:
-            chart_type: Chart type string (see above)
-            ticker: Stock ticker symbol (e.g. "AAPL", "NVDA") — required for single-stock charts
-            period: Time period string (default "1y") — always extract from the user's message
-            compare_tickers: For relative_performance — list of tickers to compare
+            chart_type: Chart type (see above)
+            ticker: Ticker symbol or alias (e.g. "AAPL", "Nasdaq")
+            period: Time period string — always extract from the user's message
+            start_date: Start date for custom date range (overrides period)
+            end_date: End date for custom date range (optional)
+            overlays: Indicator overlays e.g. ["bollinger", "ema_20"]
+            compare_tickers: For relative_performance — list of tickers/aliases to compare
         """
-        from ai_financial_analyst.tools.chart_generator import generate_on_demand_chart
+        from ai_financial_analyst.charts import generate_on_demand_chart
 
-        # Normalise period to a valid yfinance value
-        p = _normalise_period(period)
+        # Normalise period and dates
+        p     = _normalise_period(period)
+        start = _normalise_date(start_date) if start_date else None
+        end   = _normalise_date(end_date)   if end_date   else None
 
         # For comparison charts, pass tickers directly — no raw_data needed
         if chart_type.lower().replace("-", "_").replace(" ", "_") in (
@@ -340,20 +415,23 @@ def build_tools(
             fig = generate_on_demand_chart(
                 ticker=ticker, chart_type=chart_type,
                 raw_data={}, analysis={},
-                period=p, compare_tickers=compare_tickers,
+                period=p, start=start, end=end,
+                compare_tickers=compare_tickers,
             )
             if fig is None:
                 return "Could not generate comparison chart. Ensure at least 2 valid tickers are provided."
             tickers_label = ", ".join(compare_tickers or [ticker])
+            range_label   = f"{start} to {end or 'today'}" if start else p
             if not hasattr(agent, "_pending_charts"):
                 agent._pending_charts = []
             agent._pending_charts.append({
                 "ticker": tickers_label,
                 "chart_type": chart_type,
-                "title": f"Return Comparison ({p}) — {tickers_label}",
+                "title": f"Return Comparison ({range_label}) — {tickers_label}",
                 "figure": fig,
             })
-            return f"Comparison chart for **{tickers_label}** over {p} is displayed below."
+            range_label = f"{start} to {end or 'today'}" if start else p
+            return f"Comparison chart for **{tickers_label}** ({range_label}) is displayed below."
 
         # Single-ticker charts
         final_state = agent.last_analysis_state or {}
@@ -372,20 +450,22 @@ def build_tools(
         fig = generate_on_demand_chart(
             ticker=ticker.upper(), chart_type=chart_type,
             raw_data=raw_data, analysis=analysis,
-            period=p, compare_tickers=compare_tickers,
+            period=p, start=start, end=end,
+            overlays=overlays, compare_tickers=compare_tickers,
         )
         if fig is None:
             return f"Could not generate the {chart_type} chart for {ticker}. Try a different period or run an analysis first."
 
+        range_label = f"{start} to {end or 'today'}" if start else p
         if not hasattr(agent, "_pending_charts"):
             agent._pending_charts = []
         agent._pending_charts.append({
             "ticker": ticker.upper(),
             "chart_type": chart_type,
-            "title": f"{ticker.upper()} — {chart_type.replace('_', ' ').title()} ({p})",
+            "title": f"{ticker.upper()} — {chart_type.replace('_', ' ').title()} ({range_label})",
             "figure": fig,
         })
-        return f"Here is the **{chart_type.replace('_', ' ')}** chart for **{ticker.upper()}** over the past {p}."
+        return f"Here is the **{chart_type.replace('_', ' ')}** chart for **{ticker.upper()}** ({range_label})."
 
     @tool
     def ask_clarification(question: str) -> str:
