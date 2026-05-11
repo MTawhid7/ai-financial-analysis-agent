@@ -39,6 +39,9 @@ export function ChatInterface({ conversationId, initialMessage, onInitialMessage
   const { streamMessage } = useStreamingChat();
   const qc = useQueryClient();
   const initialSentRef = useRef(false);
+  // Guard: only load from DB once per component instance. Without this, getConversation
+  // resolving for a brand-new conversation wipes locally-added streaming messages.
+  const dbLoadedRef = useRef(false);
 
   const { data: detail } = useQuery({
     queryKey: ["conversation", conversationId],
@@ -47,7 +50,8 @@ export function ChatInterface({ conversationId, initialMessage, onInitialMessage
   });
 
   useEffect(() => {
-    if (detail) {
+    if (detail && !dbLoadedRef.current) {
+      dbLoadedRef.current = true;
       setMessages(
         detail.messages.map((m: MessageOut, i: number) => ({
           id: `${conversationId}-${i}`,

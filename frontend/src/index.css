@@ -20,8 +20,17 @@ body {
 
 #root { height: 100dvh; overflow: hidden; }
 
-/* ── Textarea global reset — prevents browser default border/chrome inside containers ── */
-textarea { border: none; outline: none; background: transparent; }
+/* ── Textarea global reset — strip all browser-default chrome (border, focus ring, inset shadow) ── */
+textarea,
+textarea:focus,
+textarea:active {
+  border: none;
+  outline: none;
+  background: transparent;
+  -webkit-appearance: none;
+  appearance: none;
+  box-shadow: none;
+}
 
 /* ── Tabular numerals — financial tables never misalign ── */
 table, .tabular-nums, [data-metric] {
