@@ -42,10 +42,16 @@ export function PlotlyChart({ figure, title }: Props) {
           layout={{
             ...(figure.layout as Partial<Layout>),
             autosize: true,
-            height: 280,
-            margin: { l: 50, r: 20, t: 40, b: 50 },
+            // height is set by each chart's own layout; fall back to 320
+            margin: { l: 55, r: 20, t: 44, b: 44 },
           }}
-          config={{ responsive: true, displayModeBar: false }}
+          config={{
+            responsive: true,
+            displayModeBar: "hover",   // toolbar appears on hover
+            scrollZoom: true,          // scroll to zoom
+            displaylogo: false,
+            modeBarButtonsToRemove: ["sendDataToCloud", "editInChartStudio", "toImage"] as never[],
+          }}
           style={{ width: "100%" }}
           useResizeHandler
         />

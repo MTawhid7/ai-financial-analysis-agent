@@ -29,6 +29,48 @@ logger = logging.getLogger(__name__)
 
 _MAX_TOOL_ROUNDS = 5  # prevent infinite tool loops
 
+# Accepts any reasonable time-period string and normalises it to a yfinance period.
+_VALID_PERIODS = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"}
+_PERIOD_ALIASES: dict[str, str] = {
+    # months
+    "1month": "1mo", "1 month": "1mo", "one month": "1mo", "30d": "1mo", "30days": "1mo",
+    "3months": "3mo", "3 months": "3mo", "three months": "3mo", "quarter": "3mo",
+    "6months": "6mo", "6 months": "6mo", "six months": "6mo", "half year": "6mo",
+    # years
+    "1year": "1y", "1 year": "1y", "one year": "1y", "12months": "1y", "12 months": "1y",
+    "2years": "2y", "2 years": "2y", "two years": "2y",
+    "3years": "3y", "3 years": "3y", "three years": "5y",  # yfinance has no 3y
+    "5years": "5y", "5 years": "5y", "five years": "5y",
+    "10years": "10y", "10 years": "10y", "ten years": "10y", "decade": "10y",
+    # special
+    "ytd": "ytd", "year to date": "ytd", "this year": "ytd",
+    "all time": "max", "alltime": "max", "all": "max", "max": "max",
+    "since ipo": "max", "inception": "max",
+}
+
+
+def _normalise_period(raw: str) -> str:
+    """Convert any period string the LLM might produce to a valid yfinance value."""
+    if not raw:
+        return "1y"
+    s = raw.strip().lower().rstrip(".")
+    if s in _VALID_PERIODS:
+        return s
+    if s in _PERIOD_ALIASES:
+        return _PERIOD_ALIASES[s]
+    # Numeric patterns: "10y", "5yr", "6m", "2mo" etc.
+    import re
+    m = re.match(r"^(\d+)\s*(y(?:r|ear)?s?|mo(?:nth)?s?|d(?:ay)?s?)$", s)
+    if m:
+        n, unit = m.group(1), m.group(2)
+        if unit.startswith("y"):
+            return f"{n}y" if n in {"1","2","5","10"} else ("5y" if int(n) > 5 else "1y")
+        if unit.startswith("mo") or unit == "m":
+            return f"{n}mo" if n in {"1","3","6"} else ("6mo" if int(n) > 3 else "1mo")
+        if unit.startswith("d"):
+            return "5d" if int(n) <= 7 else "1mo"
+    return "1y"  # safe default
+
 _MANAGER_SYSTEM = """\
 You are an expert AI Financial Analyst assistant. You help users with:
 - Stock analysis and financial research
@@ -226,55 +268,124 @@ def build_tools(
         )
 
     @tool
-    async def generate_chart(ticker: str, chart_type: str = "price") -> str:
-        """Generate an interactive Plotly chart for a specific ticker on demand.
+    async def generate_chart(
+        chart_type: str,
+        ticker: str = "",
+        period: str = "1y",
+        compare_tickers: list[str] | None = None,
+    ) -> str:
+        """Generate an interactive financial chart — always use this for any chart request.
 
-        Use when the user explicitly asks for a chart or visualization:
-        "show me a chart of AAPL's price", "create a P/E comparison chart",
-        "visualise MSFT's financial profile".
+        CHART TYPES:
+          Price action:
+            candlestick  — OHLCV bars + volume + SMA-50/200 (best default for price)
+            price        — simple close-price line
+            rsi          — RSI(14) momentum oscillator
+            macd         — MACD(12,26,9) with signal and histogram
 
-        The chart is automatically displayed in the UI alongside this response.
+          Fundamental trends (annual history, no period parameter needed):
+            revenue_trend  — Revenue vs Net Income grouped bars (last 5Y)
+            margin_trend   — Gross / Operating / Net margins over time
+            cashflow       — Operating CF vs Free Cash Flow
+            debt_profile   — Debt vs Cash position
+
+          Comparison (requires compare_tickers list):
+            relative_performance — normalised % return across multiple tickers
+
+          Risk:
+            drawdown — max drawdown from rolling peak
+
+          From pipeline data:
+            pe, metrics, radar
+
+        PERIOD — map the user's time expression exactly:
+          "1mo"  = 1 month          "3mo" = 3 months     "6mo" = 6 months
+          "1y"   = 1 year (default) "2y"  = 2 years      "5y"  = 5 years
+          "10y"  = 10 years         "ytd" = year-to-date "max" = all history
+
+          Natural language → period value:
+            "last month" / "1 month"         → "1mo"
+            "past quarter" / "3 months"      → "3mo"
+            "last 6 months" / "half a year"  → "6mo"
+            "one year" / "1 year" / "1Y"     → "1y"
+            "two years" / "24 months"        → "2y"
+            "5 years" / "five years"         → "5y"
+            "10 years" / "ten years" / "decade" → "10y"
+            "year to date" / "YTD"           → "ytd"
+            "all time" / "since IPO" / "max" → "max"
+
+        IMPORTANT: Always extract the period from the user's message.
+          "Plot NVDA over the last 10 years" → period="10y"
+          "Show AAPL price for 5 years"      → period="5y"
+          "MSFT chart last quarter"          → period="3mo"
+
+        For relative_performance: pass compare_tickers list; ticker can be empty.
 
         Args:
-            ticker: Stock ticker symbol (e.g. "AAPL")
-            chart_type: One of: price, pe, metrics, radar (default: price)
+            chart_type: Chart type string (see above)
+            ticker: Stock ticker symbol (e.g. "AAPL", "NVDA") — required for single-stock charts
+            period: Time period string (default "1y") — always extract from the user's message
+            compare_tickers: For relative_performance — list of tickers to compare
         """
         from ai_financial_analyst.tools.chart_generator import generate_on_demand_chart
 
-        # Try to use last analysis state if available
+        # Normalise period to a valid yfinance value
+        p = _normalise_period(period)
+
+        # For comparison charts, pass tickers directly — no raw_data needed
+        if chart_type.lower().replace("-", "_").replace(" ", "_") in (
+            "relative_performance", "comparison", "compare", "normalized", "normalised",
+            "relative_return", "peer_comparison",
+        ):
+            fig = generate_on_demand_chart(
+                ticker=ticker, chart_type=chart_type,
+                raw_data={}, analysis={},
+                period=p, compare_tickers=compare_tickers,
+            )
+            if fig is None:
+                return "Could not generate comparison chart. Ensure at least 2 valid tickers are provided."
+            tickers_label = ", ".join(compare_tickers or [ticker])
+            if not hasattr(agent, "_pending_charts"):
+                agent._pending_charts = []
+            agent._pending_charts.append({
+                "ticker": tickers_label,
+                "chart_type": chart_type,
+                "title": f"Return Comparison ({p}) — {tickers_label}",
+                "figure": fig,
+            })
+            return f"Comparison chart for **{tickers_label}** over {p} is displayed below."
+
+        # Single-ticker charts
         final_state = agent.last_analysis_state or {}
         raw_data = final_state.get("raw_data", {})
         analysis = final_state.get("analysis", {})
 
-        if ticker not in raw_data:
-            # Fetch fresh data for this ticker
-            try:
-                import yfinance as yf
-                t = yf.Ticker(ticker)
-                hist = t.history(period="1y", interval="1wk")
-                raw_data = {ticker: {"price_history": {
-                    "current_price": float(hist["Close"].iloc[-1]) if not hist.empty else None,
-                    "price_5y_ago": None,
-                    "52w_high": float(hist["High"].max()) if not hist.empty else None,
-                    "52w_low": float(hist["Low"].min()) if not hist.empty else None,
-                }}}
-            except Exception:
-                return f"Could not fetch data for {ticker} to generate the chart."
+        # For charts that always fetch fresh data, raw_data not needed — pass empty
+        fresh_chart_types = {
+            "candlestick", "price", "rsi", "macd",
+            "revenue_trend", "margin_trend", "cashflow", "debt_profile", "drawdown",
+        }
+        ct_norm = chart_type.lower().replace("-", "_").replace(" ", "_")
+        if ct_norm in fresh_chart_types or ticker not in raw_data:
+            raw_data = {}  # let chart generator fetch directly
 
-        fig = generate_on_demand_chart(ticker, chart_type, raw_data, analysis)
+        fig = generate_on_demand_chart(
+            ticker=ticker.upper(), chart_type=chart_type,
+            raw_data=raw_data, analysis=analysis,
+            period=p, compare_tickers=compare_tickers,
+        )
         if fig is None:
-            return f"Could not generate a {chart_type} chart for {ticker}. Try running an analysis first."
+            return f"Could not generate the {chart_type} chart for {ticker}. Try a different period or run an analysis first."
 
-        # Inject chart into the pending chart list on the agent
         if not hasattr(agent, "_pending_charts"):
             agent._pending_charts = []
         agent._pending_charts.append({
-            "ticker": ticker,
+            "ticker": ticker.upper(),
             "chart_type": chart_type,
-            "title": f"{ticker} — {chart_type.replace('_', ' ').title()}",
+            "title": f"{ticker.upper()} — {chart_type.replace('_', ' ').title()} ({p})",
             "figure": fig,
         })
-        return f"I've generated the {chart_type} chart for **{ticker}**. It appears below."
+        return f"Here is the **{chart_type.replace('_', ' ')}** chart for **{ticker.upper()}** over the past {p}."
 
     @tool
     def ask_clarification(question: str) -> str:
