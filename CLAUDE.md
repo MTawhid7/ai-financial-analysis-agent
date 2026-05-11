@@ -121,7 +121,7 @@ Researcher → Quant Analyst → Editor → Report + Charts
 | `ai_financial_analyst/core/conversation_state.py` | `ConversationState` TypedDict — chat layer |
 | `ai_financial_analyst/core/llm.py` | Gemini client: retry + circuit breaker + Flash-Lite fallback |
 | `ai_financial_analyst/core/sanitizer.py` | Injection filter (full-content rejection) + canary token |
-| `ai_financial_analyst/memory/long_term.py` | SQLite: preferences, summaries, conversations, messages, reports, feedback (user-scoped) |
+| `ai_financial_analyst/memory/long_term.py` | SQLAlchemy/Postgres: preferences, summaries, conversations, messages, reports, feedback (user-scoped) |
 | `ai_financial_analyst/memory/memory_manager.py` | Memory facade: context injection, preference extraction, summary saving |
 | `ai_financial_analyst/tools/calculator.py` | AST-validated numexpr evaluator (no REPL) |
 | `ai_financial_analyst/tools/chart_generator.py` | Plotly JSON: price, P/E, financials, radar |
