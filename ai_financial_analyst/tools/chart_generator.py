@@ -193,6 +193,98 @@ def generate_metrics_chart(ticker: str, raw_data: dict) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Bull/Bear radar chart
+# ---------------------------------------------------------------------------
+
+
+def generate_radar_chart(ticker: str, raw_data: dict, analysis: dict) -> dict | None:
+    """Return a Plotly radar chart scoring the stock across 5 financial dimensions."""
+    try:
+        ta = analysis.get(ticker, {})
+        fund = (raw_data.get(ticker) or {}).get("fundamentals") or {}
+        if isinstance(fund, str):
+            import json as _j
+            fund = _j.loads(fund)
+
+        scores: dict[str, float] = {}
+
+        # Growth: 5Y CAGR (score 0-10, 20%+ CAGR = 10)
+        cagr = ta.get("price_cagr_5y_pct")
+        if cagr is not None:
+            scores["Growth"] = min(float(cagr) / 2, 10)
+
+        # Valuation (lower P/E premium → better score)
+        premium = ta.get("pe_vs_sector_premium_pct")
+        if premium is not None:
+            scores["Valuation"] = max(0, 10 - float(premium) / 10)
+
+        # Profitability: profit margin (40%+ margin = 10)
+        margin = fund.get("profit_margin")
+        if margin is not None:
+            scores["Profitability"] = min(float(margin) * 25, 10)
+
+        # Size / Stability: market cap ($1T+ = 10)
+        mcap = fund.get("market_cap")
+        if mcap and isinstance(mcap, (int, float)):
+            scores["Scale"] = min(float(mcap) / 1e11, 10)
+
+        if len(scores) < 3:
+            return None
+
+        categories = list(scores.keys())
+        values = [scores[c] for c in categories]
+        # Close the radar polygon
+        categories_closed = categories + [categories[0]]
+        values_closed = values + [values[0]]
+
+        layout = _base_layout(f"{ticker} — Financial Profile")
+        layout.pop("xaxis", None)
+        layout.pop("yaxis", None)
+        layout["polar"] = {
+            "bgcolor": _BG,
+            "radialaxis": {"visible": True, "range": [0, 10], "color": _GRID_COLOR, "gridcolor": _GRID_COLOR},
+            "angularaxis": {"color": _FONT_COLOR, "gridcolor": _GRID_COLOR},
+        }
+
+        return {
+            "data": [{
+                "type": "scatterpolar",
+                "r": values_closed,
+                "theta": categories_closed,
+                "fill": "toself",
+                "fillcolor": f"{_ACCENT}33",
+                "line": {"color": _ACCENT, "width": 2},
+                "name": ticker,
+                "hovertemplate": "%{theta}: %{r:.1f}/10<extra></extra>",
+            }],
+            "layout": layout,
+        }
+    except Exception as exc:
+        logger.warning("Could not generate radar chart for %s: %s", ticker, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# On-demand chart by type (called by Manager generate_chart tool)
+# ---------------------------------------------------------------------------
+
+
+def generate_on_demand_chart(ticker: str, chart_type: str, raw_data: dict, analysis: dict) -> dict | None:
+    """Generate a specific chart type on user request."""
+    ct = chart_type.lower().replace(" ", "_").replace("-", "_")
+    if ct in ("price", "price_history", "price_chart"):
+        return generate_price_chart(ticker, raw_data)
+    if ct in ("pe", "pe_comparison", "valuation"):
+        return generate_pe_chart(ticker, analysis)
+    if ct in ("metrics", "financials", "key_financials", "revenue"):
+        return generate_metrics_chart(ticker, raw_data)
+    if ct in ("radar", "profile", "financial_profile"):
+        return generate_radar_chart(ticker, raw_data, analysis)
+    # Default: generate all and return first
+    return generate_price_chart(ticker, raw_data)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point — called after pipeline completes
 # ---------------------------------------------------------------------------
 
@@ -211,16 +303,21 @@ def generate_all_charts(final_state: Any) -> list[dict]:
         price_fig = generate_price_chart(ticker, raw_data)
         if price_fig:
             charts.append({"ticker": ticker, "chart_type": "price",
-                           "title": f"{ticker} Price History", "figure": price_fig})
+                           "title": f"{ticker} — Price History (1Y)", "figure": price_fig})
 
         pe_fig = generate_pe_chart(ticker, analysis)
         if pe_fig:
             charts.append({"ticker": ticker, "chart_type": "pe",
-                           "title": f"{ticker} P/E Comparison", "figure": pe_fig})
+                           "title": f"{ticker} — P/E vs Sector", "figure": pe_fig})
 
         metrics_fig = generate_metrics_chart(ticker, raw_data)
         if metrics_fig:
             charts.append({"ticker": ticker, "chart_type": "metrics",
-                           "title": f"{ticker} Key Financials", "figure": metrics_fig})
+                           "title": f"{ticker} — Key Financials", "figure": metrics_fig})
+
+        radar_fig = generate_radar_chart(ticker, raw_data, analysis)
+        if radar_fig:
+            charts.append({"ticker": ticker, "chart_type": "radar",
+                           "title": f"{ticker} — Financial Profile", "figure": radar_fig})
 
     return charts

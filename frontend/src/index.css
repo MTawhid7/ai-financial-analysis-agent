@@ -1,8 +1,8 @@
+/* ── Fonts — must be first before any other @import or directives ── */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
-
-/* ── Fonts ── */
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
 
 /* ── Base ── */
 *, *::before, *::after { box-sizing: border-box; }
@@ -10,9 +10,11 @@
 body {
   margin: 0;
   font-family: Inter, system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: #09090b;   /* zinc-950 */
+  background: #09090b;
   color: #fafafa;
 }
 
@@ -46,37 +48,41 @@ code, kbd, pre, .font-mono {
   --tw-prose-quote-borders: #52525b;
 }
 
-.prose h1 { font-size: 1.25rem; font-weight: 600; margin-top: 1.5rem; }
-.prose h2 { font-size: 1.05rem; font-weight: 600; margin-top: 1.25rem; border-bottom: 1px solid #3f3f46; padding-bottom: 0.25rem; }
-.prose h3 { font-size: 0.95rem; font-weight: 600; margin-top: 1rem; }
-.prose p  { margin: 0.5rem 0; line-height: 1.65; }
+.prose h1 { font-size: 1.3rem; font-weight: 600; margin-top: 1.5rem; letter-spacing: -0.02em; }
+.prose h2 { font-size: 1.05rem; font-weight: 600; margin-top: 1.5rem; border-bottom: 1px solid #3f3f46; padding-bottom: 0.3rem; }
+.prose h3 { font-size: 0.95rem; font-weight: 600; margin-top: 1rem; color: #e4e4e7; }
+.prose p  { margin: 0.6rem 0; line-height: 1.7; }
 
-/* Financial tables — tight, right-aligned numbers */
+/* Financial tables */
 .prose table {
   font-size: 0.8rem;
   font-variant-numeric: tabular-nums;
   border-collapse: collapse;
   width: 100%;
+  margin: 1rem 0;
 }
 .prose th {
   background: #27272a;
-  padding: 0.35rem 0.6rem;
+  padding: 0.4rem 0.75rem;
   text-align: left;
   font-weight: 600;
   color: #e4e4e7;
   border: 1px solid #3f3f46;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 .prose td {
-  padding: 0.3rem 0.6rem;
+  padding: 0.35rem 0.75rem;
   border: 1px solid #27272a;
   color: #d4d4d8;
 }
-/* Right-align numeric cells (second column onwards in metric tables) */
 .prose td:not(:first-child) {
   text-align: right;
   font-family: "JetBrains Mono", monospace;
   font-size: 0.78rem;
 }
+.prose tr:hover td { background: #1c1c1f; }
 
 .prose code:not(pre code) {
   background: #27272a;
@@ -90,11 +96,50 @@ code, kbd, pre, .font-mono {
   padding-left: 0.75rem;
   color: #a1a1aa;
   font-style: normal;
+  background: #18181b;
+  border-radius: 0 0.25rem 0.25rem 0;
+  padding: 0.5rem 0.75rem;
+  margin: 0.75rem 0;
 }
 
 .prose ul > li::marker { color: #71717a; }
 .prose ol > li::marker { color: #71717a; }
-.prose hr { border-color: #3f3f46; }
+.prose hr { border-color: #3f3f46; margin: 1.5rem 0; }
+
+/* Citation superscript badges */
+.citation-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.65rem;
+  font-weight: 600;
+  font-family: "JetBrains Mono", monospace;
+  color: #a78bfa;
+  background: #1e1b4b;
+  border: 1px solid #4c1d95;
+  border-radius: 3px;
+  padding: 0 3px;
+  margin: 0 1px;
+  cursor: pointer;
+  line-height: 1.4;
+  vertical-align: super;
+  font-size: 0.6em;
+  transition: background 0.15s;
+}
+.citation-badge:hover { background: #2e1065; }
+
+/* ── Animations ── */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in-up { animation: fadeInUp 0.18s ease-out; }
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.animate-fade-in { animation: fadeIn 0.15s ease-out; }
 
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }

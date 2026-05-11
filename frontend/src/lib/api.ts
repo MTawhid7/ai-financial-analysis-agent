@@ -232,9 +232,17 @@ export async function getFeedbackStats(
 // Sources (provenance — returns analysis citations for a report)
 // ---------------------------------------------------------------------------
 
+export interface WebSource {
+  ticker: string;
+  title: string;
+  url: string;
+  score: number;
+}
+
 export async function getReportSources(reportId: string): Promise<{
   tickers: string;
-  analysis: Record<string, unknown>;
+  analysis: Record<string, Record<string, { value: unknown; source_tool: string; observation_step: number }>>;
+  web_sources: WebSource[];
 }> {
   const res = await fetch(`${API_BASE}/reports/${reportId}/sources`, {
     credentials: "include",

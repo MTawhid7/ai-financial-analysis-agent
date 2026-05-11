@@ -1,8 +1,12 @@
 import { Suspense, lazy } from "react";
 import type { Layout, Data } from "plotly.js";
 
-// Lazy-load to keep the initial bundle small.
-const Plot = lazy(() => import("react-plotly.js"));
+// react-plotly.js is a CommonJS module. Without the .then() normalisation,
+// Vite's ESM dynamic import resolves to the namespace object { default, ... }
+// and React.lazy crashes with "Element type is invalid" on first load.
+const Plot = lazy(() =>
+  import("react-plotly.js").then((mod) => ({ default: mod.default }))
+);
 
 interface Props {
   figure: { data: object[]; layout: object };

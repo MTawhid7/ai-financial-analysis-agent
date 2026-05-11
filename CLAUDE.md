@@ -63,7 +63,7 @@ pytest --cov=ai_financial_analyst --cov-report=term-missing
 cd frontend && npm run build
 ```
 
-Current status: **156/156** Python tests passing + frontend build clean.
+Current status: **152/152** Python tests passing + frontend build clean.
 
 ---
 
@@ -76,26 +76,27 @@ React 19 + Vite (port 5173)
   ↕ EventSource credentials:include — SSE
 FastAPI 0.115 (port 8000)
   ↕ session_manager: user_id → ConversationalAgent (LRU, 30-min TTL)
-ConversationalAgent  ← Flash-Lite intent classifier (7 intents)
-  ↓ financial_analysis  ↓ comparison  ↓ refinement  ↓ memory_query  ↓ financial_question  ↓ off_topic
-run_pipeline()       comparison_    refinement_    search          primary LLM      rejection
-                     agent          handler        summaries       + history
-  ↓
-Researcher → Quant Analyst → Editor → Report + Charts + run_artifacts.json
+ConversationalAgent
+  ↕ Manager LLM (Flash + tool-use / function-calling)
+      tools: run_financial_analysis, compare_stocks, recall_past_analysis,
+             edit_report_section, answer_finance_question, generate_chart,
+             reject_request, ask_clarification
+  ↓ run_financial_analysis / compare_stocks
+Researcher → Quant Analyst → Editor → Report + Charts
 ```
 
 | Component | File | Responsibilities |
 |---|---|---|
 | FastAPI app | `backend/main.py` | CORS, lifespan DB migration, router registration |
 | Auth | `backend/routers/auth.py` | Google ID token → JWT httpOnly cookie |
-| Chat + SSE | `backend/routers/chat.py` | POST /chat → event_id; GET /stream → EventSource; generates charts + saves report |
-| Files + Export | `backend/routers/files.py` | POST /files/upload; POST /export/{pdf,docx,xlsx}; GET /reports/{id}/sources |
-| Feedback | `backend/routers/feedback.py` | POST /feedback (👍/👎); GET /feedback/stats |
+| Chat + SSE | `backend/routers/chat.py` | POST /chat → event_id; GET /stream → EventSource; charts + report save |
+| Files + Export | `backend/routers/files.py` | POST /files/upload (8 formats); POST /export/{pdf,docx,xlsx}; GET /reports/{id}/sources |
+| Feedback | `backend/routers/feedback.py` | POST /feedback; GET /feedback/stats (stored, not yet surfaced in UI) |
 | Session manager | `backend/core/session_manager.py` | user_id → ConversationalAgent LRU cache |
-| ConversationalAgent | `agents/conversational_agent.py` | 7-intent routing, memory injection, pipeline calls |
-| IntentClassifier | `agents/intent_classifier.py` | Flash-Lite JSON classifier; 7 intents |
+| ConversationalAgent | `agents/conversational_agent.py` | Delegates to Manager; preference extraction; memory summary saving |
+| Manager LLM | `agents/manager.py` | Tool-use orchestrator replacing hardcoded intent classifier |
 | ComparisonAgent | `agents/comparison_agent.py` | Multi-ticker pipeline + Flash comparison table |
-| RefinementHandler | `agents/refinement_handler.py` | DB report retrieval + Flash LLM modification |
+| RefinementHandler | `agents/refinement_handler.py` | str_replace surgical report editing |
 | Researcher | `agents/researcher.py` | yfinance + Tavily; max 5 iterations/ticker |
 | Quant Analyst | `agents/quant_analyst.py` | CAGR, P/E vs benchmark, bull/bear cases |
 | Editor | `agents/editor.py` | SOP rubric, grounding check, disclaimer |
@@ -113,8 +114,9 @@ Researcher → Quant Analyst → Editor → Report + Charts + run_artifacts.json
 | `backend/core/event_store.py` | event_id → asyncio.Queue registry for SSE |
 | `frontend/src/hooks/useStreamingChat.ts` | POST /chat → EventSource /stream |
 | `frontend/src/lib/api.ts` | Typed fetch wrappers for all FastAPI endpoints |
-| `frontend/src/components/chat/ProvenancePanel.tsx` | "View Sources" — metric → tool → step citations |
+| `frontend/src/components/chat/CitationRenderer.tsx` | (Source: xxx) → numbered [N] badges + popovers + References section |
 | `frontend/src/components/PlotlyChart.tsx` | Lazy-loaded Plotly chart renderer |
+| `ai_financial_analyst/agents/manager.py` | LangChain bind_tools orchestrator |
 | `ai_financial_analyst/core/state.py` | `AgentState` TypedDict — inner pipeline contract |
 | `ai_financial_analyst/core/conversation_state.py` | `ConversationState` TypedDict — chat layer |
 | `ai_financial_analyst/core/llm.py` | Gemini client: retry + circuit breaker + Flash-Lite fallback |
@@ -122,8 +124,8 @@ Researcher → Quant Analyst → Editor → Report + Charts + run_artifacts.json
 | `ai_financial_analyst/memory/long_term.py` | SQLite: preferences, summaries, conversations, messages, reports, feedback (user-scoped) |
 | `ai_financial_analyst/memory/memory_manager.py` | Memory facade: context injection, preference extraction, summary saving |
 | `ai_financial_analyst/tools/calculator.py` | AST-validated numexpr evaluator (no REPL) |
-| `ai_financial_analyst/tools/chart_generator.py` | Plotly JSON: price, P/E comparison, key financials |
-| `ai_financial_analyst/tools/file_parser.py` | CSV (pandas fixed-schema + formula injection scrub) + PDF (pdfplumber + Flash-Lite) |
+| `ai_financial_analyst/tools/chart_generator.py` | Plotly JSON: price, P/E, financials, radar |
+| `ai_financial_analyst/tools/file_parser.py` | CSV, PDF, XLSX, DOCX, TXT, MD, JSON — hierarchical summarisation |
 | `ai_financial_analyst/tools/xlsx_exporter.py` | Excel workbook with live CAGR formula cells |
 
 ---
@@ -131,10 +133,10 @@ Researcher → Quant Analyst → Editor → Report + Charts + run_artifacts.json
 ## Critical Design Decisions (Do Not Change Without Review)
 
 ### No Python REPL
-`CalculatorTool` uses `numexpr` with a three-level AST guard (node whitelist, name allowlist, function allowlist). CSV files are similarly restricted — only a fixed-schema JSON summary is produced, never arbitrary pandas operations. Changing either to a general REPL is a security regression.
+`CalculatorTool` uses `numexpr` with a three-level AST guard. CSV/XLSX files are parsed to a fixed-schema JSON summary only — no arbitrary pandas operations on user data.
 
 ### Full-Content Injection Rejection
-`ContentSanitizer._regex_filter()` rejects the **entire content block** on any injection pattern match. Sentence-level redaction is insufficient. CSV cell values starting with `=`, `+`, `-`, `@` are also scrubbed before the summary reaches the LLM.
+`ContentSanitizer._regex_filter()` rejects the **entire content block** on any injection pattern match. CSV cell values starting with `=`, `+`, `-`, `@` are also scrubbed.
 
 ### Sequential Agent Execution
 Agents run one at a time. Concurrent execution saturates the free-tier 15 RPM limit and triggers the circuit breaker.
@@ -142,20 +144,17 @@ Agents run one at a time. Concurrent execution saturates the free-tier 15 RPM li
 ### `AgentState` Return Pattern
 All agent nodes return `AgentState(**{**state, "key": value})` — never `AgentState(**state, key=value)`. The latter causes `TypeError: got multiple values for keyword argument`.
 
-### `ConversationState` vs `AgentState` — Two Separate TypedDicts
-`ConversationState` is the chat layer (session ID, messages, intent). `AgentState` is the pipeline (raw_data, analysis, report). Never merged — the agent calls `run_pipeline()` and receives the final report; it never touches `AgentState` directly.
+### Manager LLM — Tool-Use Orchestrator
+The Manager uses LangChain `bind_tools` (function-calling) rather than a hardcoded intent classifier. Adding new capabilities requires only registering a new `@tool` function — no classifier changes. The tool-use loop has a hard cap of 5 rounds to prevent infinite loops.
 
-### Seven-Intent Taxonomy
-Each intent routes to a distinct handler. Critical intents that must remain separate:
-- `memory_query` — without it, "What did we find about AAPL earlier?" triggers the full pipeline (AAPL present)
-- `comparison` — without it, "Compare AAPL vs MSFT" runs full analysis instead of generating a comparison table
-- `refinement` — without it, "Make the bear case more pessimistic" re-runs the full pipeline unnecessarily
+### str_replace Document Editing
+`refinement_handler.py` sends the full report to Flash primary and asks for `old_string` + `new_string`. A literal `str.replace(old, new, 1)` is applied. If `old_string` is not found (LLM hallucinated it), the handler retries once with a corrective prompt. This preserves all unchanged sections character-perfect.
 
 ### user_id Scoping
-All `LongTermMemory` queries include `WHERE user_id = ?`. The FastAPI DB migration adds `user_id TEXT DEFAULT 'default'` to all tables — safe to run on existing databases. Existing tests use `user_id="default"` implicitly.
+All `LongTermMemory` queries include `WHERE user_id = ?`. The FastAPI DB migration adds `user_id TEXT DEFAULT 'default'` to all tables. Existing tests use `user_id="default"` implicitly.
 
-### Flash-Lite for Classification and Summarisation
-`IntentClassifier`, `MemoryManager` preference extraction, analysis summarisation, and PDF summarisation all use `get_subllm()` (Flash-Lite). Primary LLM (Flash) is reserved for analysis reasoning, financial questions, comparison tables, and refinements.
+### Hierarchical Document Summarisation
+Large documents (PDF, DOCX, TXT) are split into overlapping 3,000-char chunks, each summarised by Flash-Lite, then combined into a final summary. No truncation — all content is covered.
 
 ---
 
@@ -187,7 +186,7 @@ All `LongTermMemory` queries include `WHERE user_id = ?`. The FastAPI DB migrati
 | Service | Limit | Mitigation |
 |---|---|---|
 | Gemini Flash | ~1,500 RPD, 15 RPM | Circuit breaker (3×429 in 30s) + Flash-Lite fallback |
-| Gemini Flash-Lite | ~1,500 RPD, 30 RPM | Sub-tasks only (classification, summaries, PDF parsing) |
+| Gemini Flash-Lite | ~1,500 RPD, 30 RPM | Sub-tasks: summaries, PDF parsing, preference extraction |
 | Tavily | 1,000 credits/month | 4-hour diskcache |
 | yfinance | No hard limit | 4-hour diskcache |
 

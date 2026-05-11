@@ -1,6 +1,6 @@
 """File upload and export endpoints.
 
-POST /files/upload               Accept CSV or PDF, return parsed summary.
+POST /files/upload               Accept CSV, PDF, XLSX, XLS, DOCX, TXT, MD, JSON.
 POST /export/pdf/{report_id}     Generate and return a PDF of the report.
 POST /export/docx/{report_id}    Generate and return a Word document.
 POST /export/xlsx/{report_id}    Generate and return an Excel workbook.
@@ -27,8 +27,8 @@ from ..core import session_manager
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["files"])
 
-_MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
-_ALLOWED_TYPES = {"text/csv", "application/pdf", "application/octet-stream"}
+_MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+_ALLOWED_EXTENSIONS = {".csv", ".pdf", ".xlsx", ".xls", ".docx", ".txt", ".md", ".json"}
 _WORKSPACE = os.getenv("WORKSPACE_DIR", "workspace")
 
 
@@ -42,7 +42,7 @@ async def upload_file(
     file: UploadFile,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict:
-    """Accept a CSV or PDF file and return a structured summary."""
+    """Accept a financial document and return a structured summary."""
     content = await file.read()
     if len(content) > _MAX_UPLOAD_BYTES:
         raise HTTPException(
@@ -53,18 +53,37 @@ async def upload_file(
     filename = file.filename or "upload"
     ext = Path(filename).suffix.lower()
 
-    if ext == ".csv":
-        from ai_financial_analyst.tools.file_parser import parse_csv
-        summary = parse_csv(content, filename)
-    elif ext == ".pdf":
-        agent = session_manager.get_or_create(user.id)
-        from ai_financial_analyst.tools.file_parser import parse_pdf
-        summary = await parse_pdf(content, filename, subllm=agent._subllm)
-    else:
+    if ext not in _ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Unsupported file type: {ext}. Supported: .csv, .pdf",
+            detail=(
+                f"Unsupported file type: '{ext}'. "
+                f"Supported: {', '.join(sorted(_ALLOWED_EXTENSIONS))}"
+            ),
         )
+
+    agent = session_manager.get_or_create(user.id)
+    subllm = agent._subllm
+
+    from ai_financial_analyst.tools.file_parser import (
+        parse_csv, parse_docx, parse_json, parse_pdf, parse_text, parse_xlsx,
+    )
+
+    if ext == ".csv":
+        summary = parse_csv(content, filename)
+    elif ext == ".pdf":
+        summary = await parse_pdf(content, filename, subllm=subllm)
+    elif ext in (".xlsx", ".xls"):
+        summary = parse_xlsx(content, filename)
+    elif ext == ".docx":
+        summary = await parse_docx(content, filename, subllm=subllm)
+    elif ext in (".txt", ".md"):
+        summary = await parse_text(content, filename, subllm=subllm)
+    elif ext == ".json":
+        summary = parse_json(content, filename)
+    else:
+        # Should not reach here given the extension check above
+        raise HTTPException(status_code=415, detail=f"Unsupported: {ext}")
 
     return summary
 
@@ -79,10 +98,11 @@ async def get_report_sources(
     report_id: str,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict:
-    """Return the analysis citations for a report (used by the provenance panel)."""
+    """Return citations + web source URLs for a report."""
     async with aiosqlite.connect(get_db_path()) as db:
         async with db.execute(
-            "SELECT tickers, analysis_json FROM reports WHERE id = ? AND user_id = ?",
+            "SELECT tickers, analysis_json, raw_data_json FROM reports"
+            " WHERE id = ? AND user_id = ?",
             (report_id, user.id),
         ) as cursor:
             row = await cursor.fetchone()
@@ -91,7 +111,9 @@ async def get_report_sources(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
 
     analysis = json.loads(row[1] or "{}")
-    # Extract only the citations sub-dict so the response stays compact
+    raw_data = json.loads(row[2] or "{}")
+
+    # Build citations per ticker
     citations_by_ticker: dict = {}
     for ticker, ta in analysis.items():
         cit = ta.get("citations", {})
@@ -105,7 +127,27 @@ async def get_report_sources(
         if metrics:
             citations_by_ticker[ticker] = metrics
 
-    return {"tickers": row[0], "analysis": citations_by_ticker}
+    # Collect web search results (include title + URL for citation links)
+    web_sources: list[dict] = []
+    for ticker, ticker_data in raw_data.items():
+        news = ticker_data.get("news_search", {})
+        if isinstance(news, dict):
+            for item in news.get("summaries", []):
+                url = item.get("url", "")
+                title = item.get("headline", "")
+                if url:
+                    web_sources.append({
+                        "ticker": ticker,
+                        "title": title,
+                        "url": url,
+                        "score": item.get("score", 0),
+                    })
+
+    return {
+        "tickers": row[0],
+        "analysis": citations_by_ticker,
+        "web_sources": web_sources,
+    }
 
 
 @router.get("/export/available")

@@ -1,6 +1,6 @@
 # AI Financial Analyst Agent
 
-A **conversational AI financial analyst** with Google authentication, persistent memory, real-time streaming, interactive charts, and multi-format export. Built on a ReAct + Multi-Agent architecture using LangGraph, Gemini free tier, yfinance, and Tavily.
+A **conversational AI financial analyst** with Google authentication, persistent memory, real-time streaming, interactive charts, multi-format export, surgical report editing, and an intelligent tool-use orchestrator. Built on a ReAct + Multi-Agent architecture using LangGraph, Gemini free tier, yfinance, and Tavily.
 
 > **Portfolio project** — demonstrates production-grade agentic AI engineering. Not for real investment decisions.
 
@@ -10,24 +10,25 @@ A **conversational AI financial analyst** with Google authentication, persistent
 
 | Say this | What happens |
 |---|---|
-| *"Analyse AAPL"* | Full pipeline runs → structured report + 3 Plotly charts + PDF/Word/Excel export |
+| *"Analyse AAPL"* | Full pipeline → report + 4 Plotly charts + PDF/Word/Excel export |
 | *"Compare AAPL vs MSFT"* | Both tickers analysed → side-by-side comparison table |
-| *"Make the bear case more pessimistic"* | Refinement without re-running the pipeline |
+| *"Make the bear case more pessimistic"* | Surgical str_replace edit — only that section changes |
+| *"Show me a chart of AAPL's financial profile"* | On-demand radar chart generated |
 | *"What did we find about AAPL last time?"* | Returns stored summary, no API calls |
 | *"I prefer conservative analysis"* | Preference saved, injected into future responses |
-| *"What is a P/E ratio?"* | Direct LLM answer, no pipeline |
-| Upload a CSV or PDF | Structured summary shown in chat |
+| *"Analyse AAPL, then compare with MSFT"* | Manager chains both tools in one message |
+| Upload XLSX, DOCX, PDF, CSV, TXT, MD, JSON | Full-document hierarchical summary in chat |
 
 ---
 
 ## Architecture
 
 ```
-React 19 + Vite  →  FastAPI 0.115  →  ConversationalAgent  →  LangGraph Pipeline
+React 19 + Vite  →  FastAPI 0.115  →  Manager LLM (tool-use)  →  LangGraph Pipeline
        │                   │                    │                        │
-  Google OAuth         JWT cookie           7-intent                Researcher
-  SSE streaming        DB migration         routing                 Quant Analyst
-  TanStack Query       user_id scope        memory                  Editor
+  Google OAuth         JWT cookie           8 tools                 Researcher
+  SSE streaming        DB migration         auto-routing            Quant Analyst
+  Citation badges      user_id scope        memory context          Editor
 ```
 
 ```mermaid
@@ -35,43 +36,44 @@ flowchart LR
     User -->|natural language| React["⚛️ React + Vite\n(port 5173)"]
     React -->|Google OAuth| Google[Google]
     React -->|REST + SSE| API["⚡ FastAPI\n(port 8000)"]
-    API --> CA["💬 ConversationalAgent\n(7-intent classifier)"]
+    API --> MGR["🧠 Manager LLM\n(tool-use orchestrator)"]
 
-    CA -->|financial_analysis| Pipeline
-    CA -->|comparison| Pipeline
-    CA -->|refinement| DB2[("📋 reports\ntable")]
-    CA -->|memory_query| DB[("🧠 SQLite\nmemory.db")]
-    CA -->|financial_question| LLM["Gemini Flash\n(direct answer)"]
-    CA -->|off_topic| Reject["Polite rejection"]
+    MGR -->|run_financial_analysis| Pipeline
+    MGR -->|compare_stocks| Pipeline
+    MGR -->|edit_report_section| DB2[("📋 reports\ntable")]
+    MGR -->|recall_past_analysis| DB[("🧠 SQLite\nmemory.db")]
+    MGR -->|answer_finance_question| LLM["Gemini Flash\n(direct answer)"]
+    MGR -->|generate_chart| Charts["📊 Plotly JSON"]
+    MGR -->|reject_request| Reject["Polite rejection"]
 
     subgraph Pipeline ["LangGraph Pipeline"]
         R["🔍 Researcher"] --> Q["📐 Quant"] --> E["✏️ Editor"]
     end
 
-    Pipeline --> Report["Report + Charts\n+ run_artifacts.json"]
+    Pipeline --> Report["Report + Citations\n+ 4 Charts\n+ run_artifacts.json"]
 ```
 
 ---
 
 ## Key Engineering Decisions
 
-### No Python REPL
-`CalculatorTool` uses `numexpr` with a three-level AST whitelist. Every expression is validated before evaluation. The same principle applies to file uploads — CSV files are parsed to a fixed-schema JSON summary only, no arbitrary pandas operations.
+### Manager LLM Orchestrator (replaces hardcoded intent classifier)
+The Manager uses LangChain `bind_tools` (function-calling) to autonomously decide which tool(s) to call, in what order. Handles compound requests ("Analyse AAPL then compare with MSFT") and adds new capabilities by simply registering a new `@tool` — no routing changes needed.
 
-### Prompt Injection Mitigation
-All web search output passes through a two-layer sanitisation filter: (1) regex strips known injection patterns, (2) full content blocks are rejected — not partially redacted. A canary token in every system prompt detects successful injection. CSV uploads are checked for formula injection (`=`, `+HYPERLINK`).
+### str_replace Surgical Document Editing
+When refining a report, the LLM receives the **full** document and outputs `old_string` + `new_string`. A literal string replacement is applied — unchanged sections are preserved character-perfect. If the LLM hallucinates text not in the document, the handler retries with a corrective prompt.
+
+### Hierarchical Document Summarisation
+Large documents (PDF, DOCX, TXT) are split into overlapping 3,000-char chunks, each summarised by Flash-Lite, then combined. No truncation — important context is preserved regardless of document length.
+
+### Citation System
+`(Source: fundamentals)` inline citations are parsed into numbered `[N]` superscript badges with click/hover popovers. Each source shows a always-visible link (Yahoo Finance, Reuters, Bloomberg, etc. — parsed from actual URLs). A References section at the bottom lists all citations.
+
+### No Python REPL
+`CalculatorTool` uses `numexpr` with an AST whitelist. File parsers produce fixed-schema JSON summaries only — no raw user data reaches the LLM, no arbitrary code execution.
 
 ### Rate Limit Resilience
-`tenacity` exponential backoff + circuit breaker (halts after 3×429 in 30s). Automatic fallback from Gemini Flash to Flash-Lite when rate-limited — analysis continues at reduced quality rather than failing.
-
-### Memory System
-SQLite at `.memory/memory.db`: per-user preferences (extracted by Flash-Lite), analysis summaries (generated after each pipeline run), full conversation history. Summaries retrieved by keyword search to inject relevant past context into the system prompt.
-
-### SSE Streaming
-`POST /chat/{conv_id}` starts the pipeline in a background asyncio task and returns an `event_id`. `GET /stream/{event_id}` opens an `EventSource` that emits tool-step events in real time, then the final response with chart data and `report_id`.
-
-### Seven-Intent Taxonomy
-A dedicated intent for each action prevents false pipeline triggers. `memory_query` stops "What did we find about AAPL?" from re-running the analysis. `comparison` and `refinement` route to specialised handlers that avoid full pipeline re-runs.
+`tenacity` retry + circuit breaker (3×429 in 30s). Automatic fallback from Gemini Flash to Flash-Lite — analysis continues at reduced quality rather than failing.
 
 ---
 
@@ -131,53 +133,49 @@ cd frontend && npm run build      # zero TypeScript errors required
 ```
 ai_financial_analyst/
   agents/
-    conversational_agent.py   Top-level router (7 intents)
-    intent_classifier.py      Flash-Lite JSON classifier
-    comparison_agent.py       Side-by-side comparison table
-    refinement_handler.py     LLM-guided report modification
+    manager.py               Tool-use LLM orchestrator (8 tools, bind_tools loop)
+    conversational_agent.py  Session wrapper; delegates to Manager
+    comparison_agent.py      Multi-ticker pipeline + comparison table
+    refinement_handler.py    str_replace surgical report editing
     researcher.py / quant_analyst.py / editor.py / orchestrator.py
   core/
-    llm.py                    Gemini client: retry + circuit breaker + fallback
-    state.py / conversation_state.py   AgentState + ConversationState TypedDicts
-    sanitizer.py              Injection filter + canary token
+    llm.py                   Gemini client: retry + circuit breaker + Flash-Lite fallback
+    state.py / conversation_state.py
+    sanitizer.py             Injection filter + canary token
     budget_tracker.py / cache.py / tracing.py / artifacts.py
   memory/
-    long_term.py              SQLite: preferences, summaries, conversations, messages, feedback
-    memory_manager.py         Facade: context injection, preference extraction, summary saving
-    short_term.py             Token-budget context window
+    long_term.py             SQLite: preferences, summaries, conversations, messages, reports
+    memory_manager.py        Facade: context injection, preference extraction, summary saving
+    short_term.py            Token-budget context window
   tools/
     yahoo_finance.py / web_search.py / calculator.py / benchmark_lookup.py / report_writer.py
-    chart_generator.py        Plotly JSON charts (price, P/E, financials)
-    file_parser.py            CSV + PDF upload parsing
-    pdf_exporter.py / docx_exporter.py / xlsx_exporter.py
+    chart_generator.py       Plotly JSON: price, P/E, financials, radar
+    file_parser.py           8 formats with hierarchical Flash-Lite summarisation
+    pdf_exporter.py / docx_exporter.py / xlsx_exporter.py (with live CAGR formulas)
 
 backend/
-  main.py                     FastAPI app, CORS, lifespan DB migration
+  main.py                    FastAPI app, CORS, lifespan DB migration
   routers/
-    auth.py                   Google OAuth → JWT httpOnly cookie
-    chat.py                   POST /chat → event_id; GET /stream → SSE
-    conversations.py          CRUD + message history
-    files.py                  POST /files/upload; POST /export/{pdf,docx,xlsx}
-    memory.py                 Preferences + summaries CRUD
-    feedback.py               POST /feedback (👍/👎)
+    auth.py / conversations.py / chat.py / files.py / memory.py / feedback.py
   core/
     auth.py / database.py / session_manager.py / event_store.py / deps.py
 
 frontend/
   src/
-    pages/          LoginPage, ChatPage
+    pages/          LoginPage, ChatPage (collapsible sidebar rail)
     components/
-      chat/         ChatInterface, ChatBubble, MessageInput, FileUploadZone
+      chat/         ChatInterface (Gemini-style empty state), ChatBubble (fade-in, SVG avatar)
+                    MessageInput (violet send button), FileUploadZone (8 formats)
+                    CitationRenderer (numbered badges + popovers + References)
                     ExportMenu, ProvenancePanel
-      sidebar/      ConversationList, MemoryPanel
-      PlotlyChart.tsx
+      sidebar/      ConversationList, MemoryPanel (natural-language preferences)
+      PlotlyChart.tsx (lazy-loaded, code-split)
     hooks/          useAuth, useStreamingChat
     lib/            api.ts (typed fetch wrappers), constants.ts
 
 tests/              unit / integration / adversarial / e2e
 docs/
-  ROADMAP.md        Implementation history and phase summaries
-  MANUAL_TESTING.md Complete manual testing guide
+  MANUAL_TESTING.md  Complete manual testing guide (15 sections)
 ```
 
 ---
@@ -191,7 +189,7 @@ docs/
 | Tavily: 1,000 credits/month | 4-hour diskcache reduces consumption |
 | Static sector benchmarks | Approximate 2024 P/E averages — relative comparison only |
 | Sequential pipeline (~60–120s / 2–3 tickers) | Required to stay within free-tier RPM cap |
-| PDF export requires weasyprint | `pip install weasyprint`; may need `brew install pango` on macOS |
+| PDF export requires weasyprint | `pip install weasyprint`; macOS may need `brew install pango` |
 | Single-process FastAPI sessions | Fine for local/demo; Redis needed for horizontal scaling |
 
 ---
@@ -199,8 +197,8 @@ docs/
 ## Security
 
 - No secrets committed — all credentials in `.env` (gitignored)
-- No Python REPL — constrained `numexpr` evaluator only
-- Prompt injection filter on all web search content; CSV formula injection scrubbed
+- No Python REPL — constrained `numexpr` only; file parsers produce fixed-schema summaries
+- Prompt injection filter on all web search content; CSV/XLSX formula injection scrubbed
 - Canary token detection in agent output
 - All tool inputs validated with Pydantic v2 `extra='forbid'`
 - JWT in httpOnly cookie (not accessible to JavaScript)
