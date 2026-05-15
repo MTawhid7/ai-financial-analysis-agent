@@ -45,8 +45,37 @@ async def get_db_session() -> AsyncSession: # type: ignore
 
 
 async def run_migrations() -> None:
-    """Create all tables idempotently."""
+    """Create all tables idempotently; enable pgvector extension on PostgreSQL."""
     logger.info("Running database migrations via SQLAlchemy...")
+    is_pg = _DATABASE_URL.startswith("postgresql")
     async with engine.begin() as conn:
+        if is_pg:
+            # Enable pgvector extension (idempotent; no-op if already enabled)
+            try:
+                await conn.execute(
+                    __import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector")
+                )
+                await conn.execute(
+                    __import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                )
+            except Exception as ext_err:
+                logger.warning("Could not create pgvector extension (may need superuser): %s", ext_err)
+
         await conn.run_sync(Base.metadata.create_all)
+
+        if is_pg:
+            # Add GIN full-text-search index on document_pages if not present
+            await conn.execute(__import__("sqlalchemy").text("""
+                CREATE INDEX IF NOT EXISTS idx_pages_content_fts
+                ON document_pages USING GIN (to_tsvector('english', content))
+            """))
+            # Add IVFFlat ANN index for vector similarity if pgvector is available
+            from .models import HAS_PGVECTOR
+            if HAS_PGVECTOR:
+                await conn.execute(__import__("sqlalchemy").text("""
+                    CREATE INDEX IF NOT EXISTS idx_pages_embedding_ivfflat
+                    ON document_pages USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = 100)
+                """))
+
     logger.info("Database migrations complete.")

@@ -14,10 +14,14 @@ A **conversational AI financial analyst** with Google authentication, persistent
 | *"Compare AAPL vs MSFT"* | Both tickers analysed → side-by-side comparison table |
 | *"Make the bear case more pessimistic"* | Surgical str_replace edit — only that section changes |
 | *"Show me a chart of AAPL's financial profile"* | On-demand radar chart generated |
+| *"Show NVDA with Bollinger Bands over 10 years"* | Candlestick + BB overlays, period="10y" |
+| *"Compare Nasdaq vs S&P 500 year to date"* | Normalised return chart, QQQ vs SPY |
 | *"What did we find about AAPL last time?"* | Returns stored summary, no API calls |
 | *"I prefer conservative analysis"* | Preference saved, injected into future responses |
 | *"Analyse AAPL, then compare with MSFT"* | Manager chains both tools in one message |
-| Upload XLSX, DOCX, PDF, CSV, TXT, MD, JSON | Full-document hierarchical summary in chat |
+| Upload XLSX, DOCX, PDF, CSV, TXT, MD, JSON | Immediate summary + background PageIndex deep-indexing |
+| *"What does page 47 of the uploaded report say?"* | PageIndex returns that exact page with citation |
+| *"Find the revenue table in my annual report"* | Hybrid vector+FTS search → page-level result |
 
 ---
 
@@ -43,7 +47,9 @@ flowchart LR
     MGR -->|edit_report_section| DB2[("📋 reports\ntable")]
     MGR -->|recall_past_analysis| DB[("🐘 Postgres\nSupabase")]
     MGR -->|answer_finance_question| LLM["Gemini Flash\n(direct answer)"]
-    MGR -->|generate_chart| Charts["📊 Plotly JSON"]
+    MGR -->|generate_chart| Charts["📊 13 chart types\nplotly JSON"]
+    MGR -->|search_documents| PageIdx[("📄 PageIndex\npgvector+FTS")]
+    MGR -->|get_document_page| PageIdx
     MGR -->|reject_request| Reject["Polite rejection"]
 
     subgraph Pipeline ["LangGraph Pipeline"]
@@ -133,7 +139,7 @@ cd frontend && npm run build      # zero TypeScript errors required
 ```
 ai_financial_analyst/
   agents/
-    manager.py               Tool-use LLM orchestrator (8 tools, bind_tools loop)
+    manager.py               Tool-use LLM orchestrator (10 tools: analysis, charts, docs, memory…)
     conversational_agent.py  Session wrapper; delegates to Manager
     comparison_agent.py      Multi-ticker pipeline + comparison table
     refinement_handler.py    str_replace surgical report editing
@@ -147,29 +153,47 @@ ai_financial_analyst/
     long_term.py             SQLAlchemy/Postgres: preferences, summaries, conversations, messages, reports
     memory_manager.py        Facade: context injection, preference extraction, summary saving
     short_term.py            Token-budget context window
+  pageindex/                 ← PageIndex document retrieval system
+    __init__.py              Public API: index_document, search_documents, get_page
+    embedder.py              Gemini text-embedding-004 (768-dim) + ResultCache
+    pipeline.py              Ingestion: extract → summarise → embed → store → link
+    retriever.py             Hybrid search: pgvector ANN + Postgres FTS + RRF
+    ocr.py                   Scanned PDF detection + pytesseract OCR fallback
+  charts/                    13 Plotly chart types (modular)
+    _theme.py / _data.py     Palette, fetch utils, ticker aliases, earnings annotations
+    price_action.py          Candlestick (BB/EMA overlays, earnings markers, date ranges)
+    technical.py             RSI, MACD
+    combined.py              Price+RSI, Price+MACD multi-panel
+    fundamentals.py          Revenue trend, margins, cashflow, debt profile
+    comparison.py            Normalised return comparison
+    risk.py                  Drawdown
+    pipeline.py / dispatcher.py
+  parsers/                   File parsers (modular)
+    _summarise.py / _page_extractor.py
+    csv_parser.py / pdf_parser.py / excel_parser.py / word_parser.py
+    text_parser.py / json_parser.py
   tools/
     yahoo_finance.py / web_search.py / calculator.py / benchmark_lookup.py / report_writer.py
-    chart_generator.py       Plotly JSON: price, P/E, financials, radar
-    file_parser.py           8 formats with hierarchical Flash-Lite summarisation
     pdf_exporter.py / docx_exporter.py / xlsx_exporter.py (with live CAGR formulas)
 
 backend/
   main.py                    FastAPI app, CORS, lifespan DB migration
   routers/
     auth.py / conversations.py / chat.py / files.py / memory.py / feedback.py
+    admin.py                 Admin: system document management (ADMIN_USER_IDS protected)
   core/
     auth.py / database.py / session_manager.py / event_store.py / deps.py
+    models.py                ORM models: User, Conversation, Message, Report, Document,
+                             DocumentPage, PageLink (pgvector-aware)
 
 frontend/
   src/
     pages/          LoginPage, ChatPage (collapsible sidebar rail)
     components/
-      chat/         ChatInterface (Gemini-style empty state), ChatBubble (fade-in, SVG avatar)
-                    MessageInput (violet send button), FileUploadZone (8 formats)
-                    CitationRenderer (numbered badges + popovers + References)
-                    ExportMenu, ProvenancePanel
-      sidebar/      ConversationList, MemoryPanel (natural-language preferences)
-      PlotlyChart.tsx (lazy-loaded, code-split)
+      chat/         ChatInterface, ChatBubble, MessageInput (paperclip attachment),
+                    CitationRenderer (numbered badges), ExportMenu, ProvenancePanel
+      sidebar/      ConversationList (inline rename), MemoryPanel
+      PlotlyChart.tsx (interactive: hover/zoom/pan toolbar)
     hooks/          useAuth, useStreamingChat
     lib/            api.ts (typed fetch wrappers), constants.ts
 

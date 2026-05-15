@@ -468,6 +468,86 @@ def build_tools(
         return f"Here is the **{chart_type.replace('_', ' ')}** chart for **{ticker.upper()}** ({range_label})."
 
     @tool
+    async def search_documents(query: str, top_k: int = 5) -> str:
+        """Search across all uploaded documents and system reference documents.
+
+        Use when the user asks about content from uploaded files OR system docs:
+        "What did the PDF say about...", "Find the revenue table in the report",
+        "Which page discusses risk factors?", "Search the SEC filing for..."
+
+        Returns page-level results with precise citations (document, page, section).
+        Searches BOTH the user's private uploads AND system-level reference documents
+        in a single query.
+
+        Args:
+            query: Natural language question or topic to search for
+            top_k: Number of most relevant pages to return (default 5)
+        """
+        try:
+            from ai_financial_analyst.pageindex import search_documents as pi_search
+            results = await pi_search(query, user_id=agent.user_id or "", top_k=top_k)
+        except Exception as exc:
+            logger.warning("PageIndex search failed: %s", exc)
+            return f"Document search is not available: {exc}"
+
+        if not results:
+            return (
+                "No relevant content found in uploaded documents or system references. "
+                "Try uploading a document first, or rephrase your query."
+            )
+
+        lines = [f"Found {len(results)} relevant page(s) from your documents:\n"]
+        for i, pr in enumerate(results, 1):
+            lines.append(f"**[{i}] {pr.citation}**")
+            if pr.content_summary:
+                lines.append(f"*{pr.content_summary}*")
+            lines.append(pr.content[:1200])
+            if pr.tables:
+                for tbl in pr.tables[:2]:
+                    headers = tbl.get("headers", [])
+                    rows    = tbl.get("rows", [])[:5]
+                    if headers:
+                        lines.append("| " + " | ".join(str(h) for h in headers) + " |")
+                        lines.append("| " + " | ".join("---" for _ in headers) + " |")
+                        for row in rows:
+                            lines.append("| " + " | ".join(str(c) for c in row) + " |")
+            lines.append("")
+        return "\n".join(lines)
+
+    @tool
+    async def get_document_page(document_id: str, page_number: int) -> str:
+        """Retrieve a specific page from an indexed document by its page number.
+
+        Use when the user asks for a specific page: "Show me page 15 of the report",
+        or when following up on a search result with a known document and page reference.
+
+        Args:
+            document_id: The document identifier (from a search_documents result)
+            page_number: The page number to retrieve (1-based)
+        """
+        try:
+            from ai_financial_analyst.pageindex import get_document_page_by_number
+            pr = await get_document_page_by_number(document_id, page_number, agent.user_id or "")
+        except Exception as exc:
+            return f"Could not retrieve page: {exc}"
+
+        if not pr:
+            return f"Page {page_number} not found in document {document_id}."
+
+        lines = [f"**{pr.citation}**", ""]
+        lines.append(pr.content)
+        if pr.tables:
+            for tbl in pr.tables:
+                headers = tbl.get("headers", [])
+                rows    = tbl.get("rows", [])
+                if headers:
+                    lines.append("| " + " | ".join(str(h) for h in headers) + " |")
+                    lines.append("| " + " | ".join("---" for _ in headers) + " |")
+                    for row in rows[:10]:
+                        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+        return "\n".join(lines)
+
+    @tool
     def ask_clarification(question: str) -> str:
         """Ask the user a clarifying question when the request is ambiguous.
 
@@ -486,6 +566,8 @@ def build_tools(
         edit_report_section,
         answer_finance_question,
         generate_chart,
+        search_documents,
+        get_document_page,
         reject_request,
         ask_clarification,
     ]

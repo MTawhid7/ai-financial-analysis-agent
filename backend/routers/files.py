@@ -16,7 +16,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
 from ..core.deps import CurrentUser, get_current_user
@@ -38,9 +38,10 @@ _WORKSPACE = os.getenv("WORKSPACE_DIR", "workspace")
 @router.post("/files/upload")
 async def upload_file(
     file: UploadFile,
+    background_tasks: BackgroundTasks,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict:
-    """Accept a financial document and return a structured summary."""
+    """Accept a financial document, return a structured summary, and queue deep PageIndex indexing."""
     content = await file.read()
     if len(content) > _MAX_UPLOAD_BYTES:
         raise HTTPException(
@@ -80,10 +81,38 @@ async def upload_file(
     elif ext == ".json":
         summary = parse_json(content, filename)
     else:
-        # Should not reach here given the extension check above
         raise HTTPException(status_code=415, detail=f"Unsupported: {ext}")
 
+    # Queue background deep indexing (non-blocking — returns immediately)
+    if ext not in (".csv", ".json", ".xlsx", ".xls"):
+        # Skip indexing for purely tabular formats (no narrative text to retrieve)
+        background_tasks.add_task(
+            _background_index, content, filename, user.id, subllm
+        )
+        summary["indexing"] = True
+
     return summary
+
+
+async def _background_index(
+    file_bytes: bytes,
+    filename: str,
+    user_id: str,
+    subllm: object,
+) -> None:
+    """Background task: run full PageIndex pipeline for a user-uploaded document."""
+    try:
+        from ai_financial_analyst.pageindex import index_document
+        doc_id = await index_document(
+            file_bytes=file_bytes,
+            filename=filename,
+            user_id=user_id,
+            subllm=subllm,
+            scope="user",
+        )
+        logger.info("PageIndex: background indexing complete for %s → doc_id=%s", filename, doc_id)
+    except Exception as exc:
+        logger.error("PageIndex: background indexing failed for %s: %s", filename, exc)
 
 
 # ---------------------------------------------------------------------------

@@ -80,6 +80,7 @@ ConversationalAgent
   ↕ Manager LLM (Flash + tool-use / function-calling)
       tools: run_financial_analysis, compare_stocks, recall_past_analysis,
              edit_report_section, answer_finance_question, generate_chart,
+             search_documents, get_document_page,
              reject_request, ask_clarification
   ↓ run_financial_analysis / compare_stocks
 Researcher → Quant Analyst → Editor → Report + Charts
@@ -90,7 +91,8 @@ Researcher → Quant Analyst → Editor → Report + Charts
 | FastAPI app | `backend/main.py` | CORS, lifespan DB migration, router registration |
 | Auth | `backend/routers/auth.py` | Google ID token → JWT httpOnly cookie |
 | Chat + SSE | `backend/routers/chat.py` | POST /chat → event_id; GET /stream → EventSource; charts + report save |
-| Files + Export | `backend/routers/files.py` | POST /files/upload (8 formats); POST /export/{pdf,docx,xlsx}; GET /reports/{id}/sources |
+| Files + Export | `backend/routers/files.py` | POST /files/upload (8 formats); POST /export/{pdf,docx,xlsx}; background PageIndex indexing |
+| Admin | `backend/routers/admin.py` | POST/GET/PATCH/DELETE /admin/documents — system document management (ADMIN_USER_IDS) |
 | Feedback | `backend/routers/feedback.py` | POST /feedback; GET /feedback/stats (stored, not yet surfaced in UI) |
 | Session manager | `backend/core/session_manager.py` | user_id → ConversationalAgent LRU cache |
 | ConversationalAgent | `agents/conversational_agent.py` | Delegates to Manager; preference extraction; memory summary saving |
@@ -124,9 +126,17 @@ Researcher → Quant Analyst → Editor → Report + Charts
 | `ai_financial_analyst/memory/long_term.py` | SQLAlchemy/Postgres: preferences, summaries, conversations, messages, reports, feedback (user-scoped) |
 | `ai_financial_analyst/memory/memory_manager.py` | Memory facade: context injection, preference extraction, summary saving |
 | `ai_financial_analyst/tools/calculator.py` | AST-validated numexpr evaluator (no REPL) |
-| `ai_financial_analyst/tools/chart_generator.py` | Plotly JSON: price, P/E, financials, radar |
-| `ai_financial_analyst/tools/file_parser.py` | CSV, PDF, XLSX, DOCX, TXT, MD, JSON — hierarchical summarisation |
+| `ai_financial_analyst/tools/chart_generator.py` | Shim → `ai_financial_analyst/charts/` (13 chart types) |
+| `ai_financial_analyst/tools/file_parser.py` | Shim → `ai_financial_analyst/parsers/` (7 format parsers) |
 | `ai_financial_analyst/tools/xlsx_exporter.py` | Excel workbook with live CAGR formula cells |
+| `ai_financial_analyst/pageindex/__init__.py` | PageIndex public API: index_document, search_documents, get_page |
+| `ai_financial_analyst/pageindex/pipeline.py` | Ingest pipeline: extract → summarise → embed → pgvector |
+| `ai_financial_analyst/pageindex/retriever.py` | Hybrid search: pgvector ANN + Postgres FTS + RRF; SQLite fallback |
+| `ai_financial_analyst/pageindex/embedder.py` | Gemini text-embedding-004 (768-dim) with ResultCache |
+| `ai_financial_analyst/pageindex/ocr.py` | Scanned PDF detection + pytesseract OCR |
+| `ai_financial_analyst/parsers/_page_extractor.py` | RawPage dataclass + per-format structured extraction |
+| `backend/core/models.py` | ORM: adds Document, DocumentPage, PageLink (pgvector-aware) |
+| `backend/routers/admin.py` | Admin endpoints for system documents (ADMIN_USER_IDS env var) |
 
 ---
 
@@ -155,6 +165,15 @@ All `LongTermMemory` queries include `WHERE user_id = ?`. The FastAPI DB migrati
 
 ### Hierarchical Document Summarisation
 Large documents (PDF, DOCX, TXT) are split into overlapping 3,000-char chunks, each summarised by Flash-Lite, then combined into a final summary. No truncation — all content is covered.
+
+### PageIndex — Two-Tier Document Access Model
+Documents are either `scope='user'` (private, `user_id` required) or `scope='system'` (visible to all authenticated users, `user_id=NULL`). DB-level `CHECK` constraints enforce this. Every retrieval query always returns both tiers via `WHERE (user_id=$uid AND scope='user') OR scope='system'`. User documents are deleted on account deletion (ON DELETE CASCADE). System documents are managed exclusively through `POST /admin/documents/upload` protected by the `ADMIN_USER_IDS` env var.
+
+### PageIndex — Embedding + Hybrid Search
+`text-embedding-004` (768-dim) is used for both document and query embeddings (different `task_type` for each). The retriever runs two parallel queries — pgvector IVFFlat ANN and Postgres `tsvector` FTS — then merges results with Reciprocal Rank Fusion (k=60). On SQLite (dev), falls back to LIKE-based FTS since pgvector is unavailable. Embeddings are cached in `ResultCache` via SHA256 key to avoid re-embedding identical text.
+
+### Required env vars for PageIndex
+`ADMIN_USER_IDS` — comma-separated list of user IDs or emails that can call `/admin/*` endpoints. Leave empty to disable admin access. `UPLOAD_DIR` — directory for raw file storage (default `.uploads`).
 
 ---
 
