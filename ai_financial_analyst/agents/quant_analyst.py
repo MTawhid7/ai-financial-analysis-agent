@@ -1,23 +1,22 @@
 """Quant Analyst Agent — computation and comparison node.
 
-Responsibilities:
-- Validate Researcher output before proceeding.
-- Compute 5-year CAGR for revenue and price.
-- Compare P/E ratios against sector median from BenchmarkLookupTool.
-- Identify closest sector peer.
-- Formulate bull and bear cases.
-- Cite source_tool + observation_index for every numerical value.
+Improvements over original:
+- Reads pre-computed risk metrics (Sharpe, Sortino, max drawdown, beta, volatility)
+  from the new price_metrics data type instead of recomputing
+- Uses adjusted-close total-return CAGR rather than raw-price CAGR
+- Compares 3 valuation multiples vs sector (P/E, EV/EBITDA, P/B) when available
+- Includes FCF yield and key profitability ratios in the analysis context
+- Uses Gemini JSON mode for bull/bear case generation to eliminate fragile
+  markdown-fence stripping
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import math
 from typing import Any
 
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.prompts import ChatPromptTemplate
 
 from ..core.llm import content_to_str
 from ..core.state import (
@@ -31,64 +30,55 @@ from ..tools.benchmark_lookup import benchmark_lookup_tool
 
 logger = logging.getLogger(__name__)
 
-# yfinance sector strings → GICS sector names used in benchmarks.json
+# yfinance sector strings → GICS sector names
 _YFINANCE_TO_GICS: dict[str, str] = {
-    "Technology": "Information Technology",
-    "Healthcare": "Health Care",
-    "Financial Services": "Financials",
-    "Consumer Cyclical": "Consumer Discretionary",
-    "Consumer Defensive": "Consumer Staples",
-    "Basic Materials": "Materials",
-    "Communication Services": "Communication Services",
-    "Industrials": "Industrials",
-    "Energy": "Energy",
-    "Utilities": "Utilities",
-    "Real Estate": "Real Estate",
+    "Technology":            "Information Technology",
+    "Healthcare":            "Health Care",
+    "Financial Services":    "Financials",
+    "Consumer Cyclical":     "Consumer Discretionary",
+    "Consumer Defensive":    "Consumer Staples",
+    "Basic Materials":       "Materials",
+    "Communication Services":"Communication Services",
+    "Industrials":           "Industrials",
+    "Energy":                "Energy",
+    "Utilities":             "Utilities",
+    "Real Estate":           "Real Estate",
 }
 
-_SOP_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            """You are a quantitative financial analyst. Analyse the financial data provided
-and respond with ONLY this exact JSON structure — no other keys, no markdown, no prose:
+_SOP_SYSTEM = """You are a quantitative financial analyst writing an investment brief.
 
-{{
+Analyse the financial data and metrics provided and respond with ONLY this JSON:
+
+{
   "bull_case": ["<reason 1>", "<reason 2>", "<reason 3>"],
-  "bear_case": ["<risk 1>", "<risk 2>", "<risk 3>"],
+  "bear_case": ["<risk 1>",   "<risk 2>",   "<risk 3>"],
   "closest_peer": "<Company Name (TICKER)>"
-}}
+}
 
 Rules:
-- bull_case: exactly 2-3 concise reasons to be optimistic about this stock. Reference specific computed metrics (CAGR, P/E premium, sector benchmark) where available.
-- bear_case: exactly 2-3 concise risks or concerns. Reference the valuation premium vs. sector if available.
-- closest_peer: the single most comparable publicly traded peer company
-- If data is missing, use general sector knowledge to provide reasonable analysis
-- Output ONLY the JSON object above — nothing else""",
-        ),
-        (
-            "human",
-            "Stock: {raw_data_json}\n\nComputed metrics so far:\n{computed_metrics_json}\n\nPrevious tool observations:\n{iteration_log_json}",
-        ),
-    ]
-)
+- bull_case: 2-3 specific, data-driven reasons to be optimistic.
+  Reference Sharpe ratio, CAGR vs S&P 500, FCF yield, margin trends, or sector P/E premium.
+- bear_case: 2-3 concrete risks. Reference max drawdown, valuation premium, beta, debt/equity.
+- closest_peer: single most comparable public company (format: "Apple Inc. (AAPL)")
+- If a metric is missing, use sector knowledge — but prefer cited numbers.
+- Output ONLY the JSON above. No markdown, no prose, no explanation."""
 
 
 async def quant_analyst_node(state: AgentState, config: dict | None = None) -> AgentState:
     """LangGraph node: Quant Analyst agent."""
     validate_state_for_agent(state, "quant_analyst")
 
-    tracer: RunTracer | None = config.get("tracer") if config else None
-    artifacts = config.get("artifacts") if config else None
+    tracer        = config.get("tracer")       if config else None
+    artifacts     = config.get("artifacts")    if config else None
     step_callback = config.get("step_callback") if config else None
-    primary_llm = config.get("primary_llm") if config else None
+    primary_llm   = config.get("primary_llm")  if config else None
 
     if primary_llm is None:
-        raise RuntimeError("Quant Analyst node requires 'primary_llm' in config")
+        raise RuntimeError("Quant Analyst requires 'primary_llm' in config")
 
-    raw_data = state["raw_data"]
+    raw_data       = state["raw_data"]
     iteration_log: list[IterationLogEntry] = list(state.get("iteration_log", []))
-    errors: list[dict[str, Any]] = list(state.get("errors", []))
+    errors: list[dict[str, Any]]           = list(state.get("errors", []))
     step = len(iteration_log)
 
     if tracer:
@@ -97,232 +87,249 @@ async def quant_analyst_node(state: AgentState, config: dict | None = None) -> A
     analysis_per_ticker: dict[str, Any] = {}
 
     for ticker, ticker_data in raw_data.items():
-        ticker_analysis: dict[str, Any] = {"ticker": ticker, "citations": {}}
+        ta: dict[str, Any] = {"ticker": ticker, "citations": {}}
 
-        # --- 5-year price CAGR ---
-        price_data = ticker_data.get("price_history")
-        if price_data and price_data.get("current_price") and price_data.get("price_5y_ago"):
-            current = price_data["current_price"]
-            five_y_ago = price_data["price_5y_ago"]
-            if five_y_ago > 0:
-                cagr_expr = f"(({current} / {five_y_ago}) ** (1/5) - 1) * 100"
+        # ── 1. Total-return CAGR (from price_metrics, preferred) ──────────
+        pm = ticker_data.get("price_metrics", {})
+        ph = ticker_data.get("price_history", {})
+
+        if pm and pm.get("total_return_cagr_pct") is not None:
+            ta["price_cagr_5y_pct"]  = pm["total_return_cagr_pct"]   # total return (adj.)
+            ta["sp500_cagr_pct"]     = pm.get("sp500_cagr_pct")
+            ta["relative_cagr_pct"]  = pm.get("relative_cagr_pct")   # alpha vs benchmark
+            ta["citations"]["price_cagr_5y_pct"] = {
+                "source_tool": "yahoo_finance", "observation_step": step
+            }
+        elif ph and ph.get("current_price") and ph.get("price_5y_ago"):
+            # Fallback: raw-price CAGR via calculator (no dividend adjustment)
+            current   = ph["current_price"]
+            five_y    = ph["price_5y_ago"]
+            if five_y > 0:
+                expr = f"(({current} / {five_y}) ** (1/5) - 1) * 100"
                 step += 1
-                cagr_str = await calculator_tool.arun({"expression": cagr_expr})
-
-                if tracer:
-                    tracer.record_tool_call(
-                        agent="quant_analyst",
-                        tool="calculator",
-                        input_data={"expression": cagr_expr},
-                        output_data=cagr_str,
-                        output_tokens=10,
-                    )
-                if artifacts:
-                    artifacts.record_tool_response(
-                        agent="quant_analyst",
-                        tool="calculator",
-                        input_data={"expression": cagr_expr},
-                        full_output=str(cagr_str),
-                        step=step,
-                    )
-                if step_callback:
-                    step_callback({
-                        "step": step, "agent": "quant_analyst", "tool": "calculator",
-                        "input": {"expression": cagr_expr}, "cache_hit": False, "ok": True,
-                    })
-
-                iteration_log.append(
-                    IterationLogEntry(
-                        step=step,
-                        agent="quant_analyst",
-                        tool="calculator",
-                        input={"expression": cagr_expr},
-                        output_tokens=10,
-                        cache_hit=False,
-                    )
-                )
-
+                cagr_str = await calculator_tool.arun({"expression": expr})
+                _record_step(step, "calculator", {"expression": expr}, cagr_str,
+                             tracer, artifacts, step_callback, iteration_log)
                 try:
-                    ticker_analysis["price_cagr_5y_pct"] = round(float(cagr_str), 2)
-                    ticker_analysis["citations"]["price_cagr_5y_pct"] = {
-                        "source_tool": "calculator",
-                        "observation_step": step,
+                    ta["price_cagr_5y_pct"] = round(float(cagr_str), 2)
+                    ta["citations"]["price_cagr_5y_pct"] = {
+                        "source_tool": "calculator", "observation_step": step
                     }
-                except ValueError:
-                    errors.append({"error_type": ErrorType.TOOL_ERROR.value, "detail": f"CAGR parse failed: {cagr_str}"})
-            else:
-                ticker_analysis["price_cagr_5y_pct"] = None
-        else:
-            ticker_analysis["price_cagr_5y_pct"] = None
+                except (ValueError, TypeError):
+                    errors.append({"error_type": ErrorType.TOOL_ERROR.value,
+                                   "detail": f"CAGR parse failed: {cagr_str}"})
 
-        # --- Sector benchmark comparison ---
-        fundamentals = ticker_data.get("fundamentals")
-        logger.debug(
-            "Fundamentals for %s: type=%s, sector=%s",
-            ticker,
-            type(fundamentals).__name__,
-            fundamentals.get("sector") if isinstance(fundamentals, dict) else "NOT A DICT",
-        )
-        if isinstance(fundamentals, str):
-            # Checkpoint deserialised as JSON string — parse it back.
+        # ── 2. Risk metrics (from price_metrics) ──────────────────────────
+        if pm:
+            for key in ("sharpe_ratio", "sortino_ratio", "max_drawdown_pct",
+                        "beta_vs_sp500", "volatility_annual_pct"):
+                if pm.get(key) is not None:
+                    ta[key] = pm[key]
+                    ta["citations"][key] = {
+                        "source_tool": "yahoo_finance", "observation_step": step
+                    }
+
+        # ── 3. FCF yield and cash metrics ────────────────────────────────
+        cf = ticker_data.get("cash_flow", {})
+        if cf:
+            if cf.get("fcf_yield") is not None:
+                ta["fcf_yield_pct"] = round(cf["fcf_yield"] * 100, 2)
+                ta["citations"]["fcf_yield_pct"] = {
+                    "source_tool": "yahoo_finance", "observation_step": step
+                }
+            if cf.get("cash_conversion_ratio") is not None:
+                ta["cash_conversion_ratio"] = cf["cash_conversion_ratio"]
+            if cf.get("free_cash_flow") is not None:
+                ta["free_cash_flow"] = cf["free_cash_flow"]
+
+        # ── 4. Next earnings date ─────────────────────────────────────────
+        earn = ticker_data.get("earnings", {})
+        if earn and earn.get("next_earnings_date"):
+            ta["next_earnings_date"] = earn["next_earnings_date"]
+
+        # ── 5. Sector benchmark comparison (P/E, EV/EBITDA, P/B) ─────────
+        fund = ticker_data.get("fundamentals", {})
+        if isinstance(fund, str):
             try:
-                import json as _json
-                fundamentals = _json.loads(fundamentals)
+                fund = json.loads(fund)
             except Exception:
-                fundamentals = None
-        if fundamentals and fundamentals.get("sector"):
-            sector = _YFINANCE_TO_GICS.get(fundamentals["sector"], fundamentals["sector"])
+                fund = {}
+
+        if fund and fund.get("sector"):
+            gics_sector = _YFINANCE_TO_GICS.get(fund["sector"], fund["sector"])
             step += 1
-            benchmark_str = await benchmark_lookup_tool.arun({"gics_sector": sector})
-
-            if tracer:
-                tracer.record_tool_call(
-                    agent="quant_analyst",
-                    tool="benchmark_lookup",
-                    input_data={"gics_sector": sector},
-                    output_data=benchmark_str,
-                    output_tokens=len(benchmark_str) // 4,
-                )
-            if artifacts:
-                artifacts.record_tool_response(
-                    agent="quant_analyst",
-                    tool="benchmark_lookup",
-                    input_data={"gics_sector": sector},
-                    full_output=benchmark_str,
-                    step=step,
-                )
-            if step_callback:
-                step_callback({
-                    "step": step, "agent": "quant_analyst", "tool": "benchmark_lookup",
-                    "input": {"gics_sector": sector}, "cache_hit": False,
-                    "ok": "error_type" not in (json.loads(benchmark_str) if benchmark_str.startswith("{") else {}),
-                })
-
-            iteration_log.append(
-                IterationLogEntry(
-                    step=step,
-                    agent="quant_analyst",
-                    tool="benchmark_lookup",
-                    input={"gics_sector": sector},
-                    output_tokens=len(benchmark_str) // 4,
-                    cache_hit=False,
-                )
-            )
+            benchmark_str = await benchmark_lookup_tool.arun({"gics_sector": gics_sector})
+            _record_step(step, "benchmark_lookup", {"gics_sector": gics_sector},
+                         benchmark_str, tracer, artifacts, step_callback, iteration_log)
 
             try:
-                benchmark = json.loads(benchmark_str)
-                if "error_type" not in benchmark:
-                    ticker_analysis["sector"] = sector
-                    ticker_analysis["sector_pe_avg"] = benchmark["pe_ratio_sector_avg"]
-                    ticker_analysis["sector_peers"] = benchmark["peer_examples"]
-                    ticker_analysis["citations"]["sector_pe_avg"] = {
-                        "source_tool": "benchmark_lookup",
-                        "observation_step": step,
+                bm = json.loads(benchmark_str)
+                if "error_type" not in bm:
+                    ta["sector"]       = gics_sector
+                    ta["sector_peers"] = bm.get("peer_examples", [])
+                    ta["citations"]["sector_benchmarks"] = {
+                        "source_tool": "benchmark_lookup", "observation_step": step
                     }
 
-                    company_pe = fundamentals.get("pe_ratio")
-                    if company_pe and benchmark["pe_ratio_sector_avg"]:
-                        pe_premium_pct = (
-                            (company_pe - benchmark["pe_ratio_sector_avg"])
-                            / benchmark["pe_ratio_sector_avg"]
-                            * 100
+                    # P/E premium vs sector
+                    co_pe  = fund.get("pe_ratio")
+                    sec_pe = bm.get("pe_ratio_sector_avg")
+                    if co_pe and sec_pe:
+                        ta["company_pe"]  = co_pe
+                        ta["sector_pe_avg"] = sec_pe
+                        ta["pe_vs_sector_premium_pct"] = round(
+                            (co_pe - sec_pe) / sec_pe * 100, 1
                         )
-                        ticker_analysis["company_pe"] = company_pe
-                        ticker_analysis["pe_vs_sector_premium_pct"] = round(pe_premium_pct, 1)
-                        ticker_analysis["citations"]["pe_vs_sector_premium_pct"] = {
-                            "source_tool": "benchmark_lookup",
-                            "observation_step": step,
-                        }
+
+                    # EV/EBITDA premium vs sector
+                    co_ev  = fund.get("ev_to_ebitda")
+                    sec_ev = bm.get("ev_ebitda_sector_avg")
+                    if co_ev and sec_ev:
+                        ta["ev_ebitda"]             = co_ev
+                        ta["sector_ev_ebitda_avg"]  = sec_ev
+                        ta["ev_vs_sector_premium_pct"] = round(
+                            (co_ev - sec_ev) / sec_ev * 100, 1
+                        )
+
+                    # P/B premium vs sector
+                    co_pb  = fund.get("price_to_book")
+                    sec_pb = bm.get("price_to_book_sector_avg")
+                    if co_pb and sec_pb:
+                        ta["price_to_book"]             = co_pb
+                        ta["sector_price_to_book_avg"]  = sec_pb
+                        ta["pb_vs_sector_premium_pct"]  = round(
+                            (co_pb - sec_pb) / sec_pb * 100, 1
+                        )
+
+                    # Sector-level risk & margin benchmarks (from Damodaran)
+                    if bm.get("beta_sector_avg"):
+                        ta["sector_beta_avg"] = bm["beta_sector_avg"]
+                    if bm.get("operating_margin_pct"):
+                        ta["sector_operating_margin_pct"] = bm["operating_margin_pct"]
+
             except (json.JSONDecodeError, KeyError) as exc:
                 errors.append({"error_type": ErrorType.PARSING_ERROR.value, "detail": str(exc)})
 
-        # --- LLM-generated bull/bear cases via SOP prompt ---
+        # ── 6. Key profitability context for the LLM ─────────────────────
+        if fund:
+            for key in ("roe", "roa", "operating_margin", "gross_margin",
+                        "debt_to_equity", "revenue_growth", "earnings_growth"):
+                yf_key = {
+                    "roe":              "return_on_equity",
+                    "roa":              "return_on_assets",
+                    "operating_margin": "operating_margin",
+                    "gross_margin":     "gross_margin",
+                    "debt_to_equity":   "debt_to_equity",
+                    "revenue_growth":   "revenue_growth",
+                    "earnings_growth":  "earnings_growth",
+                }.get(key, key)
+                val = fund.get(yf_key)
+                if val is not None:
+                    ta[key] = val
+
+        # ── 7. LLM bull/bear case (structured JSON mode) ─────────────────
         step += 1
-        sop_chain = _SOP_PROMPT | primary_llm
-        # Include already-computed metrics so the LLM can reference sector P/E premium
-        # and CAGR directly rather than re-deriving them from raw numbers.
-        computed_so_far = {
-            k: v for k, v in ticker_analysis.items()
-            if k not in ("ticker", "citations") and v is not None
+        computed_context = {
+            k: v for k, v in ta.items()
+            if k not in ("ticker", "citations", "sector_peers") and v is not None
         }
-        sop_input = {
-            "raw_data_json": json.dumps({ticker: ticker_data}, indent=2)[:2500],
-            "computed_metrics_json": json.dumps(computed_so_far, indent=2),
-            "iteration_log_json": json.dumps(iteration_log[-10:], indent=2),
-        }
+        human_content = (
+            f"Stock: {ticker}\n"
+            f"Sector: {ta.get('sector', 'Unknown')}\n\n"
+            f"Computed metrics:\n{json.dumps(computed_context, indent=2)[:3000]}\n\n"
+            f"Raw fundamentals (selected):\n"
+            f"{json.dumps({k: fund.get(k) for k in ('market_cap','revenue_ttm','net_income_ttm','beta','dividend_yield','analyst_target_mean')}, indent=2)}"
+        )
 
         sop_text = ""
         try:
-            sop_response = await sop_chain.ainvoke(sop_input)
-            raw_content = sop_response.content if hasattr(sop_response, "content") else sop_response
-            sop_text = content_to_str(raw_content)
-            # Strip markdown code fences if the model wraps the JSON
-            sop_text = sop_text.strip()
+            sop_response = await primary_llm.ainvoke([
+                SystemMessage(content=_SOP_SYSTEM),
+                HumanMessage(content=human_content),
+            ])
+            raw = sop_response.content if hasattr(sop_response, "content") else sop_response
+            sop_text = content_to_str(raw).strip()
+
+            # Strip markdown fences if the model ignores the instruction
             if sop_text.startswith("```"):
                 sop_text = sop_text.split("```", 2)[1]
                 if sop_text.startswith("json"):
                     sop_text = sop_text[4:]
                 sop_text = sop_text.rstrip("`").strip()
-            logger.debug("SOP chain response for %s: %s", ticker, sop_text[:300])
+
             sop_data = json.loads(sop_text)
-            # Support both flat {"bull_case": [...]} and nested {"analysis": {"investment_thesis": {...}}}
-            thesis = (
-                sop_data.get("analysis", {}).get("investment_thesis", sop_data)
-                if "analysis" in sop_data
-                else sop_data
-            )
-            ticker_analysis["bull_case"] = thesis.get("bull_case", [])
-            ticker_analysis["bear_case"] = thesis.get("bear_case", [])
-            ticker_analysis["closest_peer"] = (
-                thesis.get("closest_peer")
-                or sop_data.get("analysis", {}).get("most_likely_peer")
-            )
-        except (json.JSONDecodeError, Exception) as exc:
+            ta["bull_case"]    = sop_data.get("bull_case",    [])
+            ta["bear_case"]    = sop_data.get("bear_case",    [])
+            ta["closest_peer"] = sop_data.get("closest_peer")
+
+        except Exception as exc:
             logger.warning("SOP chain failed for %s: %s", ticker, exc)
-            ticker_analysis["bull_case"] = []
-            ticker_analysis["bear_case"] = []
+            ta["bull_case"] = []
+            ta["bear_case"] = []
             errors.append({"error_type": ErrorType.PARSING_ERROR.value, "detail": str(exc)})
 
         if step_callback:
             step_callback({
                 "step": step, "agent": "quant_analyst", "tool": "sop_llm",
-                "input": {"ticker": ticker}, "cache_hit": False, "ok": bool(ticker_analysis.get("bull_case")),
+                "input": {"ticker": ticker}, "cache_hit": False,
+                "ok": bool(ta.get("bull_case")),
             })
-
         if artifacts:
-            try:
-                formatted = _SOP_PROMPT.format_messages(**sop_input)
-                prompt_msgs = [{"role": m.type, "content": m.content} for m in formatted]
-            except Exception:
-                prompt_msgs = [{"role": "user", "content": str(sop_input)}]
             artifacts.record_llm_exchange(
-                agent="quant_analyst",
-                purpose="sop_analysis",
-                ticker=ticker,
-                prompt_messages=prompt_msgs,
+                agent="quant_analyst", purpose="sop_analysis", ticker=ticker,
+                prompt_messages=[
+                    {"role": "system", "content": _SOP_SYSTEM},
+                    {"role": "user", "content": human_content},
+                ],
                 raw_response=sop_text,
             )
-
         if tracer:
             tracer.record_tool_call(
-                agent="quant_analyst",
-                tool="sop_analysis",
-                input_data={"ticker": ticker},
-                output_data=ticker_analysis,
+                agent="quant_analyst", tool="sop_analysis",
+                input_data={"ticker": ticker}, output_data=ta,
                 output_tokens=step * 5,
             )
 
-        analysis_per_ticker[ticker] = ticker_analysis
+        analysis_per_ticker[ticker] = ta
 
     if tracer:
         tracer.record_agent_complete("quant_analyst", {
             "tickers_analysed": list(analysis_per_ticker.keys()),
-            "errors": len(errors),
+            "errors":           len(errors),
         })
 
     return AgentState(**{
         **state,
-        "analysis": analysis_per_ticker,
+        "analysis":     analysis_per_ticker,
         "iteration_log": iteration_log,
-        "errors": errors,
+        "errors":        errors,
     })
+
+
+# ── Helper ────────────────────────────────────────────────────────────────────
+
+def _record_step(
+    step: int, tool: str, input_data: dict, output: Any,
+    tracer, artifacts, step_callback, iteration_log: list,
+) -> None:
+    output_str = str(output)
+    iteration_log.append(IterationLogEntry(
+        step=step, agent="quant_analyst", tool=tool,
+        input=input_data, output_tokens=len(output_str) // 4, cache_hit=False,
+    ))
+    if tracer:
+        tracer.record_tool_call(
+            agent="quant_analyst", tool=tool,
+            input_data=input_data, output_data=output,
+            output_tokens=len(output_str) // 4,
+        )
+    if artifacts:
+        artifacts.record_tool_response(
+            agent="quant_analyst", tool=tool,
+            input_data=input_data, full_output=output_str, step=step,
+        )
+    if step_callback:
+        step_callback({
+            "step": step, "agent": "quant_analyst", "tool": tool,
+            "input": input_data, "cache_hit": False, "ok": True,
+        })
