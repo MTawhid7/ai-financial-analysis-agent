@@ -230,6 +230,57 @@ class TestChainComposition:
         chain = prompt | llm
         assert isinstance(chain, RunnableSequence)
 
+    def test_with_structured_output_delegates_to_both_models(self):
+        """with_structured_output() must wrap both primary and fallback."""
+        from pydantic import BaseModel
+
+        class _Schema(BaseModel):
+            value: str
+
+        # Mocks that record whether with_structured_output was called
+        primary_structured  = _make_sync_llm(return_value=_Schema(value="primary"))
+        fallback_structured = _make_sync_llm(return_value=_Schema(value="fallback"))
+
+        primary  = MagicMock()
+        fallback = MagicMock()
+        primary.with_structured_output.return_value  = primary_structured
+        fallback.with_structured_output.return_value = fallback_structured
+
+        llm = RateLimitFallbackLLM(primary, fallback)
+        structured_llm = llm.with_structured_output(_Schema)
+
+        # Both underlying models must have been called with the schema
+        primary.with_structured_output.assert_called_once_with(_Schema)
+        fallback.with_structured_output.assert_called_once_with(_Schema)
+
+        # Returned object is still a RateLimitFallbackLLM (preserves fallback logic)
+        assert isinstance(structured_llm, RateLimitFallbackLLM)
+
+    def test_with_structured_output_fallback_path(self):
+        """CircuitBreakerError on structured primary still falls back to structured fallback."""
+        from pydantic import BaseModel
+
+        class _Schema(BaseModel):
+            value: str
+
+        primary_structured  = _make_sync_llm(
+            side_effect=CircuitBreakerError("tripped")
+        )
+        fallback_structured = _make_sync_llm(
+            return_value=_Schema(value="from_fallback")
+        )
+
+        primary  = MagicMock()
+        fallback = MagicMock()
+        primary.with_structured_output.return_value  = primary_structured
+        fallback.with_structured_output.return_value = fallback_structured
+
+        llm = RateLimitFallbackLLM(primary, fallback)
+        structured_llm = llm.with_structured_output(_Schema)
+
+        result = structured_llm.invoke("input")
+        assert result.value == "from_fallback"
+
 
 # ---------------------------------------------------------------------------
 # _CircuitBreaker half-open recovery

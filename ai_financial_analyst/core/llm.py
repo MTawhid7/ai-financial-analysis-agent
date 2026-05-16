@@ -298,6 +298,18 @@ class RateLimitFallbackLLM(Runnable):
         new_fallback = self._fallback.bind_tools(tools, **kwargs)
         return RateLimitFallbackLLM(new_primary, new_fallback, self._budget_tracker)
 
+    def with_structured_output(self, schema, **kwargs):
+        """Return a new RateLimitFallbackLLM where both models enforce a Pydantic schema.
+
+        Each model is wrapped via ChatGoogleGenerativeAI.with_structured_output(),
+        which uses Gemini's native JSON mode to guarantee schema conformance.
+        The returned wrapper's ainvoke() yields a Pydantic model instance directly
+        (not an AIMessage), preserving the same rate-limit fallback semantics.
+        """
+        new_primary = self._primary.with_structured_output(schema, **kwargs)
+        new_fallback = self._fallback.with_structured_output(schema, **kwargs)
+        return RateLimitFallbackLLM(new_primary, new_fallback, self._budget_tracker)
+
     def _on_rate_limit_fallback(self, exc: BaseException) -> None:
         logger.warning(
             "Primary model (Flash) rate-limited — falling back to Flash-Lite. Cause: %s",

@@ -44,11 +44,11 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 |---|---|---|
 | Only price CAGR | ✅ | Total-return CAGR (adjusted for splits+dividends) read from `price_metrics.total_return_cagr_pct`; raw-price fallback via calculator |
 | No risk-adjusted metrics | ✅ | Sharpe, Sortino, max drawdown, beta vs S&P 500, volatility — all read from `price_metrics` |
-| No DCF framework | ❌ | Valuation remains entirely multiple-based; no intrinsic value estimate |
-| Bull/bear are LLM narrative | ⚠️ | Now anchored to actual data (Sharpe, FCF yield, P/E vs sector, analyst sentiment counts, quarterly momentum); still LLM-generated prose, not quantified price targets |
-| LLM response parsing is brittle | ⚠️ | System prompt instructs JSON-only output; markdown fence stripping (`split("```", 2)`) is still present as a fallback; `.with_structured_output()` not used |
-| Hardcoded sector taxonomy | ⚠️ | `_YFINANCE_TO_GICS` covers 11 sectors; incomplete (e.g. REITs); yfinance sector name changes would silently fall through |
-| No scenario analysis | ❌ | Single-point estimate only; no sensitivity analysis on P/E × earnings range |
+| No DCF framework | ✅ | `_compute_dcf()` in quant_analyst.py: 5-year FCF projection, WACC via CAPM, terminal value, per-share intrinsic value, margin of safety. Option A: negative FCF returns `{dcf_not_applicable, reason}` — no meaningless negative value. |
+| Bull/bear are LLM narrative | ✅ | `_compute_scenarios()` computes all price targets deterministically (P/E×EPS, analyst consensus, DCF). LLM only writes 1-sentence qualitative narrative per bullet citing computed numbers — cannot invent price targets. |
+| LLM response parsing is brittle | ✅ | `with_structured_output(_SOPOutput)` added to `RateLimitFallbackLLM`; quant_analyst uses it for the narration step. Gemini JSON mode enforces schema; no markdown fence stripping. |
+| Hardcoded sector taxonomy | ✅ | `_YFINANCE_TO_GICS` dict removed; raw yfinance sector string passed directly to `benchmark_lookup_tool` which resolves via alias dict + `difflib` fuzzy match (implemented in prior session). |
+| No scenario analysis | ✅ | `_compute_scenarios()`: three independent methods — P/E × forward EPS (bear/base/bull at 0.8×/1.0×/1.2× sector P/E), analyst consensus range (low/mean/high), DCF intrinsic value — each with upside_pct vs current price. |
 
 ---
 
@@ -282,7 +282,7 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 
 ---
 
-## What Was Closed (20 of 34 sub-issues from original audit)
+## What Was Closed (25 of 34 sub-issues from original audit)
 
 | Original # | Component | What was fixed |
 |---|---|---|
@@ -306,5 +306,10 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 | 18 | `yahoo_finance.py` | Corporate events — stock splits in `price_history.corporate_events` |
 | 19 | `benchmark_lookup.py` | Fuzzy sector matching — alias dict + `difflib.get_close_matches` fallback |
 | 20 | `benchmark_lookup.py` | Geographic segmentation — `geographic_context` block for non-US companies |
+| 21 | `quant_analyst.py` | DCF valuation — `_compute_dcf()`: 5-yr FCF projection, WACC via CAPM, intrinsic value per share |
+| 22 | `quant_analyst.py` | Scenario analysis — `_compute_scenarios()`: P/E×EPS, analyst consensus, DCF (bear/base/bull) |
+| 23 | `quant_analyst.py` | LLM parsing brittle — `with_structured_output(_SOPOutput)` via Gemini JSON mode |
+| 24 | `quant_analyst.py` | Hardcoded sector taxonomy — `_YFINANCE_TO_GICS` removed; raw sector passed to benchmark_lookup |
+| 25 | `core/llm.py` | `with_structured_output()` added to `RateLimitFallbackLLM` (same pattern as `bind_tools`) |
 
-*14 sub-issues remain across the priority matrix above.*
+*9 sub-issues remain across the priority matrix above.*
