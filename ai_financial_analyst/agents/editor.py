@@ -32,7 +32,20 @@ _SOP_KEYS = {
 }
 
 # Regex to detect numeric claims in the draft report.
-_NUMERIC_PATTERN = re.compile(r"\b\d+(?:\.\d+)?%?\b")
+# Handles: $1,234 (commas), (4,200) (accounting negatives),
+# $4.17T (SI suffixes K/M/B/T), plain integers and decimals with %.
+_NUMERIC_PATTERN = re.compile(
+    r"""
+    (?:
+        \(\s*\$?[\d,]+(?:\.\d+)?\s*[KMBTkmbt]?\s*\)   # (4,200) or ($1.2B) — accounting negative
+        |
+        \$?[\d,]+(?:\.\d+)?[KMBTkmbt]?%?               # $1,234 or 4.17T or 27.2%
+    )
+    """,
+    re.VERBOSE,
+)
+
+_SI_SUFFIX: dict[str, float] = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}
 
 
 async def editor_node(state: AgentState, config: dict | None = None) -> AgentState:
@@ -87,8 +100,9 @@ async def editor_node(state: AgentState, config: dict | None = None) -> AgentSta
     }
 
     # --- Invoke ReportWriterTool ---
+    # No truncation: Gemini Flash has 1M token context; truncating loses later tickers.
     report_input = {
-        "analysis_json": json.dumps(analysis_with_coverage, indent=2)[:9000],
+        "analysis_json": json.dumps(analysis_with_coverage, indent=2),
         "tickers": tickers,
         "data_gaps": researcher_gaps,
     }
@@ -176,30 +190,61 @@ async def editor_node(state: AgentState, config: dict | None = None) -> AgentSta
     })
 
 
+def _clean_numeric(s: str) -> tuple[float | None, bool]:
+    """Parse a financial numeric string to (float_value, is_negative).
+
+    Handles: $1,234 commas, (4,200) accounting negatives, SI suffixes K/M/B/T,
+    dollar signs, percent signs.  Returns (None, False) if unparseable.
+    """
+    orig = s.strip()
+    is_neg = orig.startswith("(") and orig.endswith(")")
+    # Strip outer parens, $, leading/trailing whitespace
+    cleaned = orig.replace(",", "").lstrip("($").rstrip("%)").strip()
+    # Detect SI suffix
+    suffix: float | None = None
+    if cleaned and cleaned[-1].lower() in _SI_SUFFIX:
+        suffix = _SI_SUFFIX[cleaned[-1].lower()]
+        cleaned = cleaned[:-1]
+    # Strip trailing % for conversion
+    cleaned = cleaned.rstrip("%")
+    try:
+        val = float(cleaned)
+        if suffix is not None:
+            val *= suffix
+        if is_neg:
+            val = -val
+        return val, is_neg
+    except (ValueError, AttributeError):
+        return None, False
+
+
 def _parse_grounded_floats(grounded_values: set[str]) -> list[float]:
     """Convert grounded numeric strings to floats for scaled comparison."""
     result = []
     for s in grounded_values:
-        try:
-            result.append(float(s.rstrip("%")))
-        except (ValueError, AttributeError):
-            pass
+        val, _ = _clean_numeric(s)
+        if val is not None:
+            result.append(val)
     return result
 
 
-def _is_grounded_by_scale(val_str: str, grounded_floats: list[float], tol: float = 0.015) -> bool:
-    """Return True if val_str is within tol of any grounded float under SI unit scaling.
+def _is_grounded_by_scale(val_str: str, grounded_floats: list[float]) -> bool:
+    """Return True if val_str is within tolerance of any grounded float under SI scaling.
 
-    Handles: rounding (34.362755 → 34.4), unit conversion (285508000000 → 285.5B),
-    and percentage representation (0.27152 → 27%).
+    Tolerance is tiered:
+    - Percentage values (%) : 2% tolerance (rounding common in analyst copy)
+    - Large absolute values (>1e6): 5% tolerance (T/B rounding)
+    - Everything else: 1.5% tolerance
     """
-    try:
-        val = float(val_str.rstrip("%"))
-    except (ValueError, AttributeError):
+    val, _ = _clean_numeric(val_str)
+    if val is None:
         return True  # unparseable — don't flag
     if val == 0:
         return True
-    # Scales cover: exact, thousands, millions, billions, trillions, pct (×100 or ÷100)
+
+    is_pct = "%" in val_str
+    tol = 0.02 if is_pct else (0.05 if abs(val) > 1e6 else 0.015)
+
     scale_factors = (1, 1e3, 1e6, 1e9, 1e12, 100.0, 0.01)
     for gf in grounded_floats:
         for scale in scale_factors:
@@ -253,8 +298,17 @@ def _grounding_check(
     def _check_match(m: re.Match) -> str:
         nonlocal unverified_count
         val = m.group(0)
-        # Only flag values that look like financial figures: decimal points or >3 digits.
-        is_financial = "." in val or len(val.replace("%", "")) > 3
+        # Only flag values that look like financial figures: have $ or decimal, or >3 digits,
+        # or use SI suffix, or are wrapped in parentheses.
+        stripped = val.replace(",", "").replace("$", "").replace("%", "")
+        stripped = stripped.strip("()").rstrip("KMBTkmbt")
+        is_financial = (
+            "$" in val
+            or "." in val
+            or len(stripped) > 3
+            or val.endswith(tuple("KMBTkmbt"))
+            or (val.startswith("(") and val.endswith(")"))
+        )
         if not is_financial:
             return val
         if val in grounded_values or _is_grounded_by_scale(val, grounded_floats):

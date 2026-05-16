@@ -3,12 +3,14 @@
 Mirrors the same approach used by Claude Code's file editor:
   1. LLM receives the FULL report (no truncation)
   2. LLM outputs exactly two fields: old_string and new_string
-  3. We do a literal str.replace(old_string, new_string, 1) in the document
-  4. If old_string is not found (LLM hallucinated it) → retry once with an error hint
-  5. The persisted report is updated so future refinements and exports use the latest version
+  3. We try _flexible_str_replace (exact first, then line-strip fallback)
+  4. If still not found → retry once with an error hint
+  5. The updated report is persisted as a NEW row (INSERT, not UPDATE) so
+     every edit is versioned; _load_latest_report picks it up via ORDER BY created_at DESC.
 
 This is deterministic, preserves all unchanged sections character-perfect,
 and is faster than whole-document regeneration for small edits.
+Versioning via INSERT allows natural rollback to any prior version.
 """
 
 from __future__ import annotations
@@ -16,6 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+import uuid
 from typing import Any
 
 import aiosqlite
@@ -92,6 +96,38 @@ def _extract_json(text: str) -> str:
     return match.group(0) if match else text
 
 
+def _strip_lines(s: str) -> str:
+    """Strip trailing whitespace from each line (preserves leading whitespace)."""
+    return "\n".join(line.rstrip() for line in s.splitlines())
+
+
+def _flexible_str_replace(full_report: str, old_string: str, new_string: str) -> str | None:
+    """Apply a str_replace with graceful whitespace tolerance.
+
+    Try 1 — exact match: standard `str.replace(old, new, 1)`.
+    Try 2 — line-strip match: if trailing whitespace differs on any line,
+             strip all trailing whitespace from both sides and re-attempt.
+
+    Returns the updated document string, or None if old_string cannot be found.
+    """
+    # Try 1: exact match
+    if old_string in full_report:
+        return full_report.replace(old_string, new_string, 1)
+
+    # Try 2: line-strip normalisation (covers trailing-space differences)
+    stripped_report = _strip_lines(full_report)
+    stripped_old = _strip_lines(old_string)
+    if stripped_old and stripped_old in stripped_report:
+        idx = stripped_report.index(stripped_old)
+        newlines_before = stripped_report[:idx].count("\n")
+        n_lines = stripped_old.count("\n") + 1
+        orig_lines = full_report.splitlines()
+        original_block = "\n".join(orig_lines[newlines_before:newlines_before + n_lines])
+        return full_report.replace(original_block, new_string, 1)
+
+    return None
+
+
 async def refine_analysis(
     message: str,
     conversation_id: str,
@@ -166,10 +202,10 @@ async def _attempt_str_replace(
         logger.error("str_replace: LLM or parse error: %s", exc)
         raise
 
-    if old_string not in full_report:
+    updated = _flexible_str_replace(full_report, old_string, new_string)
+    if updated is None:
         return {"bad_old_string": old_string}
-
-    return full_report.replace(old_string, new_string, 1)
+    return updated
 
 
 async def _retry_str_replace(
@@ -196,10 +232,10 @@ async def _retry_str_replace(
         logger.error("str_replace retry: LLM or parse error: %s", exc)
         return {"bad_old_string": bad_old_string}
 
-    if old_string not in full_report:
+    updated = _flexible_str_replace(full_report, old_string, new_string)
+    if updated is None:
         return {"bad_old_string": old_string}
-
-    return full_report.replace(old_string, new_string, 1)
+    return updated
 
 
 async def _load_latest_report(
@@ -230,13 +266,33 @@ async def _save_updated_report(
     user_id: str,
     db_path: str,
 ) -> None:
-    """Update the most recent report row with the edited markdown."""
+    """Insert the edited report as a new versioned row (INSERT, not UPDATE).
+
+    _load_latest_report uses ORDER BY created_at DESC LIMIT 1, so the new row
+    is automatically picked up on the next load. The original row is preserved,
+    enabling natural rollback to any prior version.
+    """
     async with aiosqlite.connect(db_path) as db:
-        await db.execute(
-            "UPDATE reports SET report_markdown = ?"
-            " WHERE id = (SELECT id FROM reports"
+        # Copy metadata from the current latest row
+        async with db.execute(
+            "SELECT tickers, raw_data_json, analysis_json FROM reports"
             " WHERE conversation_id = ? AND user_id = ?"
-            " ORDER BY created_at DESC LIMIT 1)",
-            (updated_markdown, conversation_id, user_id),
+            " ORDER BY created_at DESC LIMIT 1",
+            (conversation_id, user_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if not row:
+            return
+
+        tickers, raw_data_json, analysis_json = row
+        await db.execute(
+            "INSERT INTO reports (id, conversation_id, user_id, tickers,"
+            " report_markdown, raw_data_json, analysis_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(uuid.uuid4()), conversation_id, user_id, tickers,
+                updated_markdown, raw_data_json, analysis_json, time.time(),
+            ),
         )
         await db.commit()

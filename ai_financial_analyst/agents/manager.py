@@ -485,7 +485,13 @@ def build_tools(
         """
         try:
             from ai_financial_analyst.pageindex import search_documents as pi_search
-            results = await pi_search(query, user_id=agent.user_id or "", top_k=top_k)
+            results = await pi_search(
+                query,
+                user_id=agent.user_id or "",
+                top_k=top_k,
+                use_hyde=True,
+                subllm=agent._subllm,
+            )
         except Exception as exc:
             logger.warning("PageIndex search failed: %s", exc)
             return f"Document search is not available: {exc}"

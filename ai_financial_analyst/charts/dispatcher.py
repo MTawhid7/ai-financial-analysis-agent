@@ -51,7 +51,7 @@ def generate_on_demand_chart(
 
     # ── Price action ──────────────────────────────────────────────────────────
     if ct in ("candlestick", "ohlc", "candle", "ohlcv"):
-        return generate_candlestick_chart(ticker, period, start, end, overlays)
+        return generate_candlestick_chart(ticker, period, start, end, overlays, raw_data=raw_data)
     if ct in ("price", "price_history", "price_chart", "line"):
         return generate_price_chart(ticker, raw_data, period, start, end)
 
@@ -84,7 +84,7 @@ def generate_on_demand_chart(
         return generate_radar_chart(ticker, raw_data, analysis)
 
     # Default: candlestick with the requested period/range
-    return (generate_candlestick_chart(ticker, period, start, end, overlays)
+    return (generate_candlestick_chart(ticker, period, start, end, overlays, raw_data=raw_data)
             or generate_price_chart(ticker, raw_data, period, start, end))
 
 
@@ -96,7 +96,7 @@ def generate_all_charts(final_state: Any) -> list[dict]:
 
     for ticker in raw_data:
         for fn, ct, suffix in [
-            (lambda t: generate_candlestick_chart(t),                      "candlestick", "Price — 1Y Candlestick"),
+            (lambda t: generate_candlestick_chart(t, raw_data=raw_data),   "candlestick", "Price — 1Y Candlestick"),
             (lambda t: generate_pe_chart(t, analysis),                     "pe",          "P/E vs Sector"),
             (lambda t: generate_revenue_trend_chart(t),                    "revenue",     "Revenue vs Net Income"),
             (lambda t: generate_margin_trend_chart(t),                     "margins",     "Margin Trends"),

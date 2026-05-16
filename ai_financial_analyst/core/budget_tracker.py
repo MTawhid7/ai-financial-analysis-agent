@@ -1,13 +1,37 @@
-"""Per-session Gemini API call counter with free-tier budget warnings."""
+"""Per-session Gemini API call counter with free-tier budget and RPM warnings."""
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
 _WARN_THRESHOLD = 0.80  # Warn at 80% of daily budget
+
+# Free-tier RPM limits (requests per minute, 60-second rolling window)
+_PRIMARY_RPM_LIMIT = 15
+_SUB_RPM_LIMIT = 30
+
+
+class _RpmBucket:
+    """Rolling 60-second window for per-minute rate tracking."""
+
+    def __init__(self, limit: int) -> None:
+        self._timestamps: list[float] = []
+        self._limit = limit
+
+    def record(self) -> bool:
+        """Record a call. Returns True if the current RPM exceeds the limit."""
+        now = time.monotonic()
+        self._timestamps = [t for t in self._timestamps if now - t < 60.0]
+        self._timestamps.append(now)
+        return len(self._timestamps) > self._limit
+
+    def current_rpm(self) -> int:
+        now = time.monotonic()
+        return len([t for t in self._timestamps if now - t < 60.0])
 
 
 class RequestBudgetTracker:
@@ -26,6 +50,8 @@ class RequestBudgetTracker:
         self._cache_hits = 0
         self._warned = False
         self._model_degraded = False
+        self._primary_rpm = _RpmBucket(_PRIMARY_RPM_LIMIT)
+        self._sub_rpm = _RpmBucket(_SUB_RPM_LIMIT)
 
     # ------------------------------------------------------------------
     # Mutation
@@ -34,10 +60,22 @@ class RequestBudgetTracker:
     def record_primary_call(self) -> None:
         self._primary_calls += 1
         self._check_budget()
+        if self._primary_rpm.record():
+            logger.warning(
+                "RPM alert: %d primary calls in last 60s (free-tier limit: %d RPM)",
+                self._primary_rpm.current_rpm(),
+                _PRIMARY_RPM_LIMIT,
+            )
 
     def record_sub_call(self) -> None:
         self._sub_calls += 1
         self._check_budget()
+        if self._sub_rpm.record():
+            logger.warning(
+                "RPM alert: %d sub-model calls in last 60s (free-tier limit: %d RPM)",
+                self._sub_rpm.current_rpm(),
+                _SUB_RPM_LIMIT,
+            )
 
     def record_cache_hit(self) -> None:
         self._cache_hits += 1
@@ -74,6 +112,8 @@ class RequestBudgetTracker:
                 self.total_calls / self._daily_budget * 100, 1
             ),
             "model_degraded": self._model_degraded,
+            "primary_rpm_current": self._primary_rpm.current_rpm(),
+            "sub_rpm_current": self._sub_rpm.current_rpm(),
         }
 
     # ------------------------------------------------------------------

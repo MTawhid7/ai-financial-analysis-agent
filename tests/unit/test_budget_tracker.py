@@ -49,3 +49,34 @@ class TestRequestBudgetTracker:
                 tracker.record_primary_call()
         warning_count = caplog.text.count("Budget alert")
         assert warning_count == 1
+
+
+class TestRpmTracking:
+    def test_get_stats_includes_rpm_fields(self):
+        tracker = RequestBudgetTracker(daily_budget=1500)
+        stats = tracker.get_stats()
+        assert "primary_rpm_current" in stats
+        assert "sub_rpm_current" in stats
+        assert stats["primary_rpm_current"] == 0
+        assert stats["sub_rpm_current"] == 0
+
+    def test_rpm_increments_with_calls(self):
+        tracker = RequestBudgetTracker(daily_budget=1500)
+        tracker.record_primary_call()
+        tracker.record_primary_call()
+        assert tracker.get_stats()["primary_rpm_current"] == 2
+
+    def test_sub_rpm_tracked_separately(self):
+        tracker = RequestBudgetTracker(daily_budget=1500)
+        tracker.record_sub_call()
+        stats = tracker.get_stats()
+        assert stats["sub_rpm_current"] == 1
+        assert stats["primary_rpm_current"] == 0
+
+    def test_rpm_warning_fires_when_over_limit(self, caplog):
+        tracker = RequestBudgetTracker(daily_budget=10000)
+        with caplog.at_level(logging.WARNING):
+            # Exceed the 15 RPM primary limit
+            for _ in range(16):
+                tracker.record_primary_call()
+        assert "RPM alert" in caplog.text

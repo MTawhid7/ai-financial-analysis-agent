@@ -68,7 +68,7 @@ flowchart LR
 The Manager uses LangChain `bind_tools` (function-calling) to autonomously decide which tool(s) to call, in what order. Handles compound requests ("Analyse AAPL then compare with MSFT") and adds new capabilities by simply registering a new `@tool` — no routing changes needed.
 
 ### str_replace Surgical Document Editing
-When refining a report, the LLM receives the **full** document and outputs `old_string` + `new_string`. A literal string replacement is applied — unchanged sections are preserved character-perfect. If the LLM hallucinates text not in the document, the handler retries with a corrective prompt.
+When refining a report, the LLM receives the **full** document and outputs `old_string` + `new_string`. A `_flexible_str_replace()` function tries exact match first, then falls back to line-strip normalization (tolerates LLM trailing-space differences). Each successful edit is persisted as a new INSERT row — natural version history, rollback is always available.
 
 ### Hierarchical Document Summarisation
 Large documents (PDF, DOCX, TXT) are split into overlapping 3,000-char chunks, each summarised by Flash-Lite, then combined. No truncation — important context is preserved regardless of document length.
@@ -80,7 +80,16 @@ Large documents (PDF, DOCX, TXT) are split into overlapping 3,000-char chunks, e
 `CalculatorTool` uses `numexpr` with an AST whitelist. File parsers produce fixed-schema JSON summaries only — no raw user data reaches the LLM, no arbitrary code execution.
 
 ### Rate Limit Resilience
-`tenacity` retry + circuit breaker (3×429 in 30s). Automatic fallback from Gemini Flash to Flash-Lite — analysis continues at reduced quality rather than failing.
+`tenacity` retry + half-open circuit breaker (5×429 in 60s, 60s probe delay). Automatic fallback from Gemini Flash to Flash-Lite — analysis continues at reduced quality rather than failing. Once a probe request succeeds, the breaker resets and full quality is restored.
+
+### Conditional Pipeline Routing
+The LangGraph pipeline uses conditional edges after `researcher` and `quant_analyst`. When no usable data is retrieved (all errors, empty raw_data, or rate-limited), the pipeline routes to an `early_exit` node instead of burning API quota on downstream agents.
+
+### HyDE Query Expansion (PageIndex)
+When searching uploaded documents, the retriever uses Hypothetical Document Embedding: Flash-Lite generates a synthetic passage that would answer the query, that passage is embedded (not the raw question), and the embedding is used for vector search. Questions and passages inhabit different embedding spaces — this improves retrieval for short or ambiguous queries.
+
+### Semantic Memory Retrieval
+Analysis summaries are embedded with Gemini `text-embedding-004` at save time and stored as JSON vectors in SQLite. At query time, cosine similarity ranks past analyses by semantic relevance — "profit margins" correctly matches "earnings quality" across sessions.
 
 ---
 
@@ -130,6 +139,7 @@ cd frontend && npm run dev
 
 ```bash
 pytest tests/unit/ tests/integration/ tests/adversarial/ -v
+# 224 tests passing as of Phase 2
 cd frontend && npm run build      # zero TypeScript errors required
 ```
 

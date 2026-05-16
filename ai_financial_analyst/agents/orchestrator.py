@@ -1,6 +1,12 @@
 """LangGraph orchestrator — wires the three-agent pipeline with checkpointing.
 
-Pipeline: START → researcher → quant_analyst → editor → END
+Pipeline: START → researcher → [conditional] → quant_analyst → [conditional] → editor → END
+                                     ↘ early_exit ↗                   ↘ early_exit ↗
+
+Conditional routing skips downstream nodes when:
+- researcher retrieved no usable data (all errors / empty raw_data)
+- status is RATE_LIMITED or FAILED (preserve quota)
+- quant_analyst produced no analysis dict
 
 Each node is wrapped to catch PartialStateError and CircuitBreakerError,
 producing a graceful partial output rather than a hard crash.
@@ -54,8 +60,30 @@ def _clear_old_artifacts(output_dir: str) -> None:
                 logger.warning("Could not remove %s: %s", f, exc)
 
 
+def _route_after_researcher(state: AgentState) -> str:
+    """Route to quant_analyst or early_exit after the researcher runs."""
+    raw_data = state.get("raw_data", {})
+    status = state.get("status", "COMPLETE")
+    if not raw_data or status in ("RATE_LIMITED", "FAILED"):
+        return "early_exit"
+    # Check whether any ticker has at least one non-error key
+    any_has_data = any(
+        any(k not in ("error_type", "message", "reason") for k in td)
+        for td in raw_data.values()
+    )
+    return "early_exit" if not any_has_data else "quant_analyst"
+
+
+def _route_after_quant(state: AgentState) -> str:
+    """Route to editor or early_exit after the quant analyst runs."""
+    status = state.get("status", "COMPLETE")
+    if not state.get("analysis") or status in ("RATE_LIMITED", "FAILED"):
+        return "early_exit"
+    return "editor"
+
+
 def _build_graph(node_config: dict) -> StateGraph:
-    """Build the StateGraph with nodes and edges (not yet compiled).
+    """Build the StateGraph with nodes and conditional routing (not yet compiled).
 
     Compilation is deferred to run_pipeline() so the async checkpointer
     context manager can wrap the full ainvoke() call.
@@ -71,14 +99,31 @@ def _build_graph(node_config: dict) -> StateGraph:
     async def _editor(state: AgentState) -> AgentState:
         return await _safe_node("editor", editor_node, state, node_config, tracer)
 
+    async def _early_exit(state: AgentState) -> AgentState:
+        """Ensure a partial report is generated before ending early."""
+        if not state.get("report_markdown"):
+            return AgentState(**{**state, "report_markdown": _partial_report(state, "early_exit")})
+        return state
+
     graph = StateGraph(AgentState)
     graph.add_node("researcher", _researcher)
     graph.add_node("quant_analyst", _quant_analyst)
     graph.add_node("editor", _editor)
+    graph.add_node("early_exit", _early_exit)
+
     graph.add_edge(START, "researcher")
-    graph.add_edge("researcher", "quant_analyst")
-    graph.add_edge("quant_analyst", "editor")
+    graph.add_conditional_edges(
+        "researcher",
+        _route_after_researcher,
+        {"quant_analyst": "quant_analyst", "early_exit": "early_exit"},
+    )
+    graph.add_conditional_edges(
+        "quant_analyst",
+        _route_after_quant,
+        {"editor": "editor", "early_exit": "early_exit"},
+    )
     graph.add_edge("editor", END)
+    graph.add_edge("early_exit", END)
     return graph
 
 
@@ -185,7 +230,7 @@ async def run_pipeline(
     subllm = get_subllm(budget_tracker=budget)
 
     web_search_module.configure(subllm=subllm)
-    report_writer_module.configure(primary_llm=primary_llm)
+    report_writer_module.configure(primary_llm=primary_llm, subllm=subllm)
 
     tracer = RunTracer()
     run_id = str(uuid.uuid4())

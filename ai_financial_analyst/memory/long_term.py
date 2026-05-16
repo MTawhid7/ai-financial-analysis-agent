@@ -8,20 +8,38 @@ Four tables:
 
 All preference/summary/conversation queries are scoped by user_id.
 Defaults to "default" for backward compatibility with Streamlit and tests.
+
+Semantic search (optional):
+  When an embedder is provided to save_analysis_summary(), a 768-dim vector
+  is stored in embedding_json. search_summaries() uses cosine similarity when
+  an embedder is provided; falls back to LIKE matching otherwise.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_DB_PATH = ".memory/memory.db"
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two vectors. Returns 0.0 for zero vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    mag_a = math.sqrt(sum(x * x for x in a))
+    mag_b = math.sqrt(sum(x * x for x in b))
+    if mag_a == 0 or mag_b == 0:
+        return 0.0
+    return dot / (mag_a * mag_b)
 
 
 class LongTermMemory:
@@ -98,6 +116,13 @@ class LongTermMemory:
                     )
                 except Exception:
                     pass
+            # Semantic search column for analysis summaries — nullable, added lazily.
+            try:
+                await db.execute(
+                    "ALTER TABLE analysis_summaries ADD COLUMN embedding_json TEXT"
+                )
+            except Exception:
+                pass
             await db.commit()
 
     # ------------------------------------------------------------------
@@ -135,21 +160,43 @@ class LongTermMemory:
         tickers: list[str],
         summary_text: str,
         run_id: str = "",
+        embedder: Any = None,
     ) -> None:
         await self._ensure_init()
+        embedding_json: str | None = None
+        if embedder is not None:
+            try:
+                from ..pageindex.embedder import embed_texts
+                vecs = await embed_texts([summary_text])
+                if vecs and any(v != 0 for v in vecs[0]):
+                    embedding_json = json.dumps(vecs[0])
+            except Exception as exc:
+                logger.debug("Could not embed summary for semantic indexing: %s", exc)
+
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
                 "INSERT INTO analysis_summaries"
-                " (session_id, tickers, summary_text, run_id, created_at, user_id)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                " (session_id, tickers, summary_text, run_id, created_at, user_id, embedding_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (session_id, ", ".join(tickers), summary_text.strip(), run_id,
-                 time.time(), self._user_id),
+                 time.time(), self._user_id, embedding_json),
             )
             await db.commit()
 
-    async def search_summaries(self, query: str, limit: int = 3) -> list[dict]:
-        """Return summaries whose tickers or summary_text contain the query."""
+    async def search_summaries(
+        self, query: str, limit: int = 3, embedder: Any = None
+    ) -> list[dict]:
+        """Return summaries relevant to query.
+
+        If an embedder is provided, performs semantic cosine-similarity search
+        against stored embeddings (falling back to LIKE for un-embedded rows).
+        Otherwise uses keyword LIKE matching.
+        """
         await self._ensure_init()
+
+        if embedder is not None:
+            return await self._semantic_search_summaries(query, limit, embedder)
+
         like = f"%{query.strip()}%"
         async with aiosqlite.connect(self._db_path) as db:
             async with db.execute(
@@ -160,6 +207,59 @@ class LongTermMemory:
             ) as cursor:
                 rows = await cursor.fetchall()
         return [{"tickers": r[0], "summary": r[1], "created_at": r[2]} for r in rows]
+
+    async def _semantic_search_summaries(
+        self, query: str, limit: int, embedder: Any
+    ) -> list[dict]:
+        """Semantic cosine-similarity search over stored summary embeddings."""
+        try:
+            from ..pageindex.embedder import embed_query
+            q_vec = await embed_query(query)
+        except Exception as exc:
+            logger.warning("Semantic search failed — falling back to LIKE: %s", exc)
+            return await self.search_summaries(query, limit, embedder=None)
+
+        # Fetch all summaries for this user
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute(
+                "SELECT tickers, summary_text, created_at, embedding_json"
+                " FROM analysis_summaries WHERE user_id = ? ORDER BY created_at DESC",
+                (self._user_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        scored: list[tuple[float, dict]] = []
+        keyword_fallback: list[dict] = []
+
+        q_lower = query.lower()
+        for tickers, summary_text, created_at, emb_json in rows:
+            row_dict = {"tickers": tickers, "summary": summary_text, "created_at": created_at}
+            if emb_json:
+                try:
+                    d_vec = json.loads(emb_json)
+                    score = _cosine(q_vec, d_vec)
+                    scored.append((score, row_dict))
+                except Exception:
+                    keyword_fallback.append(row_dict)
+            else:
+                # Un-embedded row: include if keyword matches
+                if q_lower in tickers.lower() or q_lower in summary_text.lower():
+                    keyword_fallback.append(row_dict)
+
+        # Rank by cosine similarity descending
+        scored.sort(key=lambda x: x[0], reverse=True)
+        results = [row for _, row in scored[:limit]]
+
+        # Append keyword-only results (deduped by summary text) up to limit
+        seen = {r["summary"] for r in results}
+        for row in keyword_fallback:
+            if len(results) >= limit:
+                break
+            if row["summary"] not in seen:
+                results.append(row)
+                seen.add(row["summary"])
+
+        return results[:limit]
 
     async def get_recent_summaries(self, limit: int = 5) -> list[dict]:
         await self._ensure_init()

@@ -1,14 +1,24 @@
 """Two-layer prompt injection filter for WebSearchTool output.
 
-Layer 1 — Regex pre-filter: strips known imperative injection patterns.
+Layer 1 — Regex pre-filter: strips known imperative injection patterns
+           (with Unicode NFKC normalization to catch homoglyph attacks).
 Layer 2 — Flash-Lite extraction chain: converts free-form text into
            structured fields only; the agent never sees raw scraped text.
+
+Security notes:
+- CANARY_TOKEN is generated fresh per process (not hardcoded in source).
+- _regex_filter runs against NFKC-normalized text to catch homoglyph
+  substitutions (Cyrillic 'о' → Latin 'o' after normalization).
+- When no LLM is configured, the fallback stub returns an empty key_facts
+  list — raw content is never passed through to the agent.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import secrets
+import unicodedata
 from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -16,9 +26,22 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-# Canary token embedded in every system prompt.
-# If this appears in agent output, the session is flagged.
-CANARY_TOKEN = "CANARY_XQ7Z_SENTINEL"
+
+def _generate_canary() -> str:
+    """Generate a random canary token unique to this process instance."""
+    return "CANARY_" + secrets.token_urlsafe(12).upper().replace("-", "_")
+
+
+# Module-level canary: different per process restart, not in source code.
+_canary: str = _generate_canary()
+# Backward-compatibility alias (tests that import CANARY_TOKEN still work
+# because they import the same module-level value used by check_canary).
+CANARY_TOKEN: str = _canary
+
+
+def get_canary_token() -> str:
+    """Return the current session canary token."""
+    return _canary
 
 # Regex patterns that indicate likely prompt injection attempts.
 # Broad patterns intentionally — false positives (rejecting a legitimate article)
@@ -78,20 +101,22 @@ class ContentSanitizer:
         if cleaned is None:
             return None
         if self._subllm is None:
-            # Fallback when no LLM available (e.g., tests): return minimal stub.
+            # No LLM configured — return a quarantined stub with no raw content.
+            # Never pass raw text through to the agent, even truncated.
             return ExtractedArticle(
-                headline="(extraction unavailable)",
+                headline="(extraction unavailable — content quarantined)",
                 date="unknown",
-                key_facts=[cleaned[:200]],
+                key_facts=[],
                 sentiment=0.0,
             )
         return self._extract_structured(cleaned)
 
     def check_canary(self, agent_output: str) -> None:
         """Raise SanitizationAlert if the canary token appears in output."""
-        if CANARY_TOKEN in agent_output:
+        token = get_canary_token()
+        if token in agent_output:
             raise SanitizationAlert(
-                f"Canary token '{CANARY_TOKEN}' detected in agent output — "
+                f"Canary token detected in agent output — "
                 "potential prompt injection compromise."
             )
 
@@ -100,8 +125,11 @@ class ContentSanitizer:
     # ------------------------------------------------------------------
 
     def _regex_filter(self, text: str) -> str | None:
+        # NFKC normalization converts homoglyphs (Cyrillic 'о' → Latin 'o', etc.)
+        # so that Unicode substitution attacks don't bypass pattern matching.
+        text_normalized = unicodedata.normalize("NFKC", text)
         for pattern in _INJECTION_PATTERNS:
-            if pattern.search(text):
+            if pattern.search(text_normalized):
                 logger.warning(
                     "Injection pattern detected, content rejected: %s", pattern.pattern
                 )

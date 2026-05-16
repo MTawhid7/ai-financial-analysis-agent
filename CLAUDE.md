@@ -158,7 +158,7 @@ All agent nodes return `AgentState(**{**state, "key": value})` — never `AgentS
 The Manager uses LangChain `bind_tools` (function-calling) rather than a hardcoded intent classifier. Adding new capabilities requires only registering a new `@tool` function — no classifier changes. The tool-use loop has a hard cap of 5 rounds to prevent infinite loops.
 
 ### str_replace Document Editing
-`refinement_handler.py` sends the full report to Flash primary and asks for `old_string` + `new_string`. A literal `str.replace(old, new, 1)` is applied. If `old_string` is not found (LLM hallucinated it), the handler retries once with a corrective prompt. This preserves all unchanged sections character-perfect.
+`refinement_handler.py` sends the full report to Flash primary and asks for `old_string` + `new_string`. `_flexible_str_replace()` tries exact match first, then line-strip normalization (strips trailing whitespace from each line before matching — handles the most common LLM failure mode). Each successful edit is persisted as a new INSERT row — version history is natural; rollback is always available via `ORDER BY created_at DESC`. The original report row is never overwritten.
 
 ### user_id Scoping
 All `LongTermMemory` queries include `WHERE user_id = ?`. The FastAPI DB migration adds `user_id TEXT DEFAULT 'default'` to all tables. Existing tests use `user_id="default"` implicitly.
@@ -169,11 +169,34 @@ Large documents (PDF, DOCX, TXT) are split into overlapping 3,000-char chunks, e
 ### PageIndex — Two-Tier Document Access Model
 Documents are either `scope='user'` (private, `user_id` required) or `scope='system'` (visible to all authenticated users, `user_id=NULL`). DB-level `CHECK` constraints enforce this. Every retrieval query always returns both tiers via `WHERE (user_id=$uid AND scope='user') OR scope='system'`. User documents are deleted on account deletion (ON DELETE CASCADE). System documents are managed exclusively through `POST /admin/documents/upload` protected by the `ADMIN_USER_IDS` env var.
 
-### PageIndex — Embedding + Hybrid Search
+### PageIndex — Embedding + Hybrid Search + HyDE
 `text-embedding-004` (768-dim) is used for both document and query embeddings (different `task_type` for each). The retriever runs two parallel queries — pgvector IVFFlat ANN and Postgres `tsvector` FTS — then merges results with Reciprocal Rank Fusion (k=60). On SQLite (dev), falls back to LIKE-based FTS since pgvector is unavailable. Embeddings are cached in `ResultCache` via SHA256 key to avoid re-embedding identical text.
+
+**HyDE (Hypothetical Document Embedding)**: When `use_hyde=True` is passed, Flash-Lite generates a synthetic passage that would answer the query, and that passage is embedded for vector search instead of the raw question text. FTS still uses the original query keywords. HyDE improves retrieval precision for short/ambiguous queries because document passages and answer passages are in closer embedding space than questions. Cost: 1 extra Flash-Lite call per document search.
 
 ### Required env vars for PageIndex
 `ADMIN_USER_IDS` — comma-separated list of user IDs or emails that can call `/admin/*` endpoints. Leave empty to disable admin access. `UPLOAD_DIR` — directory for raw file storage (default `.uploads`).
+
+### Circuit Breaker — Half-Open Recovery
+`_CircuitBreaker` has three states: CLOSED (normal), OPEN (blocking), HALF-OPEN (one probe in flight). After 5×429 in 60s, the breaker trips and sets `_half_open_at = now + 60s`. After the delay, `is_open()` allows exactly one probe through (`_probe_in_flight=True`). Probe success → `probe_succeeded()` resets the breaker to CLOSED. Probe failure → `probe_failed()` extends `_half_open_at` by another 60s. `RateLimitFallbackLLM.ainvoke()` wraps the primary call with `asyncio.wait_for(timeout=120s)` to prevent hung streams from blocking forever.
+
+### RPM Tracking
+`_RpmBucket` in `budget_tracker.py` maintains a rolling 60-second timestamp list per model tier (15 RPM primary, 30 RPM sub). `record_primary_call()` / `record_sub_call()` log a WARNING when the current window exceeds the limit. `get_stats()` exposes `primary_rpm_current` and `sub_rpm_current`.
+
+### Memory — Semantic Summary Search
+`LongTermMemory.save_analysis_summary()` accepts an optional `embedder` parameter. When provided, it embeds the summary text with `embed_texts()` and stores the 768-dim vector as `embedding_json TEXT` in SQLite. `search_summaries(query, embedder=...)` embeds the query, loads all stored vectors, computes cosine similarity in Python (trivially fast for < 50 summaries), and returns results ranked by semantic similarity. Falls back to `LIKE` matching for un-embedded rows and when no embedder is provided.
+
+### Orchestrator — Conditional Routing
+`_route_after_researcher()` and `_route_after_quant()` are pure functions that inspect `AgentState` and return `"quant_analyst"` / `"editor"` or `"early_exit"`. The `early_exit` node generates a partial report if none exists. Conditional edges are registered with `add_conditional_edges()` — the happy path (data retrieved, analysis computed) flows researcher → quant → editor → END unchanged.
+
+### Report Writer — Two-Call Generation
+`report_writer_tool` makes two LLM calls: Call 1 uses Flash-Lite (cheap) for sections 1–3 (Executive Summary, Data Coverage, Financial Overview); Call 2 uses primary Flash for sections 4–7 (Quantitative Analysis, Bull/Bear Case, Conclusion). Both receive the full analysis JSON (no truncation). A `_validate_sections()` post-pass appends stub placeholders for any missing mandatory section headings.
+
+### Grounding Check — Financial Number Parser
+`_NUMERIC_PATTERN` in `editor.py` now matches `$1,234` (commas), `(4,200)` (accounting negatives), `$4.17T` (SI suffixes), and standard decimals/percentages. `_clean_numeric()` strips all formatting before float conversion. Tolerance is tiered: 2% for percentages, 5% for values > 1e6, 1.5% otherwise.
+
+### Sanitizer — Security Hardening
+The canary token is generated per process via `secrets.token_urlsafe(16).upper()` (not hardcoded in source). `_regex_filter()` runs Unicode NFKC normalization before pattern matching to catch fullwidth/homoglyph substitutions. When `subllm=None`, the fallback stub returns an empty `key_facts` list — raw content is never passed to the agent.
 
 ### Yahoo Finance Data Layer — 7 Data Types
 The `yahoo_finance` tool exposes seven data types, each cached at the appropriate TTL:

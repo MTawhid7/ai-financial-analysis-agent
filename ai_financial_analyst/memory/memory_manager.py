@@ -64,9 +64,15 @@ JSON:"""
 class MemoryManager:
     """Coordinates short-term context and long-term SQLite memory for the agent."""
 
-    def __init__(self, long_term: LongTermMemory, subllm: Any = None) -> None:
+    def __init__(
+        self,
+        long_term: LongTermMemory,
+        subllm: Any = None,
+        embedder: Any = None,
+    ) -> None:
         self._lt = long_term
         self._subllm = subllm
+        self._embedder = embedder
 
     # ------------------------------------------------------------------
     # Context building — called on every turn
@@ -92,7 +98,9 @@ class MemoryManager:
 
         try:
             if query.strip():
-                summaries = await self._lt.search_summaries(query.strip(), limit=2)
+                summaries = await self._lt.search_summaries(
+                    query.strip(), limit=2, embedder=self._embedder
+                )
                 if summaries:
                     lines = "\n".join(
                         f"  - [{s['tickers']}]: {s['summary'][:200]}"
@@ -177,6 +185,7 @@ class MemoryManager:
                     tickers=tickers,
                     summary_text=summary,
                     run_id=run_id,
+                    embedder=self._embedder,
                 )
                 logger.info("Saved analysis summary for tickers: %s", tickers)
 

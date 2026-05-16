@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -19,9 +20,16 @@ logger = logging.getLogger(__name__)
 _PRIMARY_MODEL = "gemini-3-flash-preview"
 _SUB_MODEL = "gemini-3.1-flash-lite-preview"
 
-# Circuit breaker settings
-_CB_MAX_CONSECUTIVE_429 = 3
-_CB_WINDOW_SECONDS = 30
+# Circuit breaker settings — wider window and higher threshold to tolerate
+# short transient bursts without permanently degrading the session.
+_CB_MAX_CONSECUTIVE_429 = 5
+_CB_WINDOW_SECONDS = 60
+
+# Half-open probe: wait this long before allowing one test request through.
+_CB_HALF_OPEN_DELAY = 60.0
+
+# Per-call timeout (seconds) for primary async invocations.
+_PRIMARY_CALL_TIMEOUT = 120.0
 
 
 class RateLimitError(RuntimeError):
@@ -34,24 +42,78 @@ class CircuitBreakerError(RuntimeError):
 
 @dataclass
 class _CircuitBreaker:
-    """Tracks consecutive 429s within a rolling time window."""
+    """Tracks 429s within a rolling time window with half-open recovery.
+
+    States:
+    - CLOSED  : normal operation (_half_open_at is None, failures < max)
+    - OPEN    : blocking calls (_half_open_at is set, probe not yet due)
+    - HALF-OPEN: one probe in flight (_probe_in_flight=True)
+    """
 
     max_failures: int = _CB_MAX_CONSECUTIVE_429
     window_seconds: float = _CB_WINDOW_SECONDS
     _failures: list[float] = field(default_factory=list)
+    _half_open_at: float | None = field(default=None)
+    _probe_in_flight: bool = field(default=False)
+
+    def _active_failures(self) -> list[float]:
+        now = time.monotonic()
+        return [t for t in self._failures if now - t < self.window_seconds]
+
+    def is_open(self) -> bool:
+        """Return True if the breaker should block the call.
+
+        Returns False (allow) in two cases:
+        1. Normal closed state — failures below threshold.
+        2. Half-open probe window — allows exactly one probe through.
+        """
+        active = self._active_failures()
+        self._failures = active
+
+        if len(active) < self.max_failures:
+            # Closed — healthy
+            return False
+
+        # Breaker tripped — check if probe is due
+        now = time.monotonic()
+        if self._half_open_at is not None and now >= self._half_open_at and not self._probe_in_flight:
+            # Enter half-open: let exactly one probe through
+            self._probe_in_flight = True
+            logger.info("Circuit breaker half-open: sending probe to primary model")
+            return False
+
+        return True  # Still open
 
     def record_failure(self) -> None:
         now = time.monotonic()
         self._failures = [t for t in self._failures if now - t < self.window_seconds]
         self._failures.append(now)
         if len(self._failures) >= self.max_failures:
+            if self._half_open_at is None:
+                self._half_open_at = time.monotonic() + _CB_HALF_OPEN_DELAY
             raise CircuitBreakerError(
-                f"Circuit breaker open: {self.max_failures} consecutive 429 errors "
-                f"within {self.window_seconds}s. Halting to preserve API quota."
+                f"Circuit breaker open: {self.max_failures} rate-limit errors "
+                f"within {self.window_seconds}s. Probe allowed in {_CB_HALF_OPEN_DELAY:.0f}s."
             )
+
+    def probe_succeeded(self) -> None:
+        """Call when the half-open probe request succeeded — close the breaker."""
+        self.reset()
+        logger.info("Circuit breaker closed: primary model probe succeeded")
+
+    def probe_failed(self) -> None:
+        """Call when the half-open probe request failed — extend the open period."""
+        self._probe_in_flight = False
+        self._half_open_at = time.monotonic() + _CB_HALF_OPEN_DELAY
+        logger.warning(
+            "Circuit breaker probe failed — staying open for another %.0fs",
+            _CB_HALF_OPEN_DELAY,
+        )
 
     def reset(self) -> None:
         self._failures.clear()
+        self._half_open_at = None
+        self._probe_in_flight = False
 
 
 _primary_cb = _CircuitBreaker()
@@ -181,16 +243,43 @@ class RateLimitFallbackLLM(Runnable):
     # ------------------------------------------------------------------
 
     def invoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        if _primary_cb.is_open():
+            logger.debug("Circuit breaker open — routing directly to fallback (sync)")
+            return self._fallback.invoke(input, config=config, **kwargs)
+        is_probe = _primary_cb._probe_in_flight
         try:
-            return self._primary.invoke(input, config=config, **kwargs)
+            result = self._primary.invoke(input, config=config, **kwargs)
+            if is_probe:
+                _primary_cb.probe_succeeded()
+            return result
         except (CircuitBreakerError, tenacity.RetryError) as exc:
+            if is_probe:
+                _primary_cb.probe_failed()
             self._on_rate_limit_fallback(exc)
             return self._fallback.invoke(input, config=config, **kwargs)
 
     async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        if _primary_cb.is_open():
+            logger.debug("Circuit breaker open — routing directly to fallback (async)")
+            return await self._fallback.ainvoke(input, config=config, **kwargs)
+        is_probe = _primary_cb._probe_in_flight
         try:
-            return await self._primary.ainvoke(input, config=config, **kwargs)
+            coro = self._primary.ainvoke(input, config=config, **kwargs)
+            result = await asyncio.wait_for(coro, timeout=_PRIMARY_CALL_TIMEOUT)
+            if is_probe:
+                _primary_cb.probe_succeeded()
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Primary model call timed out after %.0fs — falling back to Flash-Lite",
+                _PRIMARY_CALL_TIMEOUT,
+            )
+            if is_probe:
+                _primary_cb.probe_failed()
+            return await self._fallback.ainvoke(input, config=config, **kwargs)
         except (CircuitBreakerError, tenacity.RetryError) as exc:
+            if is_probe:
+                _primary_cb.probe_failed()
             self._on_rate_limit_fallback(exc)
             return await self._fallback.ainvoke(input, config=config, **kwargs)
 

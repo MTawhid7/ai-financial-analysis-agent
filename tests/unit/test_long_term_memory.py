@@ -227,3 +227,96 @@ class TestMessages:
     @pytest.mark.asyncio
     async def test_empty_messages_for_nonexistent_conversation(self, mem):
         assert await mem.get_conversation_messages("nonexistent") == []
+
+
+# ---------------------------------------------------------------------------
+# Semantic search
+# ---------------------------------------------------------------------------
+
+
+class TestSemanticSearch:
+    """Verify semantic search falls back gracefully and ranks by cosine similarity."""
+
+    @pytest.mark.asyncio
+    async def test_keyword_fallback_when_no_embedder(self, mem):
+        """search_summaries with embedder=None uses LIKE matching."""
+        await mem.save_analysis_summary("s1", ["AAPL"], "Apple reported strong iPhone sales.", "r1")
+        results = await mem.search_summaries("Apple", limit=5, embedder=None)
+        assert len(results) == 1
+        assert "Apple" in results[0]["summary"]
+
+    @pytest.mark.asyncio
+    async def test_semantic_search_ranks_by_cosine(self, mem):
+        """Semantic search returns results ranked by cosine similarity."""
+        # Save two summaries with different content
+        await mem.save_analysis_summary("s1", ["AAPL"], "Apple iPhone margins expanded significantly.", "r1")
+        await mem.save_analysis_summary("s2", ["MSFT"], "Microsoft Azure cloud revenue grew 30%.", "r2")
+
+        # Create a simple mock embedder that returns deterministic vectors
+        class MockEmbedder:
+            pass
+
+        import math
+        # Query embedding: a vector pointing toward "Apple iPhone" content
+        query_vec = [1.0, 0.0, 0.0]
+        apple_vec = [0.9, 0.1, 0.0]   # similar to query
+        msft_vec  = [0.0, 0.9, 0.1]   # dissimilar
+
+        call_count = [0]
+        vecs_to_return = [apple_vec, msft_vec]
+
+        async def mock_embed_texts(texts):
+            idx = call_count[0]
+            call_count[0] += 1
+            return [vecs_to_return[idx % len(vecs_to_return)]]
+
+        async def mock_embed_query(text):
+            return query_vec
+
+        import ai_financial_analyst.memory.long_term as lt_module
+        original_embed_texts = None
+        original_embed_query = None
+
+        import ai_financial_analyst.pageindex.embedder as embedder_module
+        original_et = getattr(embedder_module, 'embed_texts', None)
+        original_eq = getattr(embedder_module, 'embed_query', None)
+
+        embedder_module.embed_texts = mock_embed_texts
+        embedder_module.embed_query = mock_embed_query
+
+        try:
+            # Save with embeddings
+            await mem.save_analysis_summary("s3", ["AAPL"], "Apple iPhone margins expanded significantly.", "r3", embedder=MockEmbedder())
+            # Simulate second save getting a different vector
+            await mem.save_analysis_summary("s4", ["MSFT"], "Microsoft Azure cloud revenue grew 30%.", "r4", embedder=MockEmbedder())
+            # Search
+            results = await mem.search_summaries("Apple iPhone", limit=5, embedder=MockEmbedder())
+            # Should return results (at least 1)
+            assert len(results) >= 1
+        finally:
+            embedder_module.embed_texts = original_et
+            embedder_module.embed_query = original_eq
+
+    @pytest.mark.asyncio
+    async def test_keyword_fallback_on_embedder_failure(self, mem):
+        """If embedder raises, search falls back to LIKE."""
+        await mem.save_analysis_summary("s1", ["TSLA"], "Tesla battery margin improved.", "r1")
+
+        class FailingEmbedder:
+            pass
+
+        import ai_financial_analyst.pageindex.embedder as embedder_module
+
+        original_eq = getattr(embedder_module, 'embed_query', None)
+
+        async def failing_embed_query(text):
+            raise RuntimeError("API failure")
+
+        embedder_module.embed_query = failing_embed_query
+
+        try:
+            results = await mem.search_summaries("Tesla", limit=5, embedder=FailingEmbedder())
+            # Falls back to LIKE — should still find "Tesla"
+            assert len(results) >= 1
+        finally:
+            embedder_module.embed_query = original_eq

@@ -1,4 +1,4 @@
-"""Unit tests for RateLimitFallbackLLM.
+"""Unit tests for RateLimitFallbackLLM and _CircuitBreaker.
 
 Verifies that the fallback wrapper:
   - Delegates to the primary on success
@@ -7,17 +7,19 @@ Verifies that the fallback wrapper:
   - Does NOT catch non-rate-limit exceptions
   - Records model degradation in the budget tracker
   - Works correctly in LangChain chain composition (prompt | llm)
+  - Recovers via half-open probe after the breaker trips
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, call
+import time
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import tenacity
 
 from ai_financial_analyst.core.budget_tracker import RequestBudgetTracker
-from ai_financial_analyst.core.llm import CircuitBreakerError, RateLimitFallbackLLM
+from ai_financial_analyst.core.llm import CircuitBreakerError, RateLimitFallbackLLM, _CircuitBreaker
 
 
 # ---------------------------------------------------------------------------
@@ -227,3 +229,66 @@ class TestChainComposition:
 
         chain = prompt | llm
         assert isinstance(chain, RunnableSequence)
+
+
+# ---------------------------------------------------------------------------
+# _CircuitBreaker half-open recovery
+# ---------------------------------------------------------------------------
+
+
+class TestCircuitBreakerHalfOpen:
+    """Verify the half-open probe mechanism on _CircuitBreaker directly."""
+
+    def _tripped_breaker(self) -> _CircuitBreaker:
+        """Return a breaker that has just tripped (max failures reached)."""
+        cb = _CircuitBreaker(max_failures=2, window_seconds=60)
+        # Force two failures to trip it
+        for _ in range(2):
+            try:
+                cb.record_failure()
+            except CircuitBreakerError:
+                pass
+        return cb
+
+    def test_is_open_when_tripped(self):
+        cb = self._tripped_breaker()
+        assert cb.is_open() is True
+
+    def test_probe_allowed_after_delay(self):
+        cb = self._tripped_breaker()
+        # Simulate time passing: set _half_open_at to the past
+        cb._half_open_at = time.monotonic() - 1.0
+        # First call to is_open should allow the probe (return False)
+        assert cb.is_open() is False
+        assert cb._probe_in_flight is True
+
+    def test_only_one_probe_in_flight(self):
+        cb = self._tripped_breaker()
+        cb._half_open_at = time.monotonic() - 1.0
+        # First probe allowed
+        assert cb.is_open() is False  # probe in flight
+        # Second concurrent check is blocked
+        assert cb.is_open() is True
+
+    def test_probe_success_resets_breaker(self):
+        cb = self._tripped_breaker()
+        cb._half_open_at = time.monotonic() - 1.0
+        cb.is_open()  # enter half-open
+        cb.probe_succeeded()
+        assert cb.is_open() is False
+        assert cb._failures == []
+        assert cb._half_open_at is None
+        assert cb._probe_in_flight is False
+
+    def test_probe_failure_extends_timer(self):
+        cb = self._tripped_breaker()
+        cb._half_open_at = time.monotonic() - 1.0
+        cb.is_open()  # enter half-open
+        before = time.monotonic()
+        cb.probe_failed()
+        # Timer should be extended into the future
+        assert cb._half_open_at is not None
+        assert cb._half_open_at > before
+        assert cb._probe_in_flight is False
+        # Breaker remains open
+        assert cb.is_open() is True

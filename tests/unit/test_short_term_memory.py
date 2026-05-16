@@ -56,3 +56,48 @@ class TestGetWindowedMessages:
         messages = [_msg("user", "hello")]
         result = ShortTermMemory.get_windowed_messages(messages, max_tokens=0)
         assert result == []
+
+
+class TestPairPreservation:
+    def test_user_assistant_pair_not_split(self):
+        """A user+assistant pair must be included together or not at all."""
+        # Each message = 100 chars = 25 tokens. Budget = 40 fits one pair but not two.
+        user1 = _msg("user", "a" * 100)
+        asst1 = _msg("assistant", "b" * 100)
+        user2 = _msg("user", "c" * 100)
+        asst2 = _msg("assistant", "d" * 100)
+        messages = [user1, asst1, user2, asst2]
+        result = ShortTermMemory.get_windowed_messages(messages, max_tokens=50)
+        # Most recent pair (user2, asst2) costs 50 tokens total → fits.
+        # Older pair (user1, asst1) would exceed budget.
+        assert len(result) == 2
+        assert result[0]["content"] == "c" * 100
+        assert result[1]["content"] == "d" * 100
+
+    def test_assistant_not_included_without_user_pair(self):
+        """A lone assistant message (no preceding user) is included standalone."""
+        asst = _msg("assistant", "hello")
+        messages = [asst]
+        result = ShortTermMemory.get_windowed_messages(messages, max_tokens=1000)
+        assert len(result) == 1
+        assert result[0]["content"] == "hello"
+
+    def test_json_dense_content_estimates_smaller_token_cost(self):
+        """JSON-heavy content should consume fewer estimated tokens, fitting more into budget."""
+        # JSON content with high structural density (~50% structural chars)
+        json_content = '{"key": "value", "num": 123, "arr": [1, 2, 3]}' * 10  # 480 chars
+        # With json_density > 0.10, chars_per_token = 2.0 → ~240 tokens
+        # With old 4-chars/token → ~120 tokens
+        # Prose content same length
+        prose_content = "a" * len(json_content)  # pure prose → ~120 tokens
+
+        # Budget that fits the JSON message but NOT two prose messages of same length
+        json_msg = _msg("user", json_content)
+        result = ShortTermMemory.get_windowed_messages([json_msg], max_tokens=300)
+        # JSON message: 480 chars / 2 chars_per_token = 240 tokens ≤ 300 → included
+        assert len(result) == 1
+
+        prose_msg = _msg("user", prose_content)
+        result2 = ShortTermMemory.get_windowed_messages([prose_msg], max_tokens=100)
+        # Prose: 480 chars / 4 = 120 tokens > 100 → excluded
+        assert len(result2) == 0

@@ -47,6 +47,25 @@ def generate_price_chart(
         return None
 
 
+def _extract_analyst_targets(ticker: str, resolved: str, raw_data: dict | None) -> dict:
+    """Extract analyst price targets from the fundamentals raw data."""
+    if not raw_data:
+        return {}
+    import json as _json
+    ticker_data = raw_data.get(resolved) or raw_data.get(ticker) or {}
+    fund = ticker_data.get("fundamentals", {})
+    if isinstance(fund, str):
+        try:
+            fund = _json.loads(fund)
+        except Exception:
+            return {}
+    return {
+        "mean": fund.get("analyst_target_mean"),
+        "high": fund.get("analyst_target_high"),
+        "low":  fund.get("analyst_target_low"),
+    }
+
+
 def generate_candlestick_chart(
     ticker: str,
     period: str = "1y",
@@ -54,11 +73,13 @@ def generate_candlestick_chart(
     end: str | None = None,
     overlays: list[str] | None = None,
     show_earnings: bool = True,
+    raw_data: dict | None = None,
 ) -> dict | None:
-    """OHLCV candlestick + SMA-50/200 + volume.
+    """OHLCV candlestick + SMA-50/200 + volume + optional analyst targets.
 
     overlays: list of strings from {"bollinger", "bb", "ema", "ema_N"} where N is any integer.
     show_earnings: overlay vertical markers at quarterly earnings dates.
+    raw_data: pipeline raw_data dict — when provided, adds analyst price target overlay.
     """
     try:
         hist, resolved = _fetch_hist(ticker, period, start=start, end=end)
@@ -151,6 +172,34 @@ def generate_candlestick_chart(
                 "line": {"color": ema_colors[i % len(ema_colors)], "width": 1.2},
                 "name": f"EMA-{ep}",
                 "hovertemplate": f"EMA-{ep}: $%{{y:.2f}}<extra></extra>",
+            })
+
+        # ── Analyst price target overlay ─────────────────────────────────────
+        targets = _extract_analyst_targets(ticker, resolved, raw_data)
+        target_mean = targets.get("mean")
+        target_high = targets.get("high")
+        target_low  = targets.get("low")
+
+        if target_mean and dates:
+            data.append({
+                "type": "scatter", "mode": "lines", "xaxis": "x", "yaxis": "y",
+                "x": [dates[0], dates[-1]], "y": [target_mean, target_mean],
+                "line": {"color": _AMBER, "width": 1.5, "dash": "dashdot"},
+                "name": f"Target Mean ${target_mean:.2f}",
+                "hovertemplate": f"Analyst Mean: ${target_mean:.2f}<extra></extra>",
+            })
+        if target_high and target_low and dates:
+            # Shaded band between consensus low and high target
+            data.append({
+                "type": "scatter", "mode": "lines", "xaxis": "x", "yaxis": "y",
+                "x": dates + list(reversed(dates)),
+                "y": [target_high] * len(dates) + [target_low] * len(dates),
+                "fill": "toself",
+                "fillcolor": _AMBER + "18",   # ~10% opacity
+                "line": {"color": "rgba(0,0,0,0)"},
+                "name": f"Target Range ${target_low:.0f}–${target_high:.0f}",
+                "showlegend": True,
+                "hoverinfo": "skip",
             })
 
         label  = f"{start} to {end or 'today'}" if start else period

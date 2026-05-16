@@ -70,25 +70,67 @@ def _table_to_markdown(tbl: dict) -> str:
 # Main search function
 # ---------------------------------------------------------------------------
 
+async def _generate_hyde_passage(query: str, subllm: Any) -> str:
+    """Generate a hypothetical document passage via Flash-Lite for HyDE retrieval.
+
+    HyDE (Hypothetical Document Embedding) embeds a synthetic answer instead of
+    the raw question. Document passages and answers live in closer embedding space
+    than questions, improving retrieval precision for short or ambiguous queries.
+    """
+    from langchain_core.messages import HumanMessage
+    from ..core.llm import content_to_str
+
+    prompt = (
+        "Write a concise one-paragraph excerpt from a financial document that would "
+        "directly answer the following question. Use financial terminology and specific "
+        "figures if possible. Do not reference the question itself or start with 'I'.\n\n"
+        f"Question: {query}\n\nPassage:"
+    )
+    try:
+        response = await subllm.ainvoke([HumanMessage(content=prompt)])
+        raw = response.content if hasattr(response, "content") else response
+        passage = content_to_str(raw).strip()
+        if passage:
+            logger.debug("HyDE passage generated (%d chars) for query: %s", len(passage), query[:60])
+            return passage
+    except Exception as exc:
+        logger.warning("HyDE generation failed — using raw query: %s", exc)
+    return query
+
+
 async def search_documents(
     query: str,
     user_id: str,
     top_k: int = 8,
     document_ids: list[str] | None = None,
+    use_hyde: bool = False,
+    subllm: Any | None = None,
 ) -> list[PageResult]:
     """Hybrid search: vector similarity + FTS, merged via RRF.
 
     Always searches both the user's private documents (scope='user') and
     all system documents (scope='system') in a single query.
+
+    Args:
+        use_hyde: If True and subllm is provided, generates a hypothetical
+                  document passage via Flash-Lite and uses that for vector
+                  embedding instead of the raw query text. Improves retrieval
+                  for short/ambiguous queries.
+        subllm: Flash-Lite instance used for HyDE passage generation.
     """
     from backend.core.database import async_session_factory, engine
     from backend.core.models import HAS_PGVECTOR
 
     is_pg = str(engine.url).startswith("postgresql")
 
+    # HyDE: replace query text for vector embedding (FTS still uses original query)
+    embed_text = query
+    if use_hyde and subllm is not None:
+        embed_text = await _generate_hyde_passage(query, subllm)
+
     async with async_session_factory() as session:
         if is_pg and HAS_PGVECTOR:
-            vector_rows = await _vector_search(session, query, user_id, top_k * 2, document_ids)
+            vector_rows = await _vector_search(session, embed_text, user_id, top_k * 2, document_ids)
             fts_rows    = await _fts_search(session, query, user_id, top_k * 2, document_ids)
             ranked      = _rrf_merge(vector_rows, fts_rows)[:top_k]
         else:
