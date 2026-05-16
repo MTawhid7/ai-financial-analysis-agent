@@ -180,6 +180,9 @@ def _make_mock_ticker(
         index=pd.date_range("2024-09-01", periods=3, freq="-30D"),
     )
 
+    # Stock splits — empty by default; tests that exercise corporate_events override this
+    mock.splits = pd.Series([], dtype=float, name="Stock Splits")
+
     return mock
 
 
@@ -352,3 +355,113 @@ class TestYahooFinanceTool:
     def test_unknown_data_type_rejected(self, mock_cache, mock_ticker_cls):
         with pytest.raises(Exception):
             yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "unknown_type"})
+
+    # ── data_quality field tests ──────────────────────────────────────────────
+
+    def test_price_history_data_quality_full(self, mock_cache, mock_ticker_cls):
+        """Full 5-year data → data_quality=FULL, no degradation_note."""
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock_ticker_cls.return_value = _make_mock_ticker()
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "price_history"})
+        data   = json.loads(result)
+
+        assert data["data_quality"]     == "FULL"
+        assert data["degradation_note"] is None
+        assert data["period_requested"] == "5y"
+        assert data["period_received"]  == "5y"
+
+    def test_price_history_null_has_unavailable_quality(self, mock_cache, mock_ticker_cls):
+        """_null responses must include data_quality=UNAVAILABLE."""
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock_ticker_cls.return_value = _make_mock_ticker(price_history=False)
+
+        result = yahoo_finance_tool.invoke({"ticker": "FAKE", "data_type": "price_history"})
+        data   = json.loads(result)
+        assert data["result"]       is None
+        assert data["data_quality"] == "UNAVAILABLE"
+
+    def test_fundamentals_data_quality_full(self, mock_cache, mock_ticker_cls):
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock_ticker_cls.return_value = _make_mock_ticker()
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "fundamentals"})
+        data   = json.loads(result)
+        assert data["data_quality"] in ("FULL", "PARTIAL")
+        assert "degradation_note" in data
+
+    def test_cash_flow_data_quality_full(self, mock_cache, mock_ticker_cls):
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock_ticker_cls.return_value = _make_mock_ticker()
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "cash_flow"})
+        data   = json.loads(result)
+        assert data["data_quality"] in ("FULL", "PARTIAL")
+
+    def test_cash_flow_data_quality_field_always_present(self, mock_cache, mock_ticker_cls):
+        """data_quality and degradation_note fields must always be in cash_flow response."""
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock = _make_mock_ticker()
+        # DataFrame with only OCF + Capex (no explicit Free Cash Flow row)
+        mock.cashflow = pd.DataFrame({
+            "2024-09-01": {
+                "Operating Cash Flow": 110_543_000_000,
+                "Capital Expenditure": -8_978_000_000,
+            }
+        })
+        mock_ticker_cls.return_value = mock
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "cash_flow"})
+        data   = json.loads(result)
+        # FCF computed from OCF + Capex → still FULL; but fields must exist
+        assert "data_quality" in data
+        assert "degradation_note" in data
+
+    def test_earnings_data_quality_present(self, mock_cache, mock_ticker_cls):
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock_ticker_cls.return_value = _make_mock_ticker()
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "earnings"})
+        data   = json.loads(result)
+        assert "data_quality" in data
+
+    def test_financials_trend_data_quality_full(self, mock_cache, mock_ticker_cls):
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock_ticker_cls.return_value = _make_mock_ticker()
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "financials_trend"})
+        data   = json.loads(result)
+        assert data["data_quality"] == "FULL"   # mock has 5 quarters
+
+    # ── corporate_events (splits) tests ──────────────────────────────────────
+
+    def test_price_history_corporate_events_empty_by_default(self, mock_cache, mock_ticker_cls):
+        """Default mock has no splits → corporate_events=[]."""
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock_ticker_cls.return_value = _make_mock_ticker()
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "price_history"})
+        data   = json.loads(result)
+        assert "corporate_events" in data
+        assert isinstance(data["corporate_events"], list)
+        assert data["corporate_events"] == []
+
+    def test_price_history_corporate_events_with_split(self, mock_cache, mock_ticker_cls):
+        """A 4:1 split within 5 years is surfaced in corporate_events."""
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock = _make_mock_ticker()
+        mock.splits = pd.Series(
+            [4.0],
+            index=pd.DatetimeIndex(["2020-08-31"]),
+            name="Stock Splits",
+        )
+        mock_ticker_cls.return_value = mock
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "price_history"})
+        data   = json.loads(result)
+        events = data["corporate_events"]
+        assert len(events) == 1
+        assert events[0]["type"]  == "split"
+        assert events[0]["ratio"] == 4.0
+        assert "4-for-1" in events[0]["description"]
+        assert events[0]["date"]  == "2020-08-31"

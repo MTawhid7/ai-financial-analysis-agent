@@ -14,6 +14,7 @@ but meaningfully better than a single stale snapshot.
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import urllib.request
@@ -114,6 +115,100 @@ _INDUSTRY_TO_GICS: dict[str, str] = {
     for ind in industries
 }
 
+# Common yfinance sector strings that don't match GICS exactly.
+# Applied before fuzzy matching to handle the most frequent mismatches.
+_SECTOR_ALIASES: dict[str, str] = {
+    "technology":                "Information Technology",
+    "healthcare":                "Health Care",
+    "financial services":        "Financials",
+    "consumer cyclical":         "Consumer Discretionary",
+    "consumer defensive":        "Consumer Staples",
+    "basic materials":           "Materials",
+    "communication services":    "Communication Services",  # exact but lowercase alias
+    "industrials":               "Industrials",
+    "energy":                    "Energy",
+    "utilities":                 "Utilities",
+    "real estate":               "Real Estate",
+    "reits":                     "Real Estate",
+}
+
+# ── Geographic market classification ─────────────────────────────────────────
+
+# Countries whose equity markets typically trade at a 20-40% P/E discount to US
+# benchmarks due to sovereign/political risk, regulatory uncertainty, currency risk.
+_EM_COUNTRIES: frozenset[str] = frozenset({
+    "china", "india", "brazil", "russia", "taiwan", "south korea", "indonesia",
+    "thailand", "malaysia", "philippines", "vietnam", "turkey", "mexico",
+    "argentina", "colombia", "chile", "peru", "egypt", "saudi arabia",
+    "united arab emirates", "qatar", "south africa", "nigeria", "kenya",
+    "hong kong", "pakistan", "bangladesh", "sri lanka", "myanmar",
+    "czechia", "czech republic", "poland", "hungary", "romania", "ukraine",
+})
+
+# Countries whose equity markets differ from the US by a smaller margin (~10-20%).
+_DEVELOPED_EX_US: frozenset[str] = frozenset({
+    "united kingdom", "germany", "france", "japan", "australia", "canada",
+    "netherlands", "switzerland", "sweden", "norway", "denmark", "finland",
+    "belgium", "austria", "ireland", "spain", "italy", "portugal",
+    "singapore", "new zealand", "israel", "luxembourg",
+})
+
+
+def _geographic_context(country: str | None) -> dict | None:
+    """Return a geographic benchmark note when the company is not US-domiciled.
+
+    Returns None for US companies (no adjustment needed).
+    Returns a dict with scope, note, and a typical PE discount estimate for others.
+    """
+    if not country:
+        return None
+
+    c = country.lower().strip()
+
+    if c in ("united states", "usa", "us", "u.s.", "u.s.a."):
+        return None  # US baseline — benchmarks apply directly
+
+    if c in _EM_COUNTRIES:
+        note = (
+            f"{country} is classified as an Emerging Market. "
+            "EM companies typically trade at a 25–35% P/E discount to US sector "
+            "averages, driven by sovereign/political risk, lower analyst coverage, "
+            "FX volatility, and regulatory uncertainty. "
+            "Treat US benchmarks as an upper-bound reference, not a direct comparison."
+        )
+        return {
+            "geographic_scope":           "emerging_market",
+            "country":                    country,
+            "benchmark_note":             note,
+            "typical_pe_discount_vs_us":  -30,   # % — representative midpoint
+        }
+
+    if c in _DEVELOPED_EX_US:
+        note = (
+            f"{country} is a developed market outside the US. "
+            "Sector multiples may differ by 10–20% due to differences in interest "
+            "rate environment, tax treatment, accounting standards (IFRS vs US GAAP), "
+            "and market liquidity. Comparisons are directional, not precise."
+        )
+        return {
+            "geographic_scope":           "developed_ex_us",
+            "country":                    country,
+            "benchmark_note":             note,
+            "typical_pe_discount_vs_us":  -12,   # % — approximate median
+        }
+
+    # Unknown / unlisted country — flag it but don't guess the premium
+    return {
+        "geographic_scope":           "non_us_unclassified",
+        "country":                    country,
+        "benchmark_note":             (
+            f"{country} market data is not in our classification. "
+            "US sector benchmarks are provided for reference only — "
+            "local market conditions, valuations, and risk premiums may differ significantly."
+        ),
+        "typical_pe_discount_vs_us":  None,
+    }
+
 
 # ── Tool ──────────────────────────────────────────────────────────────────────
 
@@ -125,30 +220,53 @@ class BenchmarkLookupInput(StrictToolInput):
             "Communication Services, Energy, Utilities, Real Estate, Materials."
         )
     )
+    country: str | None = Field(
+        default=None,
+        description=(
+            "Company's country of domicile (e.g. 'United States', 'China', 'Germany'). "
+            "When provided, the response includes a geographic benchmark note explaining "
+            "how local market conditions may affect the comparability of US benchmarks."
+        )
+    )
 
 
 @tool("benchmark_lookup", args_schema=BenchmarkLookupInput)
-def benchmark_lookup_tool(gics_sector: str) -> str:
+def benchmark_lookup_tool(gics_sector: str, country: str | None = None) -> str:
     """Return sector valuation benchmarks: P/E, EV/EBITDA, P/Book, margins, beta.
 
     Fetches from Damodaran (NYU Stern) with a 30-day cache; falls back to
     bundled static data if the live fetch fails.
+
+    When `country` is provided and the company is not US-domiciled, the response
+    includes a `geographic_context` block explaining how local market conditions
+    affect the comparability of US benchmarks (EM discount, developed ex-US note).
     """
     def _run():
-        sector = _normalise_sector(gics_sector)
+        sector, matched_from = _normalise_sector(gics_sector)
         if sector is None:
             available = list(_STATIC_BENCHMARKS.get("sectors", {}).keys())
             return ToolError(
                 error_type=ErrorType.TOOL_ERROR,
                 tool="benchmark_lookup",
-                message=f"Sector '{gics_sector}' not found. Available: {available}",
+                message=f"Sector '{gics_sector}' not recognised. Available: {available}",
                 input={"gics_sector": gics_sector},
             ).to_json()
 
         data = _get_sector_benchmarks(sector)
+
+        # Surface fuzzy-match provenance when the input wasn't an exact GICS name
+        if matched_from and matched_from != sector:
+            data["sector_matched_from"] = matched_from
+            data["sector_match_method"] = "alias" if matched_from.lower() in _SECTOR_ALIASES else "fuzzy"
+
+        # Geographic context (Option A + partial B)
+        geo = _geographic_context(country)
+        if geo is not None:
+            data["geographic_context"] = geo
+
         return json.dumps(data)
 
-    return safe_tool_call("benchmark_lookup", _run, {"gics_sector": gics_sector})
+    return safe_tool_call("benchmark_lookup", _run, {"gics_sector": gics_sector, "country": country})
 
 
 # ── Benchmark data retrieval ──────────────────────────────────────────────────
@@ -288,13 +406,41 @@ def _fetch_damodaran_table(url: str, timeout: int = 8) -> list[dict[str, Any]]:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _normalise_sector(raw: str) -> str | None:
-    """Case-insensitive GICS sector lookup."""
-    sectors = _STATIC_BENCHMARKS.get("sectors", {})
-    return next(
-        (k for k in sectors if k.lower() == raw.strip().lower()),
-        None,
-    )
+def _normalise_sector(raw: str) -> tuple[str | None, str | None]:
+    """Map any sector string to a canonical GICS sector name.
+
+    Returns (canonical_sector, original_input) on success, (None, None) on failure.
+    Resolution order:
+      1. Exact case-insensitive GICS match
+      2. Common alias lookup (yfinance names → GICS)
+      3. difflib fuzzy match at cutoff=0.6 (handles typos, partial names)
+
+    The second element of the tuple is the original input string — used by the
+    caller to surface match provenance when a non-exact match was applied.
+    """
+    sectors = list(_STATIC_BENCHMARKS.get("sectors", {}).keys())
+    key     = raw.strip()
+
+    # 1. Exact GICS match (case-insensitive)
+    exact = next((s for s in sectors if s.lower() == key.lower()), None)
+    if exact:
+        return exact, key
+
+    # 2. Alias lookup for common yfinance sector strings
+    alias = _SECTOR_ALIASES.get(key.lower())
+    if alias and alias in sectors:
+        return alias, key
+
+    # 3. Fuzzy match via difflib (cutoff=0.6 catches "Consumer Cyclical" →
+    #    "Consumer Discretionary", "Healthcare" → "Health Care", etc.)
+    close = difflib.get_close_matches(key, sectors, n=1, cutoff=0.6)
+    if close:
+        logger.info(
+            "benchmark_lookup: fuzzy-matched '%s' → '%s'", key, close[0]
+        )
+        return close[0], key
+
+    return None, None
 
 
 def _collect(

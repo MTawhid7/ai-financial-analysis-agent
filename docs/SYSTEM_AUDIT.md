@@ -18,10 +18,10 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 | Stale `info` dict | ✅ | Uses `fast_info.last_price` for price; `TTL_PRICE=15m`, `TTL_FUNDAMENTALS=6h` per data type |
 | Missing cash flow data | ✅ | `cash_flow` data type: OCF, FCF, capex, D&A, FCF yield, cash-conversion ratio, dividend history |
 | No forward estimates | ✅ | `analyst_target_mean/high/low`, forward P/E in `fundamentals`; earnings EPS estimates in `earnings` |
-| Silent data degradation | ⚠️ | Data gaps surfaced in `researcher_gaps` and coverage report; fallback periods not yet surfaced as a quality grade |
+| Silent data degradation | ✅ | Every response now carries `data_quality: "FULL"\|"PARTIAL"\|"UNAVAILABLE"` with a `degradation_note` explaining the gap; `period_requested` vs `period_received` surfaced in `price_history` |
 | No dividend data | ✅ | Dividend history (payments, annual totals, 3Y CAGR) in `cash_flow` data type |
 | 52-week window is approximate | ✅ | Uses `timedelta(365)` for true 52-week window, not `prices[-252:]` |
-| No corporate event timeline | ⚠️ | Next earnings date in `earnings` data type; stock split history / buyback announcements not included |
+| No corporate event timeline | ⚠️ | Stock splits now in `corporate_events` list in `price_history` (date, ratio, description). Buyback announcements not available on yfinance free tier. |
 
 ---
 
@@ -31,8 +31,8 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 |---|---|---|
 | Static data, zero refresh | ✅ | Live-fetched from Damodaran NYU Stern HTML (6 URLs); 30-day cache; static JSON fallback |
 | Only P/E | ✅ | Returns 7 multiples: trailing PE, forward PE, EV/EBITDA, P/B, P/S, operating margin %, beta |
-| No fuzzy sector matching | ❌ | `_normalise_sector()` is exact case-insensitive match only; "Consumer" vs "Consumer Discretionary" silently returns None |
-| No geographic segmentation | ❌ | US-only Damodaran data; no region/country filter |
+| No fuzzy sector matching | ✅ | `_normalise_sector()` now: (1) exact GICS match, (2) alias dict for all common yfinance sector names (Technology→IT, Consumer Cyclical→Consumer Discretionary, etc.), (3) `difflib.get_close_matches(cutoff=0.6)` fuzzy fallback. `sector_matched_from` + `sector_match_method` fields surfaced in result. |
+| No geographic segmentation | ✅ | `BenchmarkLookupInput` accepts optional `country`. Non-US companies get a `geographic_context` block: EM companies flagged with ~30% typical PE discount note; developed ex-US flagged with ~12% note; unclassified countries warned. `quant_analyst.py` passes `country` from fundamentals. |
 
 ---
 
@@ -282,7 +282,7 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 
 ---
 
-## What Was Closed (16 of 34 sub-issues from original audit)
+## What Was Closed (20 of 34 sub-issues from original audit)
 
 | Original # | Component | What was fixed |
 |---|---|---|
@@ -302,5 +302,9 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 | 12 | `memory/short_term.py` | Turn-pair windowing; JSON-density token estimate |
 | 13 | `refinement_handler.py` | Fuzzy match (line-strip fallback); INSERT versioning |
 | 14 | `pageindex/retriever.py` | HyDE query expansion |
+| 17 | `yahoo_finance.py` | Silent data degradation — `data_quality` + `degradation_note` in all 7 data types |
+| 18 | `yahoo_finance.py` | Corporate events — stock splits in `price_history.corporate_events` |
+| 19 | `benchmark_lookup.py` | Fuzzy sector matching — alias dict + `difflib.get_close_matches` fallback |
+| 20 | `benchmark_lookup.py` | Geographic segmentation — `geographic_context` block for non-US companies |
 
-*18 sub-issues remain across the priority matrix above.*
+*14 sub-issues remain across the priority matrix above.*

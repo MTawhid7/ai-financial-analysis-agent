@@ -1,7 +1,8 @@
 """YahooFinanceTool — comprehensive financial data via yfinance (free tier).
 
 Seven data types, each with the appropriate cache TTL:
-  price_history      — adjusted OHLCV, true 52-week window, data freshness flag
+  price_history      — adjusted OHLCV, true 52-week window, data freshness flag,
+                       data_quality grade, corporate events (splits)
   fundamentals       — 25+ metrics + analyst recommendations (upgrade/downgrade history)
   balance_sheet      — assets, liabilities, equity, cash, debt ratios
   cash_flow          — OCF, FCF, capex, D&A, FCF yield, dividend payment history
@@ -9,7 +10,12 @@ Seven data types, each with the appropriate cache TTL:
   price_metrics      — Sharpe, Sortino, max drawdown, beta, volatility, relative CAGR
   financials_trend   — quarterly income statement + balance sheet trend (last 4 quarters)
 
-All data is cached with type-appropriate TTLs (15 min for prices, 24 h for financials).
+Every response now includes a `data_quality` field:
+  "FULL"        — all expected fields retrieved for the requested period
+  "PARTIAL"     — some fields missing or history window shorter than requested
+  "UNAVAILABLE" — no data returned (response is a null sentinel)
+
+When data_quality is "PARTIAL", a `degradation_note` field explains the gap.
 """
 
 from __future__ import annotations
@@ -122,12 +128,18 @@ def _fetch_data(ticker: str, data_type: str) -> str:
 def _price_history(stock: yf.Ticker, ticker: str, ts: str) -> str:
     # auto_adjust=True applies split/dividend adjustments to Close.
     # interval="1wk" keeps payload small while covering the full 5-year span.
-    hist = stock.history(period="5y", interval="1wk", auto_adjust=True)
-    if hist.empty:
-        hist = stock.history(period="2y", interval="1wk", auto_adjust=True)
-    if hist.empty:
-        hist = stock.history(period="1y", interval="1d", auto_adjust=True)
-    if hist.empty:
+    # Track which period actually returns data so we can surface degradation.
+    hist = None
+    period_received: str | None = None
+
+    for period, interval in [("5y", "1wk"), ("2y", "1wk"), ("1y", "1d")]:
+        h = stock.history(period=period, interval=interval, auto_adjust=True)
+        if not h.empty:
+            hist = h
+            period_received = period
+            break
+
+    if hist is None or hist.empty:
         return _null(ticker, "price_history", "No price history available")
 
     closes = hist["Close"].dropna()
@@ -135,7 +147,7 @@ def _price_history(stock: yf.Ticker, ticker: str, ts: str) -> str:
     lows   = hist["Low"].dropna()
 
     # True 52-week window: exactly 365 calendar days back from last data point
-    cutoff   = hist.index[-1] - timedelta(days=365)
+    cutoff           = hist.index[-1] - timedelta(days=365)
     last_year_closes = closes.loc[closes.index >= cutoff]
     last_year_highs  = highs.loc[highs.index  >= cutoff]
     last_year_lows   = lows.loc[lows.index   >= cutoff]
@@ -143,7 +155,27 @@ def _price_history(stock: yf.Ticker, ticker: str, ts: str) -> str:
     current_price = round(float(closes.iloc[-1]), 2)
     price_5y_ago  = round(float(closes.iloc[0]),  2)
 
-    # Freshness check: compare fast_info price to adjusted close (optional warning)
+    # ── Data quality assessment ───────────────────────────────────────────────
+    # Minimum expected data points per period (weekly bars)
+    _MIN_POINTS = {"5y": 200, "2y": 80, "1y": 40}
+    degradation_note: str | None = None
+
+    if period_received != "5y":
+        data_quality     = "PARTIAL"
+        degradation_note = (
+            f"Requested 5-year history; only {period_received} of data available. "
+            "CAGR and long-term trend figures will be less reliable."
+        )
+    elif len(closes) < _MIN_POINTS.get(period_received, 40):
+        data_quality     = "PARTIAL"
+        degradation_note = (
+            f"Fewer data points than expected ({len(closes)} bars). "
+            "May indicate sparse trading or a recently listed stock."
+        )
+    else:
+        data_quality = "FULL"
+
+    # ── Freshness check ───────────────────────────────────────────────────────
     freshness_warning = None
     try:
         fi_price = getattr(stock.fast_info, "last_price", None)
@@ -155,17 +187,45 @@ def _price_history(stock: yf.Ticker, ticker: str, ts: str) -> str:
     except Exception:
         pass
 
+    # ── Corporate events: stock splits (last 5 years) ────────────────────────
+    corporate_events: list[dict] = []
+    try:
+        splits = stock.splits
+        if splits is not None and not splits.empty:
+            event_cutoff = hist.index[-1] - timedelta(days=365 * 5)
+            recent_splits = splits[splits.index >= event_cutoff]
+            for dt, ratio in recent_splits.items():
+                if ratio and float(ratio) != 1.0:
+                    r = float(ratio)
+                    if r > 1:
+                        description = f"{r:.0f}-for-1 stock split"
+                    else:
+                        description = f"1-for-{1/r:.0f} reverse split"
+                    corporate_events.append({
+                        "date":        str(dt)[:10],
+                        "type":        "split",
+                        "ratio":       round(r, 4),
+                        "description": description,
+                    })
+    except Exception:
+        pass
+
     return json.dumps({
-        "ticker":           ticker,
-        "data_type":        "price_history",
-        "data_timestamp":   ts,
-        "current_price":    current_price,
-        "price_5y_ago":     price_5y_ago,
-        "52w_high":         _sf(last_year_highs.max())  if not last_year_highs.empty  else None,
-        "52w_low":          _sf(last_year_lows.min())   if not last_year_lows.empty   else None,
-        "data_points":      len(closes),
-        "price_adjusted":   True,   # flag so downstream knows this is adj-close
+        "ticker":            ticker,
+        "data_type":         "price_history",
+        "data_timestamp":    ts,
+        "data_quality":      data_quality,
+        "degradation_note":  degradation_note,
+        "period_requested":  "5y",
+        "period_received":   period_received,
+        "current_price":     current_price,
+        "price_5y_ago":      price_5y_ago,
+        "52w_high":          _sf(last_year_highs.max()) if not last_year_highs.empty else None,
+        "52w_low":           _sf(last_year_lows.min())  if not last_year_lows.empty  else None,
+        "data_points":       len(closes),
+        "price_adjusted":    True,
         "freshness_warning": freshness_warning,
+        "corporate_events":  corporate_events,
     })
 
 
@@ -197,10 +257,26 @@ def _fundamentals(stock: yf.Ticker, ticker: str, ts: str) -> str:
     except Exception:
         pass
 
+    # Data quality: FULL requires price + sector + at least one valuation multiple
+    _core_fields = [current_price, info.get("sector"), info.get("marketCap")]
+    _valuation   = [info.get("trailingPE"), info.get("forwardPE"), info.get("enterpriseToEbitda")]
+    if all(_core_fields) and any(_valuation):
+        fund_quality      = "FULL"
+        fund_degradation  = None
+    else:
+        fund_quality      = "PARTIAL"
+        missing = [k for k, v in {
+            "price": current_price, "sector": info.get("sector"),
+            "market_cap": info.get("marketCap"), "pe_ratio": info.get("trailingPE"),
+        }.items() if not v]
+        fund_degradation = f"Missing fields: {', '.join(missing)}"
+
     return json.dumps({
         "ticker":           ticker,
         "data_type":        "fundamentals",
         "data_timestamp":   ts,
+        "data_quality":     fund_quality,
+        "degradation_note": fund_degradation,
         # Price
         "current_price":    current_price,
         # Valuation multiples
@@ -298,10 +374,22 @@ def _balance_sheet(stock: yf.Ticker, ticker: str, ts: str) -> str:
     if current_assets and inventory is not None and current_liab and current_liab > 0:
         quick_ratio = round((current_assets - inventory) / current_liab, 2)
 
+    _bs_core = [total_assets, total_liab, equity]
+    bs_quality     = "FULL" if all(_bs_core) else "PARTIAL"
+    bs_degradation = None if bs_quality == "FULL" else (
+        "Missing: " + ", ".join(
+            k for k, v in {"total_assets": total_assets,
+                           "total_liabilities": total_liab,
+                           "equity": equity}.items() if not v
+        )
+    )
+
     return json.dumps({
         "ticker":               ticker,
         "data_type":            "balance_sheet",
         "data_timestamp":       ts,
+        "data_quality":         bs_quality,
+        "degradation_note":     bs_degradation,
         "total_assets":         total_assets,
         "total_liabilities":    total_liab,
         "stockholders_equity":  equity,
@@ -411,10 +499,19 @@ def _cash_flow(stock: yf.Ticker, ticker: str, ts: str) -> str:
     except Exception:
         pass
 
+    cf_quality     = "FULL" if (ocf is not None and fcf is not None) else "PARTIAL"
+    cf_degradation = None if cf_quality == "FULL" else (
+        "Missing: " + ", ".join(
+            k for k, v in {"operating_cash_flow": ocf, "free_cash_flow": fcf}.items() if v is None
+        )
+    )
+
     return json.dumps({
         "ticker":                  ticker,
         "data_type":               "cash_flow",
         "data_timestamp":          ts,
+        "data_quality":            cf_quality,
+        "degradation_note":        cf_degradation,
         "operating_cash_flow":     ocf,
         "free_cash_flow":          fcf,
         "capital_expenditure":     capex,
@@ -468,10 +565,18 @@ def _earnings(stock: yf.Ticker, ticker: str, ts: str) -> str:
     if next_date is None and not surprises:
         return _null(ticker, "earnings", "Earnings data unavailable")
 
+    earn_quality     = "FULL" if (next_date is not None and len(surprises) >= 4) else "PARTIAL"
+    earn_degradation = None if earn_quality == "FULL" else (
+        ("Missing next earnings date. " if next_date is None else "") +
+        (f"Only {len(surprises)} quarter(s) of surprise history (expect 4+)." if len(surprises) < 4 else "")
+    ).strip() or None
+
     return json.dumps({
         "ticker":               ticker,
         "data_type":            "earnings",
         "data_timestamp":       ts,
+        "data_quality":         earn_quality,
+        "degradation_note":     earn_degradation,
         "next_earnings_date":   next_date,
         "eps_estimate":         eps_estimate,
         "revenue_estimate":     rev_estimate,
@@ -552,10 +657,21 @@ def _price_metrics(stock: yf.Ticker, ticker: str, ts: str) -> str:
             sp500_cagr_pct  = round(sp500["cagr"] * 100, 2)
             relative_cagr   = round(total_return_cagr - sp500_cagr_pct, 2)
 
+    pm_core        = [sharpe, max_drawdown]
+    pm_quality     = "FULL" if all(pm_core) and beta is not None else "PARTIAL"
+    pm_degradation = None if pm_quality == "FULL" else (
+        "Missing: " + ", ".join(
+            k for k, v in {"sharpe_ratio": sharpe, "beta": beta,
+                           "max_drawdown": max_drawdown}.items() if v is None
+        )
+    )
+
     return json.dumps({
         "ticker":               ticker,
         "data_type":            "price_metrics",
         "data_timestamp":       ts,
+        "data_quality":         pm_quality,
+        "degradation_note":     pm_degradation,
         "total_return_cagr_pct": total_return_cagr,
         "volatility_annual_pct": volatility_annual,
         "sharpe_ratio":         sharpe,
@@ -637,10 +753,17 @@ def _financials_trend(stock: yf.Ticker, ticker: str, ts: str) -> str:
     if not income_trend and not balance_trend:
         return _null(ticker, "financials_trend", "Quarterly financials unavailable")
 
+    ft_quality     = "FULL" if len(income_trend) >= 4 else "PARTIAL"
+    ft_degradation = None if ft_quality == "FULL" else (
+        f"Only {len(income_trend)} quarter(s) of income data available (expect 4+)."
+    )
+
     return json.dumps({
         "ticker":           ticker,
         "data_type":        "financials_trend",
         "data_timestamp":   ts,
+        "data_quality":     ft_quality,
+        "degradation_note": ft_degradation,
         "income_trend":     income_trend,    # newest quarter first
         "balance_trend":    balance_trend,   # newest quarter first
     })
@@ -699,6 +822,7 @@ def _null(ticker: str, data_type: str, reason: str) -> str:
         "ticker":         ticker,
         "data_type":      data_type,
         "data_timestamp": datetime.utcnow().isoformat() + "Z",
+        "data_quality":   "UNAVAILABLE",
         "result":         None,
         "reason":         reason,
     })

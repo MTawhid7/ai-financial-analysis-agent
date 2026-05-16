@@ -157,16 +157,23 @@ async def quant_analyst_node(state: AgentState, config: dict | None = None) -> A
 
         if fund and fund.get("sector"):
             gics_sector = _YFINANCE_TO_GICS.get(fund["sector"], fund["sector"])
+            country     = fund.get("country")   # passed to benchmark for geo context
             step += 1
-            benchmark_str = await benchmark_lookup_tool.arun({"gics_sector": gics_sector})
-            _record_step(step, "benchmark_lookup", {"gics_sector": gics_sector},
+            bm_input = {"gics_sector": gics_sector}
+            if country:
+                bm_input["country"] = country
+            benchmark_str = await benchmark_lookup_tool.arun(bm_input)
+            _record_step(step, "benchmark_lookup", bm_input,
                          benchmark_str, tracer, artifacts, step_callback, iteration_log)
 
             try:
                 bm = json.loads(benchmark_str)
                 if "error_type" not in bm:
-                    ta["sector"]       = gics_sector
+                    ta["sector"]       = bm.get("sector", gics_sector)  # use resolved sector name
                     ta["sector_peers"] = bm.get("peer_examples", [])
+                    # Surface geographic context for non-US companies
+                    if bm.get("geographic_context"):
+                        ta["geographic_context"] = bm["geographic_context"]
                     ta["citations"]["sector_benchmarks"] = {
                         "source_tool": "benchmark_lookup", "observation_step": step
                     }
