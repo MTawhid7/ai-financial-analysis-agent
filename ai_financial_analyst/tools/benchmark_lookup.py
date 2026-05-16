@@ -39,6 +39,7 @@ _DAMODARAN_URLS = {
     "pe":     "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/pedata.html",
     "evdata": "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/vebitda.html",
     "pbv":    "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/pbvdata.html",
+    "ps":     "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/psdata.html",
     "margin": "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/margin.html",
     "beta":   "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/Betasetc.html",
 }
@@ -175,16 +176,17 @@ def _static_benchmarks(gics_sector: str) -> dict:
     sectors = _STATIC_BENCHMARKS.get("sectors", {})
     data    = sectors.get(gics_sector, {})
     return {
-        "sector":                   gics_sector,
-        "pe_ratio_sector_avg":      data.get("pe_ratio"),
-        "ev_ebitda_sector_avg":     data.get("ev_ebitda"),
-        "price_to_book_sector_avg": data.get("price_to_book"),
-        "price_to_sales_sector_avg": None,
-        "operating_margin_pct":     None,
-        "beta_sector_avg":          None,
-        "peer_examples":            data.get("peer_examples", []),
-        "source":                   "Bundled static data (approximate 2024 averages)",
-        "data_year":                2024,
+        "sector":                    gics_sector,
+        "pe_ratio_sector_avg":       data.get("pe_ratio"),
+        "forward_pe_sector_avg":     None,
+        "ev_ebitda_sector_avg":      data.get("ev_ebitda"),
+        "price_to_book_sector_avg":  data.get("price_to_book"),
+        "price_to_sales_sector_avg": data.get("price_to_sales"),
+        "operating_margin_pct":      None,
+        "beta_sector_avg":           None,
+        "peer_examples":             data.get("peer_examples", []),
+        "source":                    "Bundled static data (approximate 2024 averages)",
+        "data_year":                 2024,
     }
 
 
@@ -199,6 +201,7 @@ def _fetch_damodaran_all() -> dict[str, dict] | None:
         pe_data     = _fetch_damodaran_table(_DAMODARAN_URLS["pe"])
         ev_data     = _fetch_damodaran_table(_DAMODARAN_URLS["evdata"])
         pbv_data    = _fetch_damodaran_table(_DAMODARAN_URLS["pbv"])
+        ps_data     = _fetch_damodaran_table(_DAMODARAN_URLS["ps"])
         margin_data = _fetch_damodaran_table(_DAMODARAN_URLS["margin"])
         beta_data   = _fetch_damodaran_table(_DAMODARAN_URLS["beta"])
     except Exception as exc:
@@ -217,6 +220,7 @@ def _fetch_damodaran_all() -> dict[str, dict] | None:
         fpe_vals  = _collect(pe_data,     industry_set, ("Forward PE", "ForwardPE", "Forward P/E"))
         ev_vals   = _collect(ev_data,     industry_set, ("EV/EBITDA", "EV/ EBITDA", "EV/EBITDA1"))
         pbv_vals  = _collect(pbv_data,    industry_set, ("PBV", "Price to Book", "P/BV", "Current P/BV"))
+        ps_vals   = _collect(ps_data,     industry_set, ("PS", "Price/Sales", "Price/ Sales", "Price to Sales", "Current P/S"))
         mg_vals   = _collect(margin_data, industry_set, ("Net Margin", "Net margin", "After-tax Operating Margin"))
         bt_vals   = _collect(beta_data,   industry_set, ("Beta", "Market Beta", "Levered Beta"))
 
@@ -226,7 +230,7 @@ def _fetch_damodaran_all() -> dict[str, dict] | None:
             "forward_pe_sector_avg":     _avg(fpe_vals),
             "ev_ebitda_sector_avg":      _avg(ev_vals),
             "price_to_book_sector_avg":  _avg(pbv_vals),
-            "price_to_sales_sector_avg": None,   # not in standard Damodaran HTML
+            "price_to_sales_sector_avg": _avg(ps_vals),
             "operating_margin_pct":      _pct(_avg(mg_vals)),
             "beta_sector_avg":           _avg(bt_vals),
             "peer_examples":             _STATIC_BENCHMARKS.get("sectors", {}).get(gics_sector, {}).get("peer_examples", []),

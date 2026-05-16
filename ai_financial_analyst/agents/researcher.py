@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # Core data types (must succeed for a useful report)
 _CORE_DATA_TYPES = ["price_history", "fundamentals", "balance_sheet"]
 # Extended data types (improve quality; graceful degradation if missing)
-_EXTENDED_DATA_TYPES = ["cash_flow", "earnings", "price_metrics"]
+_EXTENDED_DATA_TYPES = ["cash_flow", "earnings", "price_metrics", "financials_trend"]
 
 MAX_ITERATIONS = 10   # 6 yfinance calls + 1 web search + 3 buffer
 

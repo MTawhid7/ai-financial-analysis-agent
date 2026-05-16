@@ -233,12 +233,40 @@ async def quant_analyst_node(state: AgentState, config: dict | None = None) -> A
             k: v for k, v in ta.items()
             if k not in ("ticker", "citations", "sector_peers") and v is not None
         }
+
+        # Quarterly revenue trend (last 4 quarters) for momentum context
+        qt_summary = ""
+        ft = ticker_data.get("financials_trend", {})
+        if ft and ft.get("income_trend"):
+            it = ft["income_trend"]
+            qt_rows = [
+                f"  {q.get('quarter','?')}: rev=${q.get('revenue',0) or 0:,.0f}"
+                f"  YoY={q.get('revenue_yoy_pct','N/A')}%"
+                f"  net_margin={q.get('net_margin_pct','N/A')}%"
+                for q in it[:4]
+            ]
+            qt_summary = "\n\nQuarterly revenue trend (newest first):\n" + "\n".join(qt_rows)
+
+        # Analyst recommendations summary
+        rec_summary = ""
+        recs_data = fund.get("analyst_recommendations") if isinstance(fund, dict) else None
+        if isinstance(recs_data, dict) and recs_data.get("sentiment_counts"):
+            sc = recs_data["sentiment_counts"]
+            rec_summary = (
+                f"\n\nAnalyst recommendations (last 10): "
+                f"{sc.get('positive',0)} positive / "
+                f"{sc.get('neutral',0)} neutral / "
+                f"{sc.get('negative',0)} negative"
+            )
+
         human_content = (
             f"Stock: {ticker}\n"
             f"Sector: {ta.get('sector', 'Unknown')}\n\n"
             f"Computed metrics:\n{json.dumps(computed_context, indent=2)[:3000]}\n\n"
             f"Raw fundamentals (selected):\n"
             f"{json.dumps({k: fund.get(k) for k in ('market_cap','revenue_ttm','net_income_ttm','beta','dividend_yield','analyst_target_mean')}, indent=2)}"
+            f"{qt_summary}"
+            f"{rec_summary}"
         )
 
         sop_text = ""

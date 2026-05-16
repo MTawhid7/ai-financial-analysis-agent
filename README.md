@@ -22,6 +22,7 @@ A **conversational AI financial analyst** with Google authentication, persistent
 | Upload XLSX, DOCX, PDF, CSV, TXT, MD, JSON | Immediate summary + background PageIndex deep-indexing |
 | *"What does page 47 of the uploaded report say?"* | PageIndex returns that exact page with citation |
 | *"Find the revenue table in my annual report"* | Hybrid vector+FTS search → page-level result |
+| *"Analyse AAPL"* (enhanced) | 7 yfinance data types: price + fundamentals + cash flow + earnings + risk metrics + quarterly trend + dividend history |
 
 ---
 

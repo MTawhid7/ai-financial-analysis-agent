@@ -146,6 +146,40 @@ def _make_mock_ticker(
         mock.calendar       = {}
         mock.earnings_dates = pd.DataFrame()
 
+    # Quarterly financials for financials_trend data type
+    mock.quarterly_financials = pd.DataFrame(
+        {
+            "2024-09-01": {"Total Revenue": 94_930_000_000, "Net Income": 14_736_000_000, "Gross Profit": 43_881_000_000},
+            "2024-06-01": {"Total Revenue": 85_777_000_000, "Net Income": 21_448_000_000, "Gross Profit": 39_673_000_000},
+            "2024-03-01": {"Total Revenue": 90_753_000_000, "Net Income": 23_636_000_000, "Gross Profit": 42_270_000_000},
+            "2023-12-01": {"Total Revenue": 119_575_000_000, "Net Income": 33_916_000_000, "Gross Profit": 56_995_000_000},
+            "2023-09-01": {"Total Revenue": 89_498_000_000, "Net Income": 22_956_000_000, "Gross Profit": 40_428_000_000},
+        }
+    )
+    mock.quarterly_balance_sheet = pd.DataFrame(
+        {
+            "2024-09-01": {"Cash And Cash Equivalents": 29_965_000_000, "Total Debt": 104_590_000_000, "Stockholders Equity": 56_950_000_000},
+            "2024-06-01": {"Cash And Cash Equivalents": 32_695_000_000, "Total Debt": 101_304_000_000, "Stockholders Equity": 66_708_000_000},
+        }
+    )
+
+    # Dividend history (pd already imported at top of file)
+    mock.dividends = pd.Series(
+        [0.24, 0.24, 0.25, 0.25, 0.25, 0.26, 0.26, 0.26],
+        index=pd.date_range("2023-02-10", periods=8, freq="92D"),
+    )
+
+    # Analyst recommendations
+    mock.recommendations = pd.DataFrame(
+        {
+            "Firm":       ["Goldman Sachs", "Morgan Stanley", "Barclays"],
+            "To Grade":   ["Buy", "Overweight", "Equal Weight"],
+            "From Grade": ["Neutral", "Equal Weight", "Equal Weight"],
+            "Action":     ["up", "up", "main"],
+        },
+        index=pd.date_range("2024-09-01", periods=3, freq="-30D"),
+    )
+
     return mock
 
 
@@ -246,6 +280,60 @@ class TestYahooFinanceTool:
         assert data["next_earnings_date"] is not None
         assert isinstance(data["earnings_surprises"], list)
         assert len(data["earnings_surprises"]) > 0
+
+    def test_cash_flow_includes_dividend_history(self, mock_cache, mock_ticker_cls):
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock_ticker_cls.return_value = _make_mock_ticker()
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "cash_flow"})
+        data   = json.loads(result)
+
+        assert data["dividend_history"] is not None
+        assert "recent_payments" in data["dividend_history"]
+        assert len(data["dividend_history"]["recent_payments"]) > 0
+        assert "annual_totals" in data["dividend_history"]
+        assert "dividend_cagr_3y_pct" in data["dividend_history"]
+
+    def test_fundamentals_includes_recommendations(self, mock_cache, mock_ticker_cls):
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock_ticker_cls.return_value = _make_mock_ticker()
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "fundamentals"})
+        data   = json.loads(result)
+
+        assert data["analyst_recommendations"] is not None
+        recs = data["analyst_recommendations"]
+        assert "recent" in recs
+        assert "sentiment_counts" in recs
+        sc = recs["sentiment_counts"]
+        assert "positive" in sc and "neutral" in sc and "negative" in sc
+
+    def test_financials_trend_success(self, mock_cache, mock_ticker_cls):
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock_ticker_cls.return_value = _make_mock_ticker()
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "financials_trend"})
+        data   = json.loads(result)
+
+        assert data["data_type"]    == "financials_trend"
+        assert "income_trend"  in data
+        assert "balance_trend" in data
+        it = data["income_trend"]
+        assert len(it) >= 2
+        assert "quarter"    in it[0]
+        assert "revenue"    in it[0]
+        assert "net_income" in it[0]
+
+    def test_financials_trend_has_yoy_growth(self, mock_cache, mock_ticker_cls):
+        mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)
+        mock_ticker_cls.return_value = _make_mock_ticker()
+
+        result = yahoo_finance_tool.invoke({"ticker": "AAPL", "data_type": "financials_trend"})
+        data   = json.loads(result)
+
+        # The mock has 5 quarters, so YoY growth should be computable for Q0
+        it = data["income_trend"]
+        assert any("revenue_yoy_pct" in q for q in it), "YoY growth should be present when 5 quarters available"
 
     def test_returns_error_on_exception(self, mock_cache, mock_ticker_cls):
         mock_cache.get_or_fetch.side_effect = lambda tool, args, fn, **kw: (fn(), False)

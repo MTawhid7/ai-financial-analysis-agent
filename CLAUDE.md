@@ -175,6 +175,23 @@ Documents are either `scope='user'` (private, `user_id` required) or `scope='sys
 ### Required env vars for PageIndex
 `ADMIN_USER_IDS` — comma-separated list of user IDs or emails that can call `/admin/*` endpoints. Leave empty to disable admin access. `UPLOAD_DIR` — directory for raw file storage (default `.uploads`).
 
+### Yahoo Finance Data Layer — 7 Data Types
+The `yahoo_finance` tool exposes seven data types, each cached at the appropriate TTL:
+
+| data_type | TTL | Contents |
+|---|---|---|
+| `price_history` | 15 min | Adjusted OHLCV (split+dividend), true 52-week High/Low, freshness warning |
+| `fundamentals` | 6 h | 25+ fields: PE, EV/EBITDA, P/B, margins, ROE/ROA, analyst targets + recommendations |
+| `balance_sheet` | 24 h | Assets, liabilities, equity, net debt, derived current/quick ratios |
+| `cash_flow` | 24 h | OCF, FCF, capex, D&A, FCF yield, cash-conversion ratio, dividend history |
+| `earnings` | 6 h | Next earnings date, EPS estimate, 8-quarter surprise history |
+| `price_metrics` | 6 h | Sharpe, Sortino, max drawdown, beta vs S&P 500, volatility, relative CAGR |
+| `financials_trend` | 24 h | Quarterly revenue/income with QoQ + YoY growth, quarterly balance sheet snapshots |
+
+Free supplementary sources (no new API keys):
+- `market_data.py` — `get_risk_free_rate()` via `^TNX`, `get_sp500_data()` via `^GSPC`
+- `benchmark_lookup.py` — Damodaran sector multiples (P/E, EV/EBITDA, P/B, P/S, margin, beta) fetched from NYU Stern HTML, 30-day cache, static JSON fallback
+
 ---
 
 ## Package Versions (Pinned)

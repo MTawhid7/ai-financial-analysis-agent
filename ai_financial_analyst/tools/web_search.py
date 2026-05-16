@@ -16,7 +16,7 @@ from langchain_tavily import TavilySearch
 from langchain_core.tools import tool
 from pydantic import Field
 
-from ..core.cache import ResultCache
+from ..core.cache import ResultCache, TTL_WEB_SEARCH
 from ..core.sanitizer import ContentSanitizer, build_sanitizer
 from .base import StrictToolInput, safe_tool_call
 
@@ -55,7 +55,7 @@ def web_search_tool(query: str, max_results: int = 3) -> str:
     def _fetch():
         return _search_and_sanitize(query, max_results)
 
-    result, hit = _cache.get_or_fetch("web_search", args, _fetch)
+    result, hit = _cache.get_or_fetch("web_search", args, _fetch, ttl=TTL_WEB_SEARCH)
     if hit:
         logger.debug("Web search cache HIT query=%s", query[:60])
     return result

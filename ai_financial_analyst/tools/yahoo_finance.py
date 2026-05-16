@@ -1,12 +1,13 @@
 """YahooFinanceTool — comprehensive financial data via yfinance (free tier).
 
-Six data types, each with the appropriate cache TTL:
-  price_history   — adjusted OHLCV, true 52-week window, data freshness flag
-  fundamentals    — 25+ metrics: PE, EV/EBITDA, P/B, margins, ROE/ROA, analyst targets
-  balance_sheet   — assets, liabilities, equity, cash, debt ratios
-  cash_flow       — OCF, FCF, capex, D&A, FCF yield, cash-conversion ratio
-  earnings        — next earnings date, trailing EPS surprises
-  price_metrics   — Sharpe, Sortino, max drawdown, beta, volatility, relative CAGR
+Seven data types, each with the appropriate cache TTL:
+  price_history      — adjusted OHLCV, true 52-week window, data freshness flag
+  fundamentals       — 25+ metrics + analyst recommendations (upgrade/downgrade history)
+  balance_sheet      — assets, liabilities, equity, cash, debt ratios
+  cash_flow          — OCF, FCF, capex, D&A, FCF yield, dividend payment history
+  earnings           — next earnings date, trailing EPS surprises
+  price_metrics      — Sharpe, Sortino, max drawdown, beta, volatility, relative CAGR
+  financials_trend   — quarterly income statement + balance sheet trend (last 4 quarters)
 
 All data is cached with type-appropriate TTLs (15 min for prices, 24 h for financials).
 """
@@ -43,17 +44,19 @@ class YahooFinanceInput(StrictToolInput):
         "cash_flow",
         "earnings",
         "price_metrics",
+        "financials_trend",
     ] = Field(description="Type of financial data to retrieve")
 
 
 # Map data_type → cache TTL
 _TYPE_TTL = {
-    "price_history":  TTL_PRICE,
-    "fundamentals":   TTL_FUNDAMENTALS,
-    "balance_sheet":  TTL_FINANCIALS,
-    "cash_flow":      TTL_FINANCIALS,
-    "earnings":       TTL_FUNDAMENTALS,
-    "price_metrics":  TTL_FUNDAMENTALS,
+    "price_history":    TTL_PRICE,
+    "fundamentals":     TTL_FUNDAMENTALS,
+    "balance_sheet":    TTL_FINANCIALS,
+    "cash_flow":        TTL_FINANCIALS,
+    "earnings":         TTL_FUNDAMENTALS,
+    "price_metrics":    TTL_FUNDAMENTALS,
+    "financials_trend": TTL_FINANCIALS,
 }
 
 
@@ -99,6 +102,8 @@ def _fetch_data(ticker: str, data_type: str) -> str:
             return _earnings(stock, ticker, ts)
         if data_type == "price_metrics":
             return _price_metrics(stock, ticker, ts)
+        if data_type == "financials_trend":
+            return _financials_trend(stock, ticker, ts)
 
         return ToolError(
             error_type=ErrorType.TOOL_ERROR,
@@ -247,10 +252,12 @@ def _fundamentals(stock: yf.Ticker, ticker: str, ts: str) -> str:
         "company_name":     info.get("longName"),
         "employees":        info.get("fullTimeEmployees"),
         # Analyst consensus (aggregate — single-source, directional only)
-        "analyst_target_mean": _sf(apt.get("mean")),
-        "analyst_target_high": _sf(apt.get("high")),
-        "analyst_target_low":  _sf(apt.get("low")),
+        "analyst_target_mean":   _sf(apt.get("mean")),
+        "analyst_target_high":   _sf(apt.get("high")),
+        "analyst_target_low":    _sf(apt.get("low")),
         "analyst_target_median": _sf(apt.get("median")),
+        # Analyst upgrade/downgrade history (last 10 actions)
+        "analyst_recommendations": _analyst_recommendations(stock),
     })
 
 
@@ -368,6 +375,42 @@ def _cash_flow(stock: yf.Ticker, ticker: str, ts: str) -> str:
     except Exception:
         pass
 
+    # Dividend payment history (date-indexed series of per-share amounts)
+    dividend_history = None
+    try:
+        divs = stock.dividends
+        if divs is not None and not divs.empty:
+            cutoff = divs.index[-1] - timedelta(days=365 * 3)
+            recent = divs[divs.index >= cutoff]
+
+            # Annual totals per calendar year
+            annual: dict[str, float] = {}
+            for dt, amt in recent.items():
+                yr = str(dt.year)
+                annual[yr] = round(annual.get(yr, 0.0) + float(amt), 4)
+
+            # Dividend CAGR across available annual totals
+            div_cagr = None
+            years = sorted(annual.keys())
+            if len(years) >= 2:
+                oldest, newest = annual[years[0]], annual[years[-1]]
+                n = len(years) - 1
+                if oldest > 0 and n > 0:
+                    div_cagr = round(((newest / oldest) ** (1 / n) - 1) * 100, 2)
+
+            dividend_history = {
+                "recent_payments": [
+                    {"date": str(dt)[:10], "amount": round(float(amt), 4)}
+                    for dt, amt in recent.iloc[-8:].items()
+                ],
+                "annual_totals":         annual,
+                "most_recent_date":      str(divs.index[-1])[:10],
+                "most_recent_amount":    round(float(divs.iloc[-1]), 4),
+                "dividend_cagr_3y_pct":  div_cagr,
+            }
+    except Exception:
+        pass
+
     return json.dumps({
         "ticker":                  ticker,
         "data_type":               "cash_flow",
@@ -379,7 +422,8 @@ def _cash_flow(stock: yf.Ticker, ticker: str, ts: str) -> str:
         "change_in_working_capital": wc,
         "fcf_yield":               fcf_yield,
         "cash_conversion_ratio":   cash_conversion,
-        "ocf_4yr_trend":           ocf_trend,  # oldest→newest order in yfinance is reversed
+        "ocf_4yr_trend":           ocf_trend,
+        "dividend_history":        dividend_history,
     })
 
 
@@ -523,6 +567,127 @@ def _price_metrics(stock: yf.Ticker, ticker: str, ts: str) -> str:
         "risk_free_rate_used":  round(rfr_annual * 100, 3),
         "data_period_years":    round(n_years, 1),
     })
+
+
+# ---------------------------------------------------------------------------
+# 7. Quarterly financial trends — income statement + balance sheet
+# ---------------------------------------------------------------------------
+
+def _financials_trend(stock: yf.Ticker, ticker: str, ts: str) -> str:
+    """Last 4 quarters of revenue/earnings + balance sheet snapshots."""
+    qf  = stock.quarterly_financials
+    qbs = stock.quarterly_balance_sheet
+
+    income_trend: list[dict] = []
+    if qf is not None and not qf.empty:
+        rev_row = _get_row(qf, "Total Revenue", "Revenue")
+        ni_row  = _get_row(qf, "Net Income")
+        gp_row  = _get_row(qf, "Gross Profit")
+
+        cols = list(qf.columns[:5])   # up to 5 quarters — need 4 + 1 for YoY
+        for i, col in enumerate(cols[:4]):
+            entry: dict = {"quarter": str(col)[:10]}
+            rev = _sf(rev_row[col]) if rev_row is not None and col in rev_row.index else None
+            ni  = _sf(ni_row[col])  if ni_row  is not None and col in ni_row.index  else None
+            gp  = _sf(gp_row[col])  if gp_row  is not None and col in gp_row.index  else None
+            entry["revenue"]    = rev
+            entry["net_income"] = ni
+
+            # Gross margin
+            if rev and gp and rev != 0:
+                entry["gross_margin_pct"] = round(gp / rev * 100, 2)
+
+            # Net margin
+            if rev and ni and rev != 0:
+                entry["net_margin_pct"] = round(ni / rev * 100, 2)
+
+            # QoQ revenue growth (vs previous quarter)
+            if i + 1 < len(cols) and rev_row is not None:
+                prev_col = cols[i + 1]
+                prev_rev = _sf(rev_row[prev_col]) if prev_col in rev_row.index else None
+                if rev and prev_rev and prev_rev != 0:
+                    entry["revenue_qoq_pct"] = round((rev - prev_rev) / abs(prev_rev) * 100, 2)
+
+            # YoY revenue growth (vs same quarter prior year, index 4)
+            yoy_col_idx = i + 4
+            if yoy_col_idx < len(cols) and rev_row is not None:
+                yoy_col = cols[yoy_col_idx]
+                yoy_rev = _sf(rev_row[yoy_col]) if yoy_col in rev_row.index else None
+                if rev and yoy_rev and yoy_rev != 0:
+                    entry["revenue_yoy_pct"] = round((rev - yoy_rev) / abs(yoy_rev) * 100, 2)
+
+            income_trend.append(entry)
+
+    balance_trend: list[dict] = []
+    if qbs is not None and not qbs.empty:
+        cash_row  = _get_row(qbs, "Cash And Cash Equivalents",
+                             "Cash Cash Equivalents And Short Term Investments")
+        debt_row  = _get_row(qbs, "Total Debt", "Long Term Debt")
+        eq_row    = _get_row(qbs, "Stockholders Equity")
+        for col in list(qbs.columns[:4]):
+            entry = {"quarter": str(col)[:10]}
+            if cash_row is not None and col in cash_row.index:
+                entry["cash"] = _sf(cash_row[col])
+            if debt_row is not None and col in debt_row.index:
+                entry["total_debt"] = _sf(debt_row[col])
+            if eq_row is not None and col in eq_row.index:
+                entry["equity"] = _sf(eq_row[col])
+            balance_trend.append(entry)
+
+    if not income_trend and not balance_trend:
+        return _null(ticker, "financials_trend", "Quarterly financials unavailable")
+
+    return json.dumps({
+        "ticker":           ticker,
+        "data_type":        "financials_trend",
+        "data_timestamp":   ts,
+        "income_trend":     income_trend,    # newest quarter first
+        "balance_trend":    balance_trend,   # newest quarter first
+    })
+
+
+# ---------------------------------------------------------------------------
+# Analyst recommendations helper
+# ---------------------------------------------------------------------------
+
+def _analyst_recommendations(stock: yf.Ticker) -> dict | None:
+    """Return last 10 analyst upgrade/downgrade actions with sentiment summary."""
+    try:
+        recs = stock.recommendations
+        if recs is None or recs.empty:
+            return None
+
+        def _sentiment(grade: str) -> str:
+            g = grade.lower()
+            if any(k in g for k in ("buy", "overweight", "outperform", "strong buy",
+                                    "positive", "add", "accumulate")):
+                return "positive"
+            if any(k in g for k in ("sell", "underweight", "underperform", "reduce",
+                                    "negative", "strong sell")):
+                return "negative"
+            return "neutral"
+
+        counts = {"positive": 0, "neutral": 0, "negative": 0}
+        recent: list[dict] = []
+        for dt, row in recs.tail(10).iterrows():
+            to_grade   = str(row.get("To Grade",   row.get("toGrade",   "")))
+            from_grade = str(row.get("From Grade", row.get("fromGrade", "")))
+            firm       = str(row.get("Firm",       row.get("firm",      "")))
+            action     = str(row.get("Action",     row.get("action",    "")))
+            s = _sentiment(to_grade)
+            counts[s] += 1
+            recent.append({
+                "date":       str(dt)[:10],
+                "firm":       firm,
+                "from_grade": from_grade,
+                "to_grade":   to_grade,
+                "action":     action,
+                "sentiment":  s,
+            })
+
+        return {"recent": recent, "sentiment_counts": counts}
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
