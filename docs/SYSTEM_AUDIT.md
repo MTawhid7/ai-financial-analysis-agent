@@ -1,8 +1,10 @@
-# System Audit Report: Naive & Underdeveloped Implementations
+# System Audit Report: Implementation Status
 
-**Date:** 2026-05-15  
+**Original audit date:** 2026-05-15  
+**Last updated:** 2026-05-16  
 **Scope:** Full pipeline — data layer, LLM infrastructure, memory, orchestration, security, charts, PageIndex  
-**Purpose:** Identify components where current implementations are simplistic relative to industry standards, as a basis for prioritised redesign.
+
+Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 
 ---
 
@@ -10,35 +12,27 @@
 
 ### 1.1 Yahoo Finance Tool (`tools/yahoo_finance.py`)
 
-**Current:** Single-source yfinance wrapper returning a static snapshot of fundamentals and a 5-year weekly close series.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **No adjusted close prices** | Uses raw `Close` throughout. Stock splits and dividends distort historical analysis — a 4:1 split makes the price look like it fell 75%. | Bloomberg, FactSet always distinguish `Close` vs `Adj Close`; adjusted is the default for return calculations |
-| **Stale `info` dict** | `stock.info` is cached by Yahoo's CDN and can be 15–24 hours old. No timestamp validation or freshness check | Real-time feeds (IEX, Polygon.io) carry explicit `lastUpdated` timestamps and warn on stale data |
-| **Missing cash flow data** | Operating CF, free cash flow, capex are absent despite being core to DCF valuation and quality-of-earnings analysis | Every professional terminal exposes cash flow as a first-class data type alongside income statement |
-| **No forward estimates** | Only trailing P/E; no forward P/E, consensus EPS estimates, revenue estimates, or analyst target prices | FactSet Estimates, Bloomberg Consensus pull from 30+ sell-side firms for a forward view |
-| **Silent data degradation** | Falls back from 5y → 2y → 1y without notifying the agent or the user | Production data pipelines surface data quality grades ("FULL", "PARTIAL", "ESTIMATED") to consumers |
-| **No dividend data** | Yield, ex-dates, payout ratio absent | Critical for income-focused analysis; yield-on-cost changes with price but payout ratio doesn't |
-| **52-week window is approximate** | `prices[-252:]` assumes exactly 252 trading days per calendar year — off by 2–5 days | Use `.loc[date - timedelta(365):]` for a true 52-week window |
-| **No corporate event timeline** | No earnings dates, stock split history, share buyback announcements | Bloomberg Events timeline overlays these on price charts and warns analysts before earnings |
-
-**Severity: HIGH** — Stale data and missing cash flow materially affect report quality.
+| No adjusted close prices | ✅ | `auto_adjust=True` throughout; split+dividend adjusted OHLCV |
+| Stale `info` dict | ✅ | Uses `fast_info.last_price` for price; `TTL_PRICE=15m`, `TTL_FUNDAMENTALS=6h` per data type |
+| Missing cash flow data | ✅ | `cash_flow` data type: OCF, FCF, capex, D&A, FCF yield, cash-conversion ratio, dividend history |
+| No forward estimates | ✅ | `analyst_target_mean/high/low`, forward P/E in `fundamentals`; earnings EPS estimates in `earnings` |
+| Silent data degradation | ⚠️ | Data gaps surfaced in `researcher_gaps` and coverage report; fallback periods not yet surfaced as a quality grade |
+| No dividend data | ✅ | Dividend history (payments, annual totals, 3Y CAGR) in `cash_flow` data type |
+| 52-week window is approximate | ✅ | Uses `timedelta(365)` for true 52-week window, not `prices[-252:]` |
+| No corporate event timeline | ⚠️ | Next earnings date in `earnings` data type; stock split history / buyback announcements not included |
 
 ---
 
 ### 1.2 Benchmark Lookup (`tools/benchmark_lookup.py`)
 
-**Current:** A static JSON file loaded once at import time containing approximate 2024 sector P/E averages.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **Static data, zero refresh** | Values are frozen at one point in time. P/E multiples shift dramatically in rate cycles (S&P P/E: 38x in 2021, 18x in late 2022) | Damodaran's dataset is updated annually; Bloomberg recomputes sector multiples daily |
-| **Only P/E** | Lacks EV/EBITDA, Price/Book, Price/Sales, EV/Revenue, FCF yield by sector | A proper relative valuation uses 4–6 multiples, not one |
-| **No fuzzy sector matching** | Exact case-insensitive match only; "Consumer Discretionary" vs "Consumer" silently returns an error | Production systems use fuzzy string matching (edit distance) with a fallback hierarchy |
-| **No geographic segmentation** | Global sector benchmarks are very different from US-only ones. A Chinese tech company benchmarked against US tech is misleading | Bloomberg allows filtering by region, country, and GICS sub-sector |
-
-**Severity: HIGH** — Single stale multiple renders relative valuation unreliable.
+| Static data, zero refresh | ✅ | Live-fetched from Damodaran NYU Stern HTML (6 URLs); 30-day cache; static JSON fallback |
+| Only P/E | ✅ | Returns 7 multiples: trailing PE, forward PE, EV/EBITDA, P/B, P/S, operating margin %, beta |
+| No fuzzy sector matching | ❌ | `_normalise_sector()` is exact case-insensitive match only; "Consumer" vs "Consumer Discretionary" silently returns None |
+| No geographic segmentation | ❌ | US-only Damodaran data; no region/country filter |
 
 ---
 
@@ -46,34 +40,28 @@
 
 ### 2.1 Quant Analyst (`agents/quant_analyst.py`)
 
-**Current:** Calculates CAGR via string-interpolated numexpr expression and P/E premium against one static benchmark. Sends analysis to Flash for bull/bear case generation.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **Only price CAGR** | 5-year price return without dividends is Total Return Shareholder Value (TRSV) only if dividends are zero | Analysts use Total Return (price + dividends reinvested), not price-only CAGR |
-| **No risk-adjusted metrics** | No Sharpe ratio, Sortino ratio, max drawdown, or beta. "Strong 15% CAGR" looks different at Sharpe 0.3 vs 1.8 | Risk-adjusted return is the primary performance metric in institutional analysis |
-| **No DCF framework** | Valuation is entirely multiple-based. No intrinsic value estimate | A complete buy-side note includes at least a back-of-envelope DCF with explicit assumptions |
-| **Bull/bear cases are LLM-generated narrative** | The LLM invents bull/bear scenarios without checking them against historical volatility, analyst estimates, or stress scenarios | Buy-side bull/bear cases are anchored to specific catalysts with quantified price targets |
-| **LLM response parsing is brittle** | Manual markdown fence stripping: `.split("```", 2)[1]`. If the LLM changes formatting, parsing silently fails and cases are empty | Use structured outputs (JSON mode / tool-use) to enforce schema; never parse free-form LLM text for structured data |
-| **Hardcoded sector taxonomy** | Static `_YFINANCE_TO_GICS` dict; if yfinance renames a sector, falls back to the original name silently | GICS is the standard — map to it definitively, not aspirationally |
-| **No scenario analysis** | Single-point estimate only. No sensitivity analysis on key assumptions | Scenario analysis (base/bull/bear P/E × earnings range) is standard in equity research |
-
-**Severity: HIGH** — Missing risk adjustment means the agent consistently presents returns without context.
+| Only price CAGR | ✅ | Total-return CAGR (adjusted for splits+dividends) read from `price_metrics.total_return_cagr_pct`; raw-price fallback via calculator |
+| No risk-adjusted metrics | ✅ | Sharpe, Sortino, max drawdown, beta vs S&P 500, volatility — all read from `price_metrics` |
+| No DCF framework | ❌ | Valuation remains entirely multiple-based; no intrinsic value estimate |
+| Bull/bear are LLM narrative | ⚠️ | Now anchored to actual data (Sharpe, FCF yield, P/E vs sector, analyst sentiment counts, quarterly momentum); still LLM-generated prose, not quantified price targets |
+| LLM response parsing is brittle | ⚠️ | System prompt instructs JSON-only output; markdown fence stripping (`split("```", 2)`) is still present as a fallback; `.with_structured_output()` not used |
+| Hardcoded sector taxonomy | ⚠️ | `_YFINANCE_TO_GICS` covers 11 sectors; incomplete (e.g. REITs); yfinance sector name changes would silently fall through |
+| No scenario analysis | ❌ | Single-point estimate only; no sensitivity analysis on P/E × earnings range |
 
 ---
 
 ### 2.2 Calculator Tool (`tools/calculator.py`)
 
-**Current:** AST-validated numexpr evaluator. Safe but minimal.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **No financial formula library** | Must construct every formula as a string expression. No `pv()`, `fv()`, `npv()`, `irr()` | Excel's financial functions are the baseline expectation for any financial calculator |
-| **Rounding inconsistency** | Hardcoded 6 decimal places; analysts expect 2 for percentages, 0 for share counts, 2 for currency | Professional calculation engines carry full precision internally and format on output |
-| **No unit tracking** | `200 * 1e6 / 100` is correct only if inputs are in the same unit. No dimension checking | QuantLib and Bloomberg carry units through calculations |
-| **No result range validation** | Returns `1e308` (float overflow) silently; division-by-zero produces `nan` without warning | Any value outside plausible financial range should raise with explanation |
+| No financial formula library | ❌ | Still string-expression numexpr only; no `pv()`, `fv()`, `npv()`, `irr()` |
+| Rounding inconsistency | ❌ | Hardcoded 6 decimal places; no per-type formatting |
+| No unit tracking | ❌ | No dimension checking |
+| No result range validation | ❌ | Float overflow / NaN returned silently |
 
-**Severity: MEDIUM** — Current scope is narrow but safe; adding financial functions would be high value.
+**Severity: MEDIUM — Narrow scope but safe; financial functions would add value.**
 
 ---
 
@@ -81,33 +69,25 @@
 
 ### 3.1 Researcher Agent (`agents/researcher.py`)
 
-**Current:** LangGraph ReAct loop calling yfinance (3×), web search (1×), benchmark lookup. Max 5 iterations.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **Hardcoded year in news query** | `"2024"` is baked into the search query; will produce zero results in 2026 | Dynamic `datetime.now().year` or a recency parameter |
-| **No adaptive iteration** | Hard stop at 5 regardless of data completeness; also never terminates early if data is already complete | ReAct agents should terminate when a coverage threshold is met, not at a fixed iteration count |
-| **No multi-source reconciliation** | Takes the first tool result for each data type. If yfinance returns stale data and web search has fresher info, only yfinance is used | Bloomberg reconciles from 50+ sources and surfaces discrepancies |
-| **Token estimation** | `len(string) // 4` for all text. Off by 2–3× for JSON, markdown, non-ASCII | Use `tiktoken` or the model provider's tokenization endpoint |
-| **No data freshness labeling** | No `data_as_of` timestamp propagated to the report | Every Bloomberg terminal quote shows "Last Updated" |
-
-**Severity: MEDIUM** — The hardcoded year is an imminent bug; adaptive termination would improve quality.
+| Hardcoded year in news query | ✅ | `_current_year()` → `datetime.utcnow().year` |
+| No adaptive iteration | ⚠️ | `MAX_ITERATIONS=10` (raised from 5); still no early-exit when coverage threshold met |
+| No multi-source reconciliation | ❌ | First yfinance result used for each data type; no cross-source validation |
+| Token estimation | ⚠️ | `len(string) // 4` still used in researcher's iteration log; short_term memory now uses content-type-aware estimate |
+| No data freshness labeling | ⚠️ | `data_timestamp` field present in price_history; other types do not carry `as_of` timestamps |
 
 ---
 
 ### 3.2 Web Search Tool (`tools/web_search.py`)
 
-**Current:** Tavily primary, DuckDuckGo fallback. Results sanitized by regex filter and cached 4 hours.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **4-hour cache on financial news** | A 4-hour cache means post-earnings moves, analyst upgrades, and M&A announcements are missed entirely | Financial news should have ≤15-minute TTL; general reference content can be 24h |
-| **No source credibility scoring** | Reuters and a stock-forum post are treated identically | Refinitiv and Bloomberg weight sources by publication tier (Tier 1: Reuters/AP; Tier 2: regional; Tier 3: unverified) |
-| **No date filtering on results** | Tavily can return 2019 articles as equally relevant | Query should include a `published_after` constraint or post-filter by `date` field |
-| **Sanitizer fallback leaks raw text** | When `subllm is None`, extraction returns the first 200 chars of raw HTML | Security bypass: raw injected content reaches the agent if LLM extraction is unavailable |
-| **`search_depth="basic"` is silent downgrade** | Code comment says "advanced" returns empty arrays, so always uses basic. No alerting, no retry with different query | Should log a warning and attempt query reformulation before accepting lower-quality results |
-
-**Severity: HIGH** — 4-hour cache for financial news is a correctness issue, not just a performance tradeoff.
+| 4-hour cache on financial news | ✅ | `TTL_WEB_SEARCH = 1h` (from 4h); `get_or_fetch(..., ttl=TTL_WEB_SEARCH)` wired correctly |
+| No source credibility scoring | ❌ | All results ranked equally by Tavily score; no publication-tier weighting |
+| No date filtering on results | ❌ | No `published_after` constraint; stale articles can still be returned |
+| Sanitizer fallback leaks raw text | ✅ | Fallback stub returns `key_facts=[]` — no raw content reaches the agent |
+| `search_depth="basic"` is silent downgrade | ❌ | Still hardcoded to `"basic"`; no retry with query reformulation |
 
 ---
 
@@ -115,34 +95,26 @@
 
 ### 4.1 LLM Client (`core/llm.py`)
 
-**Current:** Gemini Flash primary, Flash-Lite fallback. Tenacity retry with exponential jitter. 3×429 circuit breaker within 30 seconds.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **Circuit breaker window too short** | 3 errors within 30 seconds trips the breaker. A single 5-second cluster of transient 429s permanently degrades the session to Flash-Lite | Standard circuit breaker windows are 60–120 seconds; recovery probe attempts before permanent downgrade |
-| **No recovery from Flash-Lite** | Once tripped, the session never tries Flash again, even if the rate limit has cleared | Proper half-open state: after 60s, probe primary once; if succeeds, close breaker |
-| **Streaming/non-streaming mismatch** | Primary uses `streaming=True`, fallback uses `streaming=False`. If primary fails mid-stream, downstream code may break on non-streamed format | Both should use the same output protocol, or a stream adapter wraps the fallback |
-| **Hardcoded model names** | `"gemini-3-flash-preview"` — if Google renames or retires the model, the entire system breaks silently | Model registry with version pinning + fallback list: `[primary, fallback_v1, fallback_v2]` |
-| **No per-call timeout** | A streaming call that hangs blocks indefinitely | `asyncio.wait_for(call, timeout=120)` with a graceful abort |
-| **No token counting** | All rate-limit logic is request-based, but Gemini's actual quota is token-based | Track approximate token usage to prevent quota exhaustion before the API rejects requests |
-
-**Severity: HIGH** — The circuit breaker is too sensitive and has no recovery mechanism.
+| Circuit breaker window too short / no recovery | ✅ | 5×429/60s threshold; half-open state with 60s probe delay; `probe_succeeded()` / `probe_failed()` |
+| No recovery from Flash-Lite | ✅ | Probe success resets breaker to CLOSED; full-quality Flash restored automatically |
+| Streaming/non-streaming mismatch | ⚠️ | Primary `streaming=True`, fallback `streaming=False` — intentionally different; downstream streaming SSE handles both via `content_to_str()`; no stream adapter |
+| Hardcoded model names | ❌ | `_PRIMARY_MODEL = "gemini-3-flash-preview"`, `_SUB_MODEL = "gemini-3.1-flash-lite-preview"` — hardcoded constants; no model registry |
+| No per-call timeout | ✅ | `asyncio.wait_for(coro, timeout=120s)` in `ainvoke()`; sync `invoke()` lacks a timeout |
+| No token counting | ❌ | All rate-limit logic is request-based; no token accumulation or token-weighted quota management |
 
 ---
 
 ### 4.2 Budget Tracker (`core/budget_tracker.py`)
 
-**Current:** Counts API calls. Warns at 80%. Tracks primary vs sub-LLM calls separately.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **Counts requests, not cost** | A 50-token Flash call and a 4000-token Flash call count the same | Cost tracking should be token-weighted: `cost += input_tokens × price_in + output_tokens × price_out` |
-| **Daily budget, not per-minute** | Gemini's critical limit is RPM (15/minute free tier), not daily total | Alert at 80% of per-minute RPM, not per-day RPC |
-| **80% alert too late** | By the time the warning fires, the next request may already be rate-limited | Alert at 60% (soft warning), 80% (hard warning), 95% (activate caching/deferral mode) |
-| **No per-tool budgeting** | Web searches and main reasoning calls share the same pool | Professional ML systems assign per-tool budgets: "max 3 Tavily calls per query" |
-| **Cache hit recording is no-op** | `record_cache_hit()` logs but doesn't subtract from the budget pool | A cache hit should free budget for another real call |
-
-**Severity: MEDIUM** — Not a correctness issue currently (free tier), but blocks any real cost management.
+| Counts requests, not cost | ❌ | Still call-counting; no token-weighted cost model |
+| Daily budget, not per-minute | ✅ | `_RpmBucket` tracks rolling 60s window; warns when `current_rpm > 15/30`; `primary_rpm_current` / `sub_rpm_current` in `get_stats()` |
+| 80% alert too late / only one threshold | ❌ | Single 80% threshold; no 60% soft warning or 95% deferral mode |
+| No per-tool budgeting | ❌ | All calls share one pool |
+| Cache hit recording is no-op | ❌ | `record_cache_hit()` increments counter but doesn't adjust budget |
 
 ---
 
@@ -150,48 +122,36 @@
 
 ### 5.1 Long-Term Memory (`memory/long_term.py`)
 
-**Current:** Postgres tables for preferences, analysis summaries, conversations, messages. Retrieval via SQL `LIKE %query%`.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **Keyword-only retrieval** | `search_summaries` uses `LIKE %query%` on ticker names and summary text. "profit margins" won't match "earnings quality" | Hybrid retrieval: BM25 for sparse + semantic embeddings for dense; merge with RRF |
-| **No preference versioning** | A preference is upserted — old value is gone forever | Track `(key, value, created_at, superseded_at)` to show preference evolution |
-| **No preference conflict resolution** | "I prefer aggressive analysis" + "I prefer conservative picks" can coexist. Latest wins, silently | A conflict resolution step should surface the contradiction and ask the user |
-| **Summaries never expire or decay** | A 2-year-old analysis summary about a company that has since been acquired is still returned with equal weight | Time-decay scoring: recent memories weighted higher; very old ones flagged as potentially stale |
-| **Only 2 summaries returned for context** | Hardcoded `limit=2` in `build_memory_context` | Should be relevance-ranked and size-adaptive (fit as many summaries as the context window allows) |
-
-**Severity: MEDIUM** — Keyword retrieval limits the value of the memory system for complex queries.
+| Keyword-only retrieval | ✅ | Semantic search: Gemini `text-embedding-004` embeddings stored as `embedding_json`; cosine similarity in Python; LIKE fallback for un-embedded rows |
+| No preference versioning | ❌ | Preferences upserted in place; no `(key, value, created_at, superseded_at)` history |
+| No preference conflict resolution | ❌ | Contradictory preferences coexist silently; latest wins |
+| Summaries never expire or decay | ❌ | Uniform weight regardless of age; no time-decay scoring |
+| Only 2 summaries for context | ❌ | `limit=2` hardcoded in `memory_manager.py:build_memory_context()`; not size-adaptive |
 
 ---
 
-### 5.2 Short-Term Memory / Context Window (`memory/short_term.py`)
+### 5.2 Short-Term Memory (`memory/short_term.py`)
 
-**Current:** Fixed 3000-token budget. Walks backward through messages, truncates older ones.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **No real tokenizer** | `len(content) // 4` char-to-token estimate. Actual: JSON is ~2 chars/token; code is ~3; prose is ~4; non-ASCII is ~1–2 | Use `langchain_google_genai`'s `count_tokens()` method or Gemini's native token counter |
-| **No message priority** | A critical error message from turn 1 and a filler "OK." from turn 10 are equally truncated | Priority-based windowing: system messages → recent assistant responses → recent user messages → older messages |
-| **Drops messages wholesale** | Either a message is fully included or fully excluded | Hierarchical summarization: condense old messages to a summary paragraph instead of dropping them |
-| **Breaks mid-turn pairs** | Might include an assistant message but exclude the user message that prompted it | Always keep user+assistant turn pairs together; split at turn boundaries only |
-
-**Severity: MEDIUM** — Inaccurate token estimation causes either context overruns or unnecessary truncation.
+| No real tokenizer | ⚠️ | Improved heuristic: JSON-heavy content → 2 chars/token; prose → 4 chars/token; not a true tokenizer |
+| No message priority | ❌ | No priority ordering (system > recent > old) |
+| Drops messages wholesale | ❌ | Turn pairs are kept together but still dropped entirely; no hierarchical summarization |
+| Breaks mid-turn pairs | ✅ | Turn-pair aware: user+assistant pair is always included together or dropped together |
 
 ---
 
 ### 5.3 Memory Manager (`memory/memory_manager.py`)
 
-**Current:** Regex pre-filter + LLM extraction for preferences. Single Flash-Lite call for analysis summary. Hardcoded 2 summaries for context injection.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **Regex pre-filter is brittle** | `_PREFERENCE_SIGNALS` is a static pattern list. Novel phrasings like "my investment thesis is quality over growth" are missed | LLM-based intent detection for preference signals, not regex |
-| **No structured output enforcement** | Preference extraction uses free-form JSON parsing. Malformed JSON is silently swallowed | Use Gemini's JSON response mode or LangChain structured output — guarantees schema conformance |
-| **Preference semantics ignored** | "conservative" and "risk-averse" stored as different entries | Preference normalization: map synonyms to canonical values; detect contradictions |
-| **Summary truncation at 3000 chars** | Only the first 3000 chars of a report are summarised. For a multi-ticker analysis, that might be only the first ticker | Use the full report with hierarchical summarization already built in `parsers/_summarise.py` |
-| **No context relevance ranking** | 2 most-recent summaries injected without checking relevance to the current query | Rank summaries by semantic similarity to current query before injecting |
-
-**Severity: MEDIUM** — Regex preference extraction and fixed summary count limit personalisation quality.
+| Regex pre-filter is brittle | ❌ | `_PREFERENCE_SIGNALS` static regex still in place; novel phrasings missed |
+| No structured output enforcement | ❌ | Preference extraction still uses free-form JSON parsing with markdown-fence stripping |
+| Preference semantics ignored | ❌ | "conservative" and "risk-averse" stored as different entries; no synonym normalization |
+| Summary truncation at 3000 chars | ❌ | Report passed to summarizer still truncated at `report_markdown[:3000]` |
+| No context relevance ranking | ✅ | `search_summaries(embedder=self._embedder)` ranks by cosine similarity when embedder provided |
 
 ---
 
@@ -199,47 +159,35 @@
 
 ### 6.1 Orchestrator (`agents/orchestrator.py`)
 
-**Current:** Fixed LangGraph DAG: `Researcher → Quant → Editor`. No branching. SQLite checkpointing.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **Hardcoded linear pipeline** | Every query runs all three agents regardless of complexity. A "what is Apple's current P/E?" shouldn't run the full pipeline | Conditional routing: skip research for simple factual queries; skip editor for internal comparison tables |
-| **No agent-level retry** | If the Quant analyst fails, the whole pipeline fails. The researcher's work is lost | Node-level retry with state preservation: re-run only the failed node with the existing state |
-| **No parallelism for multi-ticker** | AAPL and MSFT are researched sequentially. At 15 RPM free tier, each ticker takes 60–120s | Pipeline can be parallelized per ticker if RPM allows; or pipelined: start MSFT quant while AAPL editor runs |
-| **Error types collapse to same output** | `PartialStateError`, `CircuitBreakerError`, generic `Exception` all produce the same generic error response | Graduated degradation: circuit breaker → return whatever was computed; timeout → return partial |
-| **SQLite checkpoint in production** | LangGraph's SQLite checkpointer is single-process only | Use the Postgres checkpointer (`langgraph-checkpoint-postgres`) in production |
-
-**Severity: MEDIUM** — Sequential multi-ticker is the most visible user-facing limitation.
+| Hardcoded linear pipeline | ✅ | Conditional routing via `_route_after_researcher` and `_route_after_quant`; `early_exit` node skips downstream agents on empty data / rate-limited state |
+| No agent-level retry | ❌ | Node failure still aborts the downstream pipeline; no re-run of individual failed nodes |
+| No parallelism for multi-ticker | ❌ | Tickers still processed sequentially within researcher, quant, editor |
+| Error types collapse to same output | ⚠️ | `PartialStateError` → `PARTIAL`, `CircuitBreakerError` → `RATE_LIMITED`, generic → `FAILED`; distinct status codes exist but all produce the same user-visible error format |
+| SQLite checkpoint in production | ❌ | `AsyncSqliteSaver` still used; Postgres checkpointer not implemented |
 
 ---
 
 ### 6.2 Comparison Agent (`agents/comparison_agent.py`)
 
-**Current:** Runs full 3-agent pipeline for every ticker, then calls Flash to write a comparison table.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **Full pipeline per ticker for comparison** | A head-to-head comparison of 4 stocks runs 4 full pipelines + a comparison call | Cache single-ticker analyses; a comparison request should combine cached analyses |
-| **Hard-truncates data at 4000/2000 chars** | Important metrics for the 2nd and 3rd tickers may be in the truncated tail | Structured extraction: pull only the key comparison metrics explicitly, not raw truncated text |
-| **No validation of output table** | Comparison result is whatever the LLM returns. A 3-ticker request might get a 2-row table | Post-validate: parse markdown table, check all requested tickers are present, flag missing rows |
-| **Comparison dimensions fixed** | Always the same columns (price, P/E, CAGR, etc.) | Let the user specify what dimensions to compare: "compare their cloud revenue growth" |
-
-**Severity: MEDIUM** — The redundant pipeline execution is the most expensive issue.
+| Full pipeline per ticker for comparison | ❌ | All tickers passed to a single `run_pipeline()` call which processes them sequentially |
+| Hard-truncates data at 4000/2000 chars | ❌ | `analysis_json[:4000]` and `fundamentals_json[:2000]` still present |
+| No validation of output table | ❌ | Comparison result is unvalidated LLM output; missing tickers in table not detected |
+| Comparison dimensions fixed | ❌ | Always the same columns; no user-specified dimensions |
 
 ---
 
 ### 6.3 Refinement Handler (`agents/refinement_handler.py`)
 
-**Current:** LLM outputs `old_string` + `new_string`; literal `str.replace(old, new, 1)`.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **No fuzzy matching fallback** | If the LLM quotes the text with a minor difference (extra space, different quote mark), fails after only 2 attempts | Edit distance / difflib approximate matching: find the closest passage; confirm before applying |
-| **No version history** | Each edit overwrites the previous version permanently | Git-style versioning: every edit is a new version; rollback is always available |
-| **No section-aware editing** | The LLM receives the entire document and must return exact text. Error-prone for long reports | Parse the document into sections first; send only the relevant section to the editing LLM |
-| **Concurrent edit race condition** | If two browser tabs trigger edits simultaneously, the second write wins silently | Optimistic locking: include a `version_hash` in the edit request; reject if document was modified |
-
-**Severity: LOW-MEDIUM** — Works for single-user demo; would fail under real concurrent use.
+| No fuzzy matching fallback | ✅ | `_flexible_str_replace()`: exact match first, then line-strip normalization (rstrips trailing whitespace per line) |
+| No version history | ✅ | Each edit inserts a new row; `_load_latest_report()` uses `ORDER BY created_at DESC`; original is never overwritten |
+| No section-aware editing | ❌ | LLM still receives the full document; no section extraction before editing LLM call |
+| Concurrent edit race condition | ❌ | No optimistic locking; simultaneous edits from two tabs still race |
 
 ---
 
@@ -247,17 +195,13 @@
 
 ### 7.1 Report Writer (`tools/report_writer.py`)
 
-**Current:** Single Flash call with a long prompt dictating section structure. Returns markdown string.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **No structured output enforcement** | The LLM is asked to "follow this format" in natural language. Section order and numeric format are advisory, not enforced | Use structured generation: define a `ReportSchema` Pydantic model; use Gemini JSON mode to fill it; render from schema |
-| **9000-char truncation of analysis JSON** | The input to the report writer is truncated at 9000 chars. For 3+ tickers, important data may be dropped | Extract the key fields for each ticker explicitly before passing to the LLM |
-| **Disclaimer is checked twice, differently** | `editor.py` checks for `"This is not financial advice"` (exact string); `report_writer.py` has its own disclaimer logic | Append disclaimer as a post-processing step after report generation, not in the LLM prompt |
-| **No quality scoring of output** | A 200-word report and an 800-word report both pass the editor | Output quality check: verify section count, approximate word count, presence of key metrics |
-| **Module-level `_primary_llm` state** | `configure()` sets a module-level variable. Not thread-safe in async context | Inject the LLM as a parameter to the function, not a global |
-
-**Severity: MEDIUM** — Structured output would guarantee section completeness.
+| No structured output enforcement | ⚠️ | Two-call generation (Flash-Lite for structural, Flash for analytical); `_validate_sections()` appends stubs for missing headings; no Pydantic schema enforcement via `.with_structured_output()` |
+| 9000-char truncation of analysis JSON | ✅ | Truncation removed; full analysis JSON passed to both LLM calls |
+| Disclaimer checked twice, differently | ⚠️ | `_enforce_disclaimer()` in `report_writer.py` handles it programmatically; `editor.py` still checks for the exact string as a secondary guard |
+| No quality scoring of output | ❌ | No word count or section length threshold validation |
+| Module-level `_primary_llm` state | ❌ | `_primary_llm = None` and `_sub_llm = None` are module-level globals; not thread-safe |
 
 ---
 
@@ -265,33 +209,25 @@
 
 ### 8.1 Sanitizer (`core/sanitizer.py`)
 
-**Current:** Regex pattern list for injection detection, LLM-based extraction for web content, static canary token.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **Regex injection filter is evadable** | Homoglyphs (`ΙgnоrΕ` looks like "Ignore" but fails the regex), encoding tricks, and split phrases bypass pattern matching | Unicode normalisation (NFKC) before matching; semantic injection detection via a small classifier |
-| **High false-positive rate** | `(output\|reveal\|expose\|print)\s+(your\s+)?(api\s+key...)` fires on security-awareness articles legitimately discussing API key protection | Context-aware filtering: reject only if injection language appears in imperative-to-AI context |
-| **Static canary token** | `"CANARY_XQ7Z_SENTINEL"` is hardcoded. An adversary who reads the codebase can craft an attack that avoids this string | Session-generated canary tokens: `str(uuid.uuid4())` injected into system prompt; if it appears in tool output, alert |
-| **Canary only checked post-generation** | The canary is only checked on final agent output, not on intermediate LLM calls | Check canary after every LLM call in the pipeline, not just the final response |
-| **Extraction fallback leaks raw text** | When LLM extraction is unavailable, the first 200 chars of raw web content go directly to the agent | Hard fail (return empty content, log warning) rather than leak unvalidated content |
-
-**Severity: HIGH** — Static canary and regex-only filtering are known-weak patterns.
+| Regex injection filter evadable by homoglyphs | ✅ | Unicode NFKC normalization applied before all pattern matching |
+| High false-positive rate | ❌ | Patterns still broad; context-aware filtering not implemented |
+| Static canary token | ✅ | `secrets.token_urlsafe(16).upper()` per process; different value every restart |
+| Canary only checked post-generation | ❌ | `check_canary()` called only on final `report_markdown` in `editor.py`; not checked after intermediate LLM calls |
+| Extraction fallback leaks raw text | ✅ | Fallback returns `key_facts=[]`; no raw content passes through |
 
 ---
 
 ## 9. Editor Agent (`agents/editor.py`)
 
-**Current:** SOP checklist (5 hardcoded keys), grounding check (regex number extraction with tolerance), disclaimer injection.
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **Grounding check has false negatives** | Returns `True` (ungrounded) for unparseable values; returns `True` for exact zeros; doesn't handle thousands separators (`1,234`) or parenthetical negatives (`(4,200)`) | Number extraction should use a proper financial number parser |
-| **Tolerance is flat 1.5%** | A $1B market-cap company off by 1.5% is a $15M error — material. The same tolerance applied to a percentage is too loose | Scale-relative tolerance configured per metric type |
-| **SOP failure is binary** | One missing data field fails the entire SOP check | Weighted SOP: critical fields (price, market cap) fail; optional fields (analyst coverage) warn |
-| **Disclaimer is hardcoded string** | Checks for exact `"This is not financial advice"` — fragile to LLM phrasing variations | Append the standard disclaimer programmatically rather than verifying the LLM added it correctly |
-| **No validation of report completeness** | A 3-line report passes the editor if it has all SOP keys | Minimum section length thresholds per section type |
-
-**Severity: MEDIUM** — Grounding check false negatives mean hallucinated numbers can pass review.
+| Grounding check false negatives | ✅ | `_NUMERIC_PATTERN` handles `$1,234`, `(4,200)`, `$4.17T`, SI suffixes; `_clean_numeric()` strips commas/parens/dollar signs/suffixes |
+| Tolerance is flat 1.5% | ✅ | Tiered: 2% for percentages, 5% for values > 1M, 1.5% otherwise |
+| SOP failure is binary | ❌ | Each key present/absent with no weighted scoring; one missing optional field fails the entire SOP |
+| Disclaimer is hardcoded string | ⚠️ | `_enforce_disclaimer()` in report_writer appends programmatically; editor still checks exact string "This is not financial advice" as a secondary guard |
+| No validation of report completeness | ⚠️ | `_validate_sections()` in report_writer.py catches missing headings; no word-count thresholds |
 
 ---
 
@@ -299,16 +235,12 @@
 
 ### 10.1 Charts Module (`charts/`)
 
-Already substantially improved (13 chart types, interactive, date ranges, Bollinger Bands, combined panels). Remaining gaps:
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **No intraday data** | All charts use daily or weekly closing prices. Intraday moves are invisible | TradingView, Bloomberg show 1m/5m/15m/1h candles for recent periods |
-| **No analyst price targets on charts** | No visual overlay of consensus price targets | Bloomberg displays analyst targets as horizontal bands on price charts |
-| **No volume profile** | Volume bars show total volume; Volume Profile shows price levels where volume concentrated | Volume Profile (horizontal histogram of volume at each price level) is standard on professional charts |
-| **Hardcoded P/E coloring thresholds** | Red if >20% premium, green if >10% discount, blue otherwise. Thresholds are arbitrary | Percentile-based coloring: red if P/E is in top decile vs sector history, green if bottom decile |
-
-**Severity: LOW** — Charts are already professional-grade; these are incremental enhancements.
+| No intraday data | ❌ | All charts use daily/weekly closes; 1m/5m/15m intervals not supported |
+| No analyst price targets on charts | ✅ | Candlestick: mean target (dashdot line) + high/low shaded band from `fundamentals.analyst_target_*` |
+| No volume profile | ❌ | Volume bars show total volume; horizontal volume-at-price histogram not implemented |
+| Hardcoded P/E coloring thresholds | ❌ | >20% premium → red, >10% discount → green, otherwise blue; percentile-based coloring not implemented |
 
 ---
 
@@ -316,40 +248,59 @@ Already substantially improved (13 chart types, interactive, date ranges, Bollin
 
 ### 11.1 PageIndex (`pageindex/`)
 
-Just built; architecture is sound. Early-stage gaps:
-
-| Issue | Detail | Industry Standard |
+| Issue | Status | Notes |
 |---|---|---|
-| **No re-ranking step** | RRF merges vector + FTS results but doesn't apply a cross-encoder re-ranker | BGE-Reranker, Cohere Rerank, or a small cross-encoder pass on top-K candidates improves precision by 15–30% |
-| **No query expansion** | User queries are embedded as-is. Short, ambiguous queries retrieve poorly | HyDE (Hypothetical Document Embedding): ask the LLM to generate a hypothetical answer, embed that as the query |
-| **No chunking strategy for long pages** | A 10,000-char PDF page is embedded as one vector. The embedding model's effective range is ~512–768 tokens | Sentence-level chunking with parent-child retrieval: store small chunks for retrieval; return full page as context |
-| **Embeddings not refreshed on model change** | If Gemini changes `text-embedding-004`, all stored embeddings become incompatible | Store the `model_version` alongside each embedding; detect version mismatches and trigger re-embedding |
-
-**Severity: LOW-MEDIUM** — Re-ranking would meaningfully improve retrieval precision.
+| No re-ranking step | ❌ | RRF is the final ranking; no cross-encoder pass (BGE-Reranker, Cohere Rerank) |
+| No query expansion | ✅ | HyDE: Flash-Lite generates a hypothetical passage; that embedding is used for vector search; FTS uses original query |
+| No chunking strategy for long pages | ❌ | A 10,000-char PDF page is embedded as one 768-dim vector; sentence-level chunking not implemented |
+| Embeddings not refreshed on model change | ❌ | No `model_version` column; incompatible embeddings not detected on model upgrade |
 
 ---
 
-## Priority Matrix
+## Remaining Work — Priority Matrix
 
-| # | Component | Issue | Severity | Implementation Effort |
+| # | Component | Issue | Severity | Effort |
 |---|---|---|---|---|
-| 1 | `web_search.py` | 4-hour TTL for financial news | **CRITICAL** | Very Low (change one constant, add per-type TTL) |
-| 2 | `core/llm.py` | Circuit breaker has no recovery; streaming mismatch | **HIGH** | Low (fix half-open state + timeout) |
-| 3 | `core/sanitizer.py` | Static canary; regex-only injection filter; extraction fallback leaks | **HIGH** | Medium (session canary + Unicode normalisation) |
-| 4 | `quant_analyst.py` | No risk-adjusted metrics; brittle LLM parsing | **HIGH** | Medium (add Sharpe/Sortino; switch to structured output) |
-| 5 | `benchmark_lookup.py` | Completely static data; single multiple | **HIGH** | Medium (live fetch from Damodaran; add EV/EBITDA, P/B) |
-| 6 | `yahoo_finance.py` | No cash flow; no adjusted close; stale `info` | **HIGH** | Medium (add `.cashflow`; use `.history(auto_adjust=True)`) |
-| 7 | `editor.py` | Grounding check false negatives; flat tolerance | **MEDIUM** | Low (fix number parser + scale-relative tolerance) |
-| 8 | `report_writer.py` | No structured output; 9000-char truncation | **MEDIUM** | Medium (Gemini JSON mode + explicit field extraction) |
-| 9 | `memory/long_term.py` | Keyword-only retrieval for summaries | **MEDIUM** | Medium (use PageIndex embeddings for memory retrieval) |
-| 10 | `orchestrator.py` | No per-ticker parallelism; linear for all queries | **MEDIUM** | Medium (parallel research with asyncio semaphore) |
-| 11 | `quant_analyst.py` | LLM-written bull/bear; no structured output | **MEDIUM** | Low (switch to Gemini JSON mode for bull/bear) |
-| 12 | `memory/short_term.py` | Char-based token estimation; drops full messages | **MEDIUM** | Low (use real tokenizer; turn-pair-aware windowing) |
-| 13 | `refinement_handler.py` | No version history; no fuzzy match | **LOW-MEDIUM** | Medium |
-| 14 | `pageindex/retriever.py` | No re-ranking; no HyDE query expansion | **LOW-MEDIUM** | Medium |
-| 15 | `budget_tracker.py` | Request-counting, not token-counting | **LOW** | Low |
-| 16 | Charts | No analyst targets; no intraday | **LOW** | Low-Medium |
+| 1 | `core/llm.py` | Hardcoded model names — no model registry | HIGH | Low |
+| 2 | `core/sanitizer.py` | Canary checked only at final output | HIGH | Low |
+| 3 | `agents/quant_analyst.py` | Brittle markdown-fence stripping still present as fallback; no true `.with_structured_output()` | MEDIUM | Low |
+| 4 | `tools/benchmark_lookup.py` | No fuzzy sector matching | MEDIUM | Low |
+| 5 | `memory/memory_manager.py` | Summary truncation at 3000 chars before LLM call | MEDIUM | Low |
+| 6 | `memory/memory_manager.py` | Hardcoded `limit=2` summaries in context | MEDIUM | Low |
+| 7 | `agents/editor.py` | SOP failure is binary (no weighted scoring) | MEDIUM | Low |
+| 8 | `agents/comparison_agent.py` | 4000/2000-char truncation of comparison data | MEDIUM | Low |
+| 9 | `core/budget_tracker.py` | Single 80% daily threshold; no per-RPM-minute warning granularity | MEDIUM | Low |
+| 10 | `tools/report_writer.py` | Module-level LLM globals; no Pydantic output schema | MEDIUM | Medium |
+| 11 | `memory/long_term.py` | No preference versioning; no time-decay for summaries | MEDIUM | Medium |
+| 12 | `agents/orchestrator.py` | No agent-level retry; no per-ticker parallelism | MEDIUM | Medium |
+| 13 | `pageindex/retriever.py` | No cross-encoder re-ranking | LOW-MEDIUM | Medium |
+| 14 | `pageindex/pipeline.py` | No sentence-level chunking for long pages | LOW-MEDIUM | Medium |
+| 15 | `agents/quant_analyst.py` | No DCF; no scenario analysis | LOW-MEDIUM | High |
+| 16 | `tools/calculator.py` | No financial formula library (pv, npv, irr) | LOW | Medium |
+| 17 | `charts/` | No intraday data; no volume profile; hardcoded P/E thresholds | LOW | Low-Medium |
+| 18 | `agents/refinement_handler.py` | No concurrent edit protection; no section-aware editing | LOW | Medium |
 
 ---
 
-*This document is the basis for the next implementation cycle. Each item will be reviewed, feasibility-assessed, and — where approved — redesigned and implemented.*
+## What Was Closed (16 of 34 sub-issues from original audit)
+
+| Original # | Component | What was fixed |
+|---|---|---|
+| 1 | `web_search.py` | TTL reduced from 4h to 1h |
+| 2a | `core/llm.py` | Half-open circuit breaker with probe recovery |
+| 2b | `core/llm.py` | `asyncio.wait_for(120s)` timeout on async calls |
+| 3a | `core/sanitizer.py` | Dynamic per-process canary token |
+| 3b | `core/sanitizer.py` | NFKC Unicode normalization before regex |
+| 3c | `core/sanitizer.py` | Safe fallback — empty `key_facts`, no raw content leak |
+| 4 | `quant_analyst.py` | Risk metrics: Sharpe, Sortino, max drawdown, beta, volatility |
+| 5 | `benchmark_lookup.py` | Live Damodaran; 7 multiples (PE, forward PE, EV/EBITDA, P/B, P/S, margin, beta) |
+| 6 | `yahoo_finance.py` | 7 data types; adjusted close; cash flow; dividend history; analyst targets |
+| 7 | `editor.py` | Financial number parser; tiered tolerance |
+| 8 | `editor.py` / `report_writer.py` | 9000-char truncation removed; two-call generation; section validation |
+| 9 | `memory/long_term.py` | Semantic search via cosine similarity on stored embeddings |
+| 10 | `orchestrator.py` | Conditional early-exit routing on empty data / rate-limited state |
+| 12 | `memory/short_term.py` | Turn-pair windowing; JSON-density token estimate |
+| 13 | `refinement_handler.py` | Fuzzy match (line-strip fallback); INSERT versioning |
+| 14 | `pageindex/retriever.py` | HyDE query expansion |
+
+*18 sub-issues remain across the priority matrix above.*
