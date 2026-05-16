@@ -565,6 +565,8 @@ def build_tools(
         """
         return question
 
+    from ..tools.financial_formulas import financial_formulas_tool
+
     return [
         run_financial_analysis,
         compare_stocks,
@@ -574,6 +576,7 @@ def build_tools(
         generate_chart,
         search_documents,
         get_document_page,
+        financial_formulas_tool,
         reject_request,
         ask_clarification,
     ]

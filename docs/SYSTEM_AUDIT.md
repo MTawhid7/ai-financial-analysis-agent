@@ -56,10 +56,10 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 
 | Issue | Status | Notes |
 |---|---|---|
-| No financial formula library | ❌ | Still string-expression numexpr only; no `pv()`, `fv()`, `npv()`, `irr()` |
-| Rounding inconsistency | ❌ | Hardcoded 6 decimal places; no per-type formatting |
-| No unit tracking | ❌ | No dimension checking |
-| No result range validation | ❌ | Float overflow / NaN returned silently |
+| No financial formula library | ✅ | New `financial_formulas` tool: NPV, IRR, PV, FV, CAGR, WACC, payback_period, ROI — pure-Python function registry; domain warnings (IRR>500%, CAGR>100%); registered in Manager LLM |
+| Rounding inconsistency | ✅ | Optional `format` hint on calculator: "percent"→"14.22%", "currency"→"$4.17T", "ratio"→"28.5×", "integer"→"15,726,000,000"; auto-detection by magnitude; structured JSON return when format specified |
+| No unit tracking | ✅ | Optional `context` dict on calculator for named variable binding (`{"market_cap_usd": 3e12, "revenue_usd": 4e11}`); unit suffixes document intent; context keys validated (no leading `_`) |
+| No result range validation | ✅ | `_validate_result()` catches `inf`/`nan` and returns ToolError; warns on magnitude > 1e15 or < 1e-10; financial functions validate domain (IRR convergence, CAGR start > 0, etc.) |
 
 **Severity: MEDIUM — Narrow scope but safe; financial functions would add value.**
 
@@ -282,7 +282,7 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 
 ---
 
-## What Was Closed (25 of 34 sub-issues from original audit)
+## What Was Closed (29 of 34 sub-issues from original audit)
 
 | Original # | Component | What was fixed |
 |---|---|---|
@@ -311,5 +311,9 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 | 23 | `quant_analyst.py` | LLM parsing brittle — `with_structured_output(_SOPOutput)` via Gemini JSON mode |
 | 24 | `quant_analyst.py` | Hardcoded sector taxonomy — `_YFINANCE_TO_GICS` removed; raw sector passed to benchmark_lookup |
 | 25 | `core/llm.py` | `with_structured_output()` added to `RateLimitFallbackLLM` (same pattern as `bind_tools`) |
+| 26 | `tools/financial_formulas.py` | New tool: NPV, IRR, PV, FV, CAGR, WACC, payback_period, ROI — function registry pattern |
+| 27 | `tools/calculator.py` | `format` hint + structured JSON return (percent/currency/ratio/integer/auto) |
+| 28 | `tools/calculator.py` | `context` dict for named variable binding (unit-context documentation) |
+| 29 | `tools/calculator.py` | `_validate_result()`: inf/nan → ToolError; large-magnitude soft warning |
 
-*9 sub-issues remain across the priority matrix above.*
+*5 sub-issues remain across the priority matrix above.*
