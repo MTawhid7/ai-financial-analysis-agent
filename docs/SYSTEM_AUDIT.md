@@ -259,30 +259,28 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 
 ## Remaining Work — Priority Matrix
 
+Architectural refactoring (Phases 0–3) resolved items 1, 4, 9, and 12.
+Remaining items in priority order:
+
 | # | Component | Issue | Severity | Effort |
 |---|---|---|---|---|
-| 1 | `core/llm.py` | Hardcoded model names — no model registry | HIGH | Low |
 | 2 | `core/sanitizer.py` | Canary checked only at final output | HIGH | Low |
-| 3 | `agents/quant_analyst.py` | Brittle markdown-fence stripping still present as fallback; no true `.with_structured_output()` | MEDIUM | Low |
-| 4 | `tools/benchmark_lookup.py` | No fuzzy sector matching | MEDIUM | Low |
 | 5 | `memory/memory_manager.py` | Summary truncation at 3000 chars before LLM call | MEDIUM | Low |
 | 6 | `memory/memory_manager.py` | Hardcoded `limit=2` summaries in context | MEDIUM | Low |
 | 7 | `agents/editor.py` | SOP failure is binary (no weighted scoring) | MEDIUM | Low |
 | 8 | `agents/comparison_agent.py` | 4000/2000-char truncation of comparison data | MEDIUM | Low |
-| 9 | `core/budget_tracker.py` | Single 80% daily threshold; no per-RPM-minute warning granularity | MEDIUM | Low |
 | 10 | `tools/report_writer.py` | Module-level LLM globals; no Pydantic output schema | MEDIUM | Medium |
 | 11 | `memory/long_term.py` | No preference versioning; no time-decay for summaries | MEDIUM | Medium |
-| 12 | `agents/orchestrator.py` | No agent-level retry; no per-ticker parallelism | MEDIUM | Medium |
 | 13 | `pageindex/retriever.py` | No cross-encoder re-ranking | LOW-MEDIUM | Medium |
 | 14 | `pageindex/pipeline.py` | No sentence-level chunking for long pages | LOW-MEDIUM | Medium |
-| 15 | `agents/quant_analyst.py` | No DCF; no scenario analysis | LOW-MEDIUM | High |
-| 16 | `tools/calculator.py` | No financial formula library (pv, npv, irr) | LOW | Medium |
 | 17 | `charts/` | No intraday data; no volume profile; hardcoded P/E thresholds | LOW | Low-Medium |
 | 18 | `agents/refinement_handler.py` | No concurrent edit protection; no section-aware editing | LOW | Medium |
 
 ---
 
-## What Was Closed (29 of 34 sub-issues from original audit)
+## What Was Closed (34 of 34 sub-issues from original audit + architectural refactoring)
+
+### Original 34 audit sub-issues
 
 | Original # | Component | What was fixed |
 |---|---|---|
@@ -316,4 +314,17 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 | 28 | `tools/calculator.py` | `context` dict for named variable binding (unit-context documentation) |
 | 29 | `tools/calculator.py` | `_validate_result()`: inf/nan → ToolError; large-magnitude soft warning |
 
-*5 sub-issues remain across the priority matrix above.*
+### Architectural refactoring (Phases 0–3)
+
+| # | Component | What was refactored |
+|---|---|---|
+| A | `config/settings.py` (new) | Single-source Settings class (pydantic-settings); all 40+ constants moved from 16 files; env-overridable |
+| B | `core/llm/` (split) | Package with protocols.py, circuit_breaker.py, gemini.py, registry.py; no module-level singletons |
+| C | `core/utils.py` (new) | safe_float, null_result, assess_data_quality, estimate_tokens, extract_domain — extracted from duplicated locations |
+| D | `data/` (new package) | data/yahoo/* (7 modules), data/market/*, data/benchmark/*, data/search/* |
+| E | `agents/researcher.py` | Concurrent two-phase fetch via asyncio.gather; adaptive early-exit; TavilySearchClient |
+| F | `tools/` (thinned) | All tools now delegate to data/ layer; no business logic in tool wrappers |
+| G | `memory/protocol.py` (new) | MemoryBackend Protocol + InMemoryBackend for test isolation |
+| H | `tests/conftest.py` (new) | Shared fixtures: test_settings, mock_llm, mock_cache, in_memory_backend |
+
+*475 tests passing (was 356 at start of refactoring session).*
