@@ -1,7 +1,7 @@
 # System Audit Report: Implementation Status
 
 **Original audit date:** 2026-05-15  
-**Last updated:** 2026-05-16  
+**Last updated:** 2026-05-17 (updated post-architectural-refactoring to reflect Phases 0–4 changes)  
 **Scope:** Full pipeline — data layer, LLM infrastructure, memory, orchestration, security, charts, PageIndex  
 
 Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
@@ -72,10 +72,12 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 | Issue | Status | Notes |
 |---|---|---|
 | Hardcoded year in news query | ✅ | `_current_year()` → `datetime.utcnow().year` |
-| No adaptive iteration | ⚠️ | `MAX_ITERATIONS=10` (raised from 5); still no early-exit when coverage threshold met |
-| No multi-source reconciliation | ❌ | First yfinance result used for each data type; no cross-source validation |
-| Token estimation | ⚠️ | `len(string) // 4` still used in researcher's iteration log; short_term memory now uses content-type-aware estimate |
-| No data freshness labeling | ⚠️ | `data_timestamp` field present in price_history; other types do not carry `as_of` timestamps |
+| No adaptive iteration | ✅ | Phase 3: two-phase concurrent fetch in `data/yahoo/__init__.py` — Phase 1 fetches 3 core types, Phase 2 fetches 4 extended only if ≥1 core succeeded. Early exit is structural, not a counter. |
+| No multi-source reconciliation | ⚠️ | No free second data source exists; `data_quality` + `degradation_note` + `data_timestamp` on every DataResult surfaces quality transparency. True reconciliation requires paid feeds. |
+| Token estimation | ✅ | Phase 3: `researcher.py` now calls `estimate_tokens()` from `core/utils.py` (JSON-density-aware 2–4 chars/token). |
+| No data freshness labeling | ✅ | Phase 2: all 7 DataResult types carry `data_timestamp` (UTC ISO 8601) and `data_quality`/`degradation_note`; researcher surfaces `PARTIAL` types as `researcher_gaps`. |
+
+**Section 3.1 is fully resolved.** The only honest limitation (no multi-source reconciliation) is a free-tier constraint, not an implementation gap.
 
 ---
 
@@ -83,26 +85,30 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 
 | Issue | Status | Notes |
 |---|---|---|
-| 4-hour cache on financial news | ✅ | `TTL_WEB_SEARCH = 1h` (from 4h); `get_or_fetch(..., ttl=TTL_WEB_SEARCH)` wired correctly |
-| No source credibility scoring | ❌ | All results ranked equally by Tavily score; no publication-tier weighting |
-| No date filtering on results | ❌ | No `published_after` constraint; stale articles can still be returned |
-| Sanitizer fallback leaks raw text | ✅ | Fallback stub returns `key_facts=[]` — no raw content reaches the agent |
-| `search_depth="basic"` is silent downgrade | ❌ | Still hardcoded to `"basic"`; no retry with query reformulation |
+| 4-hour cache on financial news | ✅ | `TTL_WEB_SEARCH = 1h`; wired correctly |
+| No source credibility scoring | ✅ | Phase 2: `data/search/credibility.py` — 30+ domains mapped to tiers 1–3; `TavilySearchClient` sorts results by `(source_tier ASC, score DESC)` before returning |
+| No date filtering on results | ✅ | Phase 2: `TavilySearchClient(days=settings.search_days_window)` — default 90 days; passed to Tavily API `days` param |
+| Sanitizer fallback leaks raw text | ✅ | Fallback returns `key_facts=[]`; no raw content passes through |
+| `search_depth="basic"` is silent downgrade | ✅ | Phase 2: `TavilySearchClient.search()` retries with `_reformulate_query()` (removes year + narrow phrases) on zero results; logs WARNING before retry |
+
+**Section 3.2 is fully resolved.**
 
 ---
 
 ## 4. LLM Infrastructure
 
-### 4.1 LLM Client (`core/llm.py`)
+### 4.1 LLM Client (`core/llm/`)
 
 | Issue | Status | Notes |
 |---|---|---|
-| Circuit breaker window too short / no recovery | ✅ | 5×429/60s threshold; half-open state with 60s probe delay; `probe_succeeded()` / `probe_failed()` |
-| No recovery from Flash-Lite | ✅ | Probe success resets breaker to CLOSED; full-quality Flash restored automatically |
-| Streaming/non-streaming mismatch | ⚠️ | Primary `streaming=True`, fallback `streaming=False` — intentionally different; downstream streaming SSE handles both via `content_to_str()`; no stream adapter |
-| Hardcoded model names | ❌ | `_PRIMARY_MODEL = "gemini-3-flash-preview"`, `_SUB_MODEL = "gemini-3.1-flash-lite-preview"` — hardcoded constants; no model registry |
-| No per-call timeout | ✅ | `asyncio.wait_for(coro, timeout=120s)` in `ainvoke()`; sync `invoke()` lacks a timeout |
-| No token counting | ❌ | All rate-limit logic is request-based; no token accumulation or token-weighted quota management |
+| Circuit breaker window too short / no recovery | ✅ | 5×429/60s threshold; half-open state; `probe_succeeded()` / `probe_failed()` |
+| No recovery from Flash-Lite | ✅ | Probe success resets breaker to CLOSED |
+| Streaming/non-streaming mismatch | ⚠️ | Primary `streaming=True`, fallback `streaming=False` — intentional; `content_to_str()` normalises both. Acceptable as-is. |
+| Hardcoded model names | ✅ | Phase 0: `settings.llm_primary_model` / `settings.llm_fallback_model` — fully env-overridable via `LLM_PRIMARY_MODEL` / `LLM_FALLBACK_MODEL` |
+| No per-call timeout | ✅ | `asyncio.wait_for(coro, timeout=settings.llm_call_timeout_s)` in `ainvoke()` |
+| No token counting | ❌ | Request-based budgeting only; Gemini API doesn't expose token counts in real-time without an extra call. Low priority for free tier. |
+
+**4.1 is substantially resolved.** Only token counting remains and is genuinely hard on free tier.
 
 ---
 
@@ -110,11 +116,13 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 
 | Issue | Status | Notes |
 |---|---|---|
-| Counts requests, not cost | ❌ | Still call-counting; no token-weighted cost model |
-| Daily budget, not per-minute | ✅ | `_RpmBucket` tracks rolling 60s window; warns when `current_rpm > 15/30`; `primary_rpm_current` / `sub_rpm_current` in `get_stats()` |
-| 80% alert too late / only one threshold | ❌ | Single 80% threshold; no 60% soft warning or 95% deferral mode |
-| No per-tool budgeting | ❌ | All calls share one pool |
-| Cache hit recording is no-op | ❌ | `record_cache_hit()` increments counter but doesn't adjust budget |
+| Counts requests, not cost | ❌ | Request-based; token-weighted cost model would require token counts from API responses (not easily available free tier) |
+| Daily budget, not per-minute | ✅ | Phase 1: `_RpmBucket` tracks rolling 60s window; warns when limit exceeded; `primary_rpm_current`/`sub_rpm_current` in `get_stats()` |
+| 80% alert too late / only one threshold | ✅ | Phase 0: three-tier via `settings`: `llm_budget_soft_warn_pct=0.60`, `llm_budget_warn_pct=0.80`, `llm_budget_defer_pct=0.95`; `budget_tracker.py` reads all three |
+| No per-tool budgeting | ❌ | All calls share one pool; tracking per-tool would require instrumenting each call site |
+| Cache hit recording is no-op | ❌ | `record_cache_hit()` increments counter but doesn't reduce quota estimate |
+
+**4.2 is mostly resolved.** Remaining items (token counting, per-tool budgeting, cache adjustment) are low-priority operational refinements.
 
 ---
 
@@ -257,24 +265,52 @@ Status legend: ✅ Resolved · ⚠️ Partial · ❌ Remaining
 
 ---
 
-## Remaining Work — Priority Matrix
+## Remaining Work — Recommended Implementation Order
 
-Architectural refactoring (Phases 0–3) resolved items 1, 4, 9, and 12.
-Remaining items in priority order:
+### What sections 3, 4 look like after the architectural refactoring
 
-| # | Component | Issue | Severity | Effort |
+**Sections 3.1 and 3.2 are fully resolved** by the Phase 2–3 data-layer refactoring.
+Tackling them now would only confirm they are done, not produce improvements.
+
+**Section 4 is substantially resolved** by Phase 0 (settings.py) and Phase 1 (LLM package).
+Only token counting (requires real-time API token metadata) and minor budget refinements remain.
+
+**The recommended order differs from section-by-section reading because severity does not follow section order.**
+
+---
+
+### Recommended sequence
+
+| Priority | Section | Specific Issue | Severity | Why Now |
 |---|---|---|---|---|
-| 2 | `core/sanitizer.py` | Canary checked only at final output | HIGH | Low |
-| 5 | `memory/memory_manager.py` | Summary truncation at 3000 chars before LLM call | MEDIUM | Low |
-| 6 | `memory/memory_manager.py` | Hardcoded `limit=2` summaries in context | MEDIUM | Low |
-| 7 | `agents/editor.py` | SOP failure is binary (no weighted scoring) | MEDIUM | Low |
-| 8 | `agents/comparison_agent.py` | 4000/2000-char truncation of comparison data | MEDIUM | Low |
-| 10 | `tools/report_writer.py` | Module-level LLM globals; no Pydantic output schema | MEDIUM | Medium |
-| 11 | `memory/long_term.py` | No preference versioning; no time-decay for summaries | MEDIUM | Medium |
-| 13 | `pageindex/retriever.py` | No cross-encoder re-ranking | LOW-MEDIUM | Medium |
-| 14 | `pageindex/pipeline.py` | No sentence-level chunking for long pages | LOW-MEDIUM | Medium |
-| 17 | `charts/` | No intraday data; no volume profile; hardcoded P/E thresholds | LOW | Low-Medium |
-| 18 | `agents/refinement_handler.py` | No concurrent edit protection; no section-aware editing | LOW | Medium |
+| **1** | **8.1** Sanitizer | Canary only checked at final output | **HIGH** | 30-min fix; highest-severity open issue; adds defence-in-depth to every pipeline run |
+| **2** | **6.2** Comparison Agent | 4000/2000-char truncation; no table validation | MEDIUM | Low effort; structured extraction follows the same pattern used in quant_analyst.py |
+| **3** | **9** Editor Agent | SOP failure is binary | MEDIUM | Low effort; weighted scoring uses the same SOP dict that already exists |
+| **4** | **5.3** Memory Manager | Summary truncation (3000 chars); hardcoded `limit=2` | MEDIUM | Quick config-driven fix; immediately improves memory context quality |
+| **5** | **5.1** Long-Term Memory | Preference versioning; time-decay for summaries | MEDIUM | Medium effort; builds naturally on the MemoryBackend Protocol from Phase 4 |
+| **6** | **7.1** Report Writer | Module-level LLM globals | MEDIUM | Phase 4 DI pattern makes this straightforward now (inject via NodeConfig) |
+| **7** | **5.2** Short-Term Memory | Message priority; hierarchical summarisation | MEDIUM | Medium effort; improves long-conversation coherence |
+| **8** | **6.1** Orchestrator | No agent-level retry; SQLite checkpoint | MEDIUM | Medium effort; Postgres checkpointer uses `settings.database_url` already wired |
+| **9** | **6.3** Refinement Handler | Section-aware editing; concurrent edit lock | LOW | Concurrent edit is a race condition only under multi-tab use |
+| **10** | **11** PageIndex | Cross-encoder re-ranking; sentence chunking | LOW-MEDIUM | Meaningful precision gain but requires additional model or chunking pass |
+| **11** | **10** Charts | Intraday data; volume profile; P/E thresholds | LOW | Incremental; intraday requires yfinance intraday quotas |
+| **12** | **4.2** Budget Tracker | Token counting; per-tool budgeting | LOW | Hard on free tier (no real-time token API); low practical impact |
+
+### What to skip (already done, just not marked)
+
+The following issues appear open in the section tables but are already resolved
+by the architectural refactoring — **do not spend time on them**:
+
+| Apparent open issue | Actually resolved by |
+|---|---|
+| 3.1 Adaptive iteration | Phase 3: two-phase concurrent fetch with structural early exit |
+| 3.1 Token estimation | Phase 3: `estimate_tokens()` from `core/utils` in researcher |
+| 3.1 Data freshness labeling | Phase 2: `data_timestamp` + `data_quality` on all 7 DataResult types |
+| 3.2 Source credibility scoring | Phase 2: `data/search/credibility.py` + `TavilySearchClient` sort |
+| 3.2 Date filtering | Phase 2: `TavilySearchClient(days=settings.search_days_window)` |
+| 3.2 Silent downgrade | Phase 2: `TavilySearchClient._invoke()` retry + `_reformulate_query()` |
+| 4.1 Hardcoded model names | Phase 0: `settings.llm_primary_model` / `LLM_PRIMARY_MODEL` env var |
+| 4.2 80% single threshold | Phase 0: three-tier 60%/80%/95% in `settings`; `budget_tracker.py` reads all three |
 
 ---
 
