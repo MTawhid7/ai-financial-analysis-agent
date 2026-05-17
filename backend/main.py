@@ -7,7 +7,6 @@ Run with:
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -16,16 +15,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
+from ai_financial_analyst.config import settings
 from .core.database import run_migrations
 from .routers import admin, auth, chat, conversations, feedback, files, memory
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://localhost:3000",
-).split(",")
+_ALLOWED_ORIGINS = settings.allowed_origins
 
 
 @asynccontextmanager

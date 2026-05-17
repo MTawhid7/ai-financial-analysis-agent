@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import tempfile
 import uuid
 from pathlib import Path
@@ -19,15 +18,16 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
+from ai_financial_analyst.config import settings
 from ..core.deps import CurrentUser, get_current_user
 from ..core import session_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["files"])
 
-_MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+_MAX_UPLOAD_BYTES   = 50 * 1024 * 1024  # 50 MB
 _ALLOWED_EXTENSIONS = {".csv", ".pdf", ".xlsx", ".xls", ".docx", ".txt", ".md", ".json"}
-_WORKSPACE = os.getenv("WORKSPACE_DIR", "workspace")
+_WORKSPACE          = settings.workspace_dir
 
 
 # ---------------------------------------------------------------------------

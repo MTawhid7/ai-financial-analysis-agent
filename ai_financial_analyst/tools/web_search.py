@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 from langchain_tavily import TavilySearch
 from langchain_core.tools import tool
 from pydantic import Field
 
+from ..config import settings
 from ..core.cache import ResultCache, TTL_WEB_SEARCH
 from ..core.sanitizer import ContentSanitizer, build_sanitizer
 from .base import StrictToolInput, safe_tool_call
@@ -23,9 +23,8 @@ from .base import StrictToolInput, safe_tool_call
 logger = logging.getLogger(__name__)
 
 _MAX_FACTS_PER_RESULT = 5
-# Minimum characters of non-link, non-whitespace text for a result to be kept.
-_MIN_CONTENT_CHARS = 150
-_cache = ResultCache()
+_MIN_CONTENT_CHARS    = settings.search_min_content_chars
+_cache                = ResultCache()
 
 # Sanitizer (regex-only — no Flash-Lite needed since Tavily pre-summarises).
 _sanitizer: ContentSanitizer = build_sanitizer(subllm=None)
@@ -67,7 +66,7 @@ def _search_and_sanitize(query: str, max_results: int) -> str:
         # often returns empty arrays for financial queries.
         tavily = TavilySearch(
             max_results=max_results,
-            api_key=os.environ["TAVILY_API_KEY"],
+            api_key=settings.tavily_api_key,
             search_depth="basic",
         )
         raw_results = tavily.invoke({"query": query})

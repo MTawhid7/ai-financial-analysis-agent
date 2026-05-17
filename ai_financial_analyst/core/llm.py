@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -14,22 +13,19 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.runnables.base import Runnable
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+from ..config import settings
+
 logger = logging.getLogger(__name__)
 
-# Model identifiers (gemini-2.0-* deprecated, shuts down June 1 2026)
-_PRIMARY_MODEL = "gemini-3-flash-preview"
-_SUB_MODEL = "gemini-3.1-flash-lite-preview"
+# Model identifiers — sourced from settings (env-configurable, not hardcoded).
+_PRIMARY_MODEL = settings.llm_primary_model
+_SUB_MODEL     = settings.llm_fallback_model
 
-# Circuit breaker settings — wider window and higher threshold to tolerate
-# short transient bursts without permanently degrading the session.
-_CB_MAX_CONSECUTIVE_429 = 5
-_CB_WINDOW_SECONDS = 60
-
-# Half-open probe: wait this long before allowing one test request through.
-_CB_HALF_OPEN_DELAY = 60.0
-
-# Per-call timeout (seconds) for primary async invocations.
-_PRIMARY_CALL_TIMEOUT = 120.0
+# Circuit breaker settings — all from settings.
+_CB_MAX_CONSECUTIVE_429 = settings.llm_cb_max_failures
+_CB_WINDOW_SECONDS      = settings.llm_cb_window_s
+_CB_HALF_OPEN_DELAY     = settings.llm_cb_half_open_delay_s
+_PRIMARY_CALL_TIMEOUT   = settings.llm_call_timeout_s
 
 
 class RateLimitError(RuntimeError):
@@ -189,7 +185,7 @@ def get_primary_llm(budget_tracker=None):
     """Return Gemini Flash LLM for the core ReAct reasoning loop."""
     llm = _PrimaryLLM(
         model=_PRIMARY_MODEL,
-        google_api_key=os.environ["GOOGLE_API_KEY"],
+        google_api_key=settings.google_api_key,
         temperature=0.1,
         streaming=True,
         # max_retries=1 disables the SDK's own retry so only our tenacity layer retries.
@@ -208,7 +204,7 @@ def get_subllm(budget_tracker=None):
     """Return Gemini Flash-Lite LLM for summarisation and sanitisation sub-tasks."""
     llm = _SubLLM(
         model=_SUB_MODEL,
-        google_api_key=os.environ["GOOGLE_API_KEY"],
+        google_api_key=settings.google_api_key,
         temperature=0.0,
         streaming=False,
         max_retries=1,

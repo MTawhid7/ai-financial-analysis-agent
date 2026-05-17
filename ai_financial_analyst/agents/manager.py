@@ -21,13 +21,14 @@ from typing import Any, Callable
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 
+from ..config import settings
 from ..core.conversation_state import ConversationState
 from ..core.llm import content_to_str
 from ..memory.short_term import ShortTermMemory
 
 logger = logging.getLogger(__name__)
 
-_MAX_TOOL_ROUNDS = 5  # prevent infinite tool loops
+_MAX_TOOL_ROUNDS = settings.pipeline_max_tool_rounds
 
 # Accepts any reasonable time-period string and normalises it to a yfinance period.
 _VALID_PERIODS = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"}
@@ -268,9 +269,7 @@ def build_tools(
             return "No stored report to edit. Please run an analysis first."
 
         from .refinement_handler import refine_analysis
-        from ..core.llm import _DEFAULT_DB_PATH as db_path_const
-        import os
-        db_path = os.getenv("MEMORY_DB_PATH", ".memory/memory.db")
+        db_path = settings.memory_db_path
 
         return await refine_analysis(
             message=instruction,

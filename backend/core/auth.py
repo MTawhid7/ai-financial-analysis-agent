@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Any
 
@@ -11,12 +10,14 @@ from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 from jose import JWTError, jwt
 
+from ai_financial_analyst.config import settings
+
 logger = logging.getLogger(__name__)
 
-_JWT_SECRET = os.environ.get("FASTAPI_JWT_SECRET", "change-me-in-production")
-_JWT_ALGORITHM = "HS256"
+_JWT_SECRET         = settings.fastapi_jwt_secret
+_JWT_ALGORITHM      = "HS256"
 _JWT_EXPIRE_SECONDS = 30 * 24 * 3600  # 30 days
-_GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+_GOOGLE_CLIENT_ID   = settings.google_client_id
 _COOKIE_NAME = "fin_session"
 
 

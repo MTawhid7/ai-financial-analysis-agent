@@ -1,18 +1,21 @@
-"""Per-session Gemini API call counter with free-tier budget and RPM warnings."""
+"""Per-session Gemini API call counter with three-tier budget and RPM warnings.
+
+All thresholds and limits are sourced from settings (env-configurable).
+
+Budget thresholds (fraction of daily budget):
+  soft_warn (default 60%) — advisory; logged at INFO
+  warn      (default 80%) — hard warning; logged at WARNING
+  defer     (default 95%) — activate caching-only mode
+"""
 
 from __future__ import annotations
 
 import logging
-import os
 import time
 
+from ..config import settings
+
 logger = logging.getLogger(__name__)
-
-_WARN_THRESHOLD = 0.80  # Warn at 80% of daily budget
-
-# Free-tier RPM limits (requests per minute, 60-second rolling window)
-_PRIMARY_RPM_LIMIT = 15
-_SUB_RPM_LIMIT = 30
 
 
 class _RpmBucket:
@@ -38,20 +41,19 @@ class RequestBudgetTracker:
     """Tracks Gemini API calls for a single pipeline run.
 
     Counts primary (Flash) and sub-task (Flash-Lite) calls separately.
-    Logs a WARNING when 80% of the estimated daily budget is consumed.
+    Emits warnings at configurable budget thresholds (soft/hard/deferral).
     """
 
     def __init__(self, daily_budget: int | None = None) -> None:
-        self._daily_budget = daily_budget or int(
-            os.getenv("GEMINI_DAILY_REQUEST_BUDGET", "1500")
-        )
-        self._primary_calls = 0
-        self._sub_calls = 0
-        self._cache_hits = 0
-        self._warned = False
+        self._daily_budget   = daily_budget or settings.llm_daily_budget
+        self._primary_calls  = 0
+        self._sub_calls      = 0
+        self._cache_hits     = 0
+        self._soft_warned    = False
+        self._warned         = False
         self._model_degraded = False
-        self._primary_rpm = _RpmBucket(_PRIMARY_RPM_LIMIT)
-        self._sub_rpm = _RpmBucket(_SUB_RPM_LIMIT)
+        self._primary_rpm    = _RpmBucket(settings.llm_primary_rpm_limit)
+        self._sub_rpm        = _RpmBucket(settings.llm_fallback_rpm_limit)
 
     # ------------------------------------------------------------------
     # Mutation
@@ -64,7 +66,7 @@ class RequestBudgetTracker:
             logger.warning(
                 "RPM alert: %d primary calls in last 60s (free-tier limit: %d RPM)",
                 self._primary_rpm.current_rpm(),
-                _PRIMARY_RPM_LIMIT,
+                settings.llm_primary_rpm_limit,
             )
 
     def record_sub_call(self) -> None:
@@ -74,18 +76,20 @@ class RequestBudgetTracker:
             logger.warning(
                 "RPM alert: %d sub-model calls in last 60s (free-tier limit: %d RPM)",
                 self._sub_rpm.current_rpm(),
-                _SUB_RPM_LIMIT,
+                settings.llm_fallback_rpm_limit,
             )
 
     def record_cache_hit(self) -> None:
         self._cache_hits += 1
 
     def record_model_degradation(self) -> None:
-        """Record that the primary model was rate-limited and Flash-Lite fallback was used."""
+        """Record that the primary model was rate-limited and fallback was used."""
         if not self._model_degraded:
             self._model_degraded = True
             logger.warning(
-                "Model degradation recorded: Flash rate-limited, falling back to Flash-Lite."
+                "Model degradation recorded: primary model rate-limited, "
+                "falling back to %s.",
+                settings.llm_fallback_model,
             )
 
     # ------------------------------------------------------------------
@@ -101,19 +105,24 @@ class RequestBudgetTracker:
         """True if the primary model was rate-limited at least once this session."""
         return self._model_degraded
 
+    @property
+    def in_deferral_mode(self) -> bool:
+        """True if budget usage exceeds the deferral threshold (95% by default)."""
+        return self.total_calls / self._daily_budget >= settings.llm_budget_defer_pct
+
     def get_stats(self) -> dict:
+        ratio = self.total_calls / self._daily_budget
         return {
-            "primary_calls": self._primary_calls,
-            "sub_calls": self._sub_calls,
-            "total_calls": self.total_calls,
-            "cache_hits": self._cache_hits,
-            "daily_budget": self._daily_budget,
-            "budget_used_pct": round(
-                self.total_calls / self._daily_budget * 100, 1
-            ),
-            "model_degraded": self._model_degraded,
+            "primary_calls":      self._primary_calls,
+            "sub_calls":          self._sub_calls,
+            "total_calls":        self.total_calls,
+            "cache_hits":         self._cache_hits,
+            "daily_budget":       self._daily_budget,
+            "budget_used_pct":    round(ratio * 100, 1),
+            "model_degraded":     self._model_degraded,
+            "in_deferral_mode":   self.in_deferral_mode,
             "primary_rpm_current": self._primary_rpm.current_rpm(),
-            "sub_rpm_current": self._sub_rpm.current_rpm(),
+            "sub_rpm_current":    self._sub_rpm.current_rpm(),
         }
 
     # ------------------------------------------------------------------
@@ -121,14 +130,16 @@ class RequestBudgetTracker:
     # ------------------------------------------------------------------
 
     def _check_budget(self) -> None:
-        if self._warned:
-            return
         ratio = self.total_calls / self._daily_budget
-        if ratio >= _WARN_THRESHOLD:
+        if not self._soft_warned and ratio >= settings.llm_budget_soft_warn_pct:
+            logger.info(
+                "Budget soft warning: %d/%d calls used (%.0f%% of daily limit).",
+                self.total_calls, self._daily_budget, ratio * 100,
+            )
+            self._soft_warned = True
+        if not self._warned and ratio >= settings.llm_budget_warn_pct:
             logger.warning(
                 "Budget alert: %d/%d Gemini API calls used (%.0f%% of daily limit).",
-                self.total_calls,
-                self._daily_budget,
-                ratio * 100,
+                self.total_calls, self._daily_budget, ratio * 100,
             )
             self._warned = True

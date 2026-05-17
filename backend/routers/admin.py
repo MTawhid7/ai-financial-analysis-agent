@@ -13,24 +13,22 @@ GET  /admin/documents/users    — List all user-uploaded documents (admin overs
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, status
 from pydantic import BaseModel
 
+from ai_financial_analyst.config import settings
 from ..core.deps import CurrentUser, get_current_user
 from ..core import session_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+_MAX_UPLOAD_BYTES   = 50 * 1024 * 1024
 _ALLOWED_EXTENSIONS = {".csv", ".pdf", ".xlsx", ".xls", ".docx", ".txt", ".md", ".json", ".html", ".htm"}
-_ADMIN_USER_IDS = set(
-    uid.strip() for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()
-)
+_ADMIN_USER_IDS     = set(settings.admin_user_ids)
 
 
 # ---------------------------------------------------------------------------

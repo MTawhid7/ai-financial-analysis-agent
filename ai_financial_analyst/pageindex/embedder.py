@@ -9,21 +9,22 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from typing import Any
+
+from ..config import settings
 
 logger = logging.getLogger(__name__)
 
-_EMBED_MODEL   = "models/text-embedding-004"
-_EMBED_DIMS    = 768
-_BATCH_SIZE    = 100  # max texts per Gemini embedding request
+_EMBED_MODEL = settings.llm_embedding_model
+_EMBED_DIMS  = 768
+_BATCH_SIZE  = 100  # max texts per Gemini embedding request
 
 
 def _make_embedder(task_type: str) -> Any:
     from langchain_google_genai import GoogleGenerativeAIEmbeddings
     return GoogleGenerativeAIEmbeddings(
         model=_EMBED_MODEL,
-        google_api_key=os.environ["GOOGLE_API_KEY"],
+        google_api_key=settings.google_api_key,
         task_type=task_type,
     )
 

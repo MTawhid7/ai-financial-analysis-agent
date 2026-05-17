@@ -9,14 +9,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import time
 import uuid
 from typing import Any
 
+from ..config import settings
+
 logger = logging.getLogger(__name__)
 
-_UPLOAD_DIR = os.getenv("UPLOAD_DIR", ".uploads")
+_UPLOAD_DIR = settings.upload_dir
 
 
 # ---------------------------------------------------------------------------

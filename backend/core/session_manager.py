@@ -10,9 +10,11 @@ from __future__ import annotations
 import logging
 import time
 
+from ai_financial_analyst.config import settings
+
 logger = logging.getLogger(__name__)
 
-_TTL_SECONDS = 1800  # 30 minutes
+_TTL_SECONDS = settings.pipeline_session_ttl_s
 _cache: dict[str, tuple[object, float]] = {}  # user_id → (agent, last_access_ts)
 
 

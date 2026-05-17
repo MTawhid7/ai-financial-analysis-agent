@@ -11,14 +11,14 @@ import os
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 from .models import Base
+from ai_financial_analyst.config import settings
 
 logger = logging.getLogger(__name__)
 
 # Fallback to local SQLite if DATABASE_URL is not set (for testing/development)
-_DATABASE_URL = os.getenv("DATABASE_URL")
+_DATABASE_URL = settings.database_url
 if not _DATABASE_URL:
-    # Use SQLite for backwards compatibility if .env is missing
-    _db_path = os.getenv("MEMORY_DB_PATH", ".memory/memory.db")
+    _db_path = settings.memory_db_path
     os.makedirs(os.path.dirname(_db_path) or ".", exist_ok=True)
     _DATABASE_URL = f"sqlite+aiosqlite:///{_db_path}"
 

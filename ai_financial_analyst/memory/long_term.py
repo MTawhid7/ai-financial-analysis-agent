@@ -27,9 +27,11 @@ from typing import Any
 
 import aiosqlite
 
+from ..config import settings
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_DB_PATH = ".memory/memory.db"
+_DEFAULT_DB_PATH = settings.memory_db_path
 
 
 def _cosine(a: list[float], b: list[float]) -> float:

@@ -17,16 +17,15 @@ async pipelines; SqliteSaver only supports synchronous methods).
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
+from ..config import settings
 from ..core.artifacts import RunArtifacts
 from ..core.budget_tracker import RequestBudgetTracker
 from ..core.llm import CircuitBreakerError, get_primary_llm_with_fallback, get_subllm
@@ -38,12 +37,10 @@ from .editor import editor_node
 from .quant_analyst import quant_analyst_node
 from .researcher import researcher_node
 
-load_dotenv()
-
 logger = logging.getLogger(__name__)
 
-_CHECKPOINT_PATH = os.getenv("CHECKPOINT_DB_PATH", ".checkpoints/state.db")
-_ARTIFACTS_DIR = os.getenv("ARTIFACTS_DIR", "debug_artifacts")
+_CHECKPOINT_PATH = settings.checkpoint_db_path
+_ARTIFACTS_DIR   = settings.artifacts_dir
 
 
 def _clear_old_artifacts(output_dir: str) -> None:

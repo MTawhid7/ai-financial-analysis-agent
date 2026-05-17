@@ -1,14 +1,10 @@
 """diskcache wrapper with configurable per-call TTL.
 
-TTL constants (use these at call sites rather than magic numbers):
-  TTL_PRICE            15 min  — real-time-ish prices via fast_info
-  TTL_FUNDAMENTALS      6 h   — PE, market cap, margins (refreshed daily by Yahoo)
-  TTL_FINANCIALS       24 h   — income statement, balance sheet, cash flow
-  TTL_MARKET_BENCHMARK 24 h   — S&P 500 history for beta calculation
-  TTL_RISK_FREE         1 h   — risk-free rate (^TNX)
-  TTL_DAMODARAN        30 d   — Damodaran sector benchmarks (published annually)
-  TTL_WEB_SEARCH        1 h   — financial news (was 4h — too stale for earnings moves)
-  TTL_DEFAULT           4 h   — fallback for anything not explicitly categorised
+TTL values are sourced from settings (env-configurable). Legacy module-level
+constants are retained as aliases for backwards compatibility with existing
+import sites that do `from .cache import TTL_PRICE`.
+
+All values are now overridable via environment variables — see config/settings.py.
 """
 
 from __future__ import annotations
@@ -16,22 +12,23 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from typing import Any, Callable
 
 import diskcache
 
+from ..config import settings
+
 logger = logging.getLogger(__name__)
 
-# ── TTL constants (seconds) ───────────────────────────────────────────────────
-TTL_PRICE            = 15 * 60            # 15 minutes
-TTL_FUNDAMENTALS     = 6  * 60 * 60       # 6 hours
-TTL_FINANCIALS       = 24 * 60 * 60       # 24 hours
-TTL_MARKET_BENCHMARK = 24 * 60 * 60       # 24 hours
-TTL_RISK_FREE        =  1 * 60 * 60       # 1 hour
-TTL_DAMODARAN        = 30 * 24 * 60 * 60  # 30 days
-TTL_WEB_SEARCH       =  1 * 60 * 60       # 1 hour (reduced from 4h)
-TTL_DEFAULT          =  4 * 60 * 60       # 4 hours (legacy default)
+# ── TTL aliases (backwards-compatible; sourced from settings) ──────────────────
+TTL_PRICE            = settings.ttl_price_s
+TTL_FUNDAMENTALS     = settings.ttl_fundamentals_s
+TTL_FINANCIALS       = settings.ttl_financials_s
+TTL_MARKET_BENCHMARK = settings.ttl_market_benchmark_s
+TTL_RISK_FREE        = settings.ttl_risk_free_s
+TTL_DAMODARAN        = settings.ttl_damodaran_s
+TTL_WEB_SEARCH       = settings.ttl_web_search_s
+TTL_DEFAULT          = settings.ttl_default_s
 
 _TTL_SECONDS = TTL_DEFAULT  # kept for any external references
 
@@ -40,7 +37,7 @@ class ResultCache:
     """Persistent on-disk cache keyed by tool name + canonical args hash."""
 
     def __init__(self, cache_dir: str | None = None) -> None:
-        path = cache_dir or os.getenv("CACHE_DIR", ".cache")
+        path = cache_dir or settings.cache_dir
         self._cache = diskcache.Cache(path)
 
     # ------------------------------------------------------------------
@@ -70,7 +67,7 @@ class ResultCache:
     ) -> tuple[Any, bool]:
         """Return (result, cache_hit). Calls fetch_fn on miss.
 
-        Pass one of the TTL_* constants as `ttl` to control staleness per data type.
+        Pass one of the TTL_* constants or settings.get_ttl(data_type) as `ttl`.
         """
         cached = self.get(tool_name, args)
         if cached is not None:
