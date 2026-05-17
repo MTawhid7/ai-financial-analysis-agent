@@ -145,11 +145,13 @@ Researcher → Quant Analyst → Editor → Report + Charts
 | `ai_financial_analyst/core/llm/` | LLM package: protocols.py, circuit_breaker.py, gemini.py, registry.py |
 | `ai_financial_analyst/core/utils.py` | Shared utilities: safe_float, null_result, assess_data_quality, estimate_tokens |
 | `ai_financial_analyst/data/` | Data access layer: yahoo/* (7 modules), market/*, benchmark/*, search/* |
-| `ai_financial_analyst/data/yahoo/__init__.py` | Concurrent fetch coordinator (asyncio.gather + semaphore) |
+| `ai_financial_analyst/data/yahoo/__init__.py` | Concurrent fetch coordinator (asyncio.gather + semaphore, adaptive exit) |
 | `ai_financial_analyst/data/search/tavily.py` | Injectable TavilySearchClient with credibility scoring + date filtering |
-| `ai_financial_analyst/memory/protocol.py` | MemoryBackend Protocol (runtime_checkable) |
+| `ai_financial_analyst/memory/protocol.py` | MemoryBackend Protocol (@runtime_checkable, 13 methods) |
 | `ai_financial_analyst/memory/in_memory.py` | InMemoryBackend for test isolation (zero file I/O) |
-| `tests/conftest.py` | Shared fixtures: test_settings, mock_llm, mock_cache, in_memory_backend |
+| `tests/conftest.py` | Shared fixtures: test_settings, mock_llm, mock_cache, in_memory_backend, mock_yf_ticker |
+| `ai_financial_analyst/agents/conversational_agent.py` | DI constructor + `create()` factory; uses `LLMRegistry` |
+| `ai_financial_analyst/agents/manager.py` | Cached tool list + `_StepCallbackProxy` — no rebuild per turn |
 
 ---
 
@@ -166,6 +168,15 @@ All tunable values live in `config/settings.py` (`Settings` class, pydantic-sett
 
 ### Concurrent Data Fetching
 `data/yahoo/__init__.py` fetches all 7 data types concurrently using `asyncio.gather`. yfinance HTTP calls consume **zero Gemini RPM quota** — concurrency is safe. The semaphore limits concurrent yfinance threads to `settings.yahoo_fetch_concurrency` (default 3). Phase 1 fetches 3 core types; Phase 2 fetches 4 extended types only if at least 1 core type succeeded.
+
+### ConversationalAgent — Dependency Injection
+`ConversationalAgent` accepts all dependencies via constructor: `ConversationalAgent(user_id, *, llm_registry=None, memory=None)`. When not injected, defaults are created from `settings`. Use `ConversationalAgent.create(user_id)` in production code; use `ConversationalAgent(user_id, llm_registry=mock, memory=mock)` in tests. `session_manager.py` calls `ConversationalAgent.create()` — no direct `LLMRegistry` construction outside the factory.
+
+### ManagerAgent — Cached Tool List
+`ManagerAgent` builds its tool list **once** in `__init__` and caches `self._llm_with_tools`. The `step_callback` varies per request; it flows through `_StepCallbackProxy` — a mutable container that tools capture by reference. `ManagerAgent.run()` updates `proxy.fn = step_callback` before each turn. No tool list rebuild per message.
+
+### MemoryBackend Protocol
+`memory/protocol.py` defines `MemoryBackend` as a `@runtime_checkable` Protocol covering 13 methods. `LongTermMemory` and `InMemoryBackend` both implement it. `MemoryManager.__init__` accepts `LongTermMemory | MemoryBackend` — tests inject `InMemoryBackend` for zero file I/O. Adding a new backend (Postgres, Redis) requires only implementing the Protocol — no changes to `MemoryManager`.
 
 ### `AgentState` Return Pattern
 All agent nodes return `AgentState(**{**state, "key": value})` — never `AgentState(**state, key=value)`. The latter causes `TypeError: got multiple values for keyword argument`.

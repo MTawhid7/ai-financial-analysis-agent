@@ -581,33 +581,63 @@ def build_tools(
     ]
 
 
+class _StepCallbackProxy:
+    """Mutable container for the per-turn step callback.
+
+    Tools capture this proxy at construction time. Before each turn, `run()`
+    updates `proxy.fn` so tools always call the current callback without needing
+    to rebuild the tool list. This eliminates the cost of calling build_tools()
+    on every user message.
+    """
+
+    __slots__ = ("fn",)
+
+    def __init__(self) -> None:
+        self.fn: Callable[[dict], None] | None = None
+
+    def __call__(self, event: dict) -> None:
+        if self.fn is not None:
+            self.fn(event)
+
+
 class ManagerAgent:
-    """LLM manager that autonomously selects and chains tools to fulfil any request."""
+    """LLM manager that autonomously selects and chains tools to fulfil any request.
+
+    Tools are built once at construction time via build_tools(). The step_callback
+    is updated per turn through _StepCallbackProxy — no tool rebuild needed.
+    The LLM binding (llm.bind_tools) is also cached; it is recreated only when the
+    underlying LLM instance changes (e.g. after a circuit-breaker reset).
+    """
 
     def __init__(self, primary_llm: Any, agent: Any) -> None:
-        self._primary_llm = primary_llm
-        self._agent = agent
+        self._primary_llm    = primary_llm
+        self._agent          = agent
+        self._callback_proxy = _StepCallbackProxy()
+
+        # Build tool list once — captures agent + callback proxy in closures.
+        self._tools         = build_tools(agent, self._callback_proxy)
+        self._llm_with_tools = self._primary_llm.bind_tools(self._tools)
+        self._tool_map       = {t.name: t for t in self._tools}
 
     async def run(
         self,
-        message: str,
-        state: ConversationState,
-        step_callback: Callable[[dict], None] | None = None,
+        message:         str,
+        state:           ConversationState,
+        step_callback:   Callable[[dict], None] | None = None,
         conversation_id: str | None = None,
     ) -> str:
         """Process a user message through the tool-use loop.
 
         Returns the final text response after all tool calls are resolved.
+        The step_callback is updated via proxy so tools call the right SSE queue.
         """
-        # Store conversation_id so tools can access it via agent
-        self._agent._current_session_id = state.get("session_id", "")
-        self._agent._current_conversation_id = conversation_id
+        # Update mutable references for this turn
+        self._callback_proxy.fn                    = step_callback
+        self._agent._current_session_id            = state.get("session_id", "")
+        self._agent._current_conversation_id       = conversation_id
 
-        tools = build_tools(self._agent, step_callback)
-        llm_with_tools = self._primary_llm.bind_tools(tools)
-
-        # Build message history from ConversationState
-        history = []
+        # Build windowed message history
+        history: list = []
         for msg in ShortTermMemory.get_windowed_messages(state.get("messages", []), max_tokens=4000):
             if msg["role"] == "user":
                 history.append(HumanMessage(content=msg["content"]))
@@ -627,36 +657,40 @@ class ManagerAgent:
         if memory_ctx:
             system_content = f"{_MANAGER_SYSTEM}\n\n---\nUser context:\n{memory_ctx}"
 
-        messages: list = [SystemMessage(content=system_content)] + history + [HumanMessage(content=message)]
+        messages: list = (
+            [SystemMessage(content=system_content)]
+            + history
+            + [HumanMessage(content=message)]
+        )
 
-        # Tool-use loop
-        tool_map = {t.name: t for t in tools}
-
+        # Tool-use loop (max _MAX_TOOL_ROUNDS)
         for _round in range(_MAX_TOOL_ROUNDS):
             try:
-                response = await llm_with_tools.ainvoke(messages)
+                response = await self._llm_with_tools.ainvoke(messages)
             except Exception as exc:
                 logger.error("Manager LLM call failed: %s", exc)
                 return f"I encountered an error: `{exc}`. Please try again."
 
             if not getattr(response, "tool_calls", None):
-                # No more tool calls — this is the final text response
-                return content_to_str(response.content if hasattr(response, "content") else response)
+                # No more tool calls — final text response
+                return content_to_str(
+                    response.content if hasattr(response, "content") else response
+                )
 
-            # Execute each tool call
+            # Execute all tool calls in this round
             messages.append(response)
             for tc in response.tool_calls:
                 tool_name = tc["name"]
                 tool_args = tc["args"]
-                tool_id = tc["id"]
+                tool_id   = tc["id"]
 
-                t = tool_map.get(tool_name)
+                t = self._tool_map.get(tool_name)
                 if t is None:
                     result = f"Unknown tool: {tool_name}"
                 else:
                     try:
                         logger.info("Manager: calling %s(%s)", tool_name, list(tool_args.keys()))
-                        raw = await t.ainvoke(tool_args) if hasattr(t, "ainvoke") else t.invoke(tool_args)
+                        raw    = await t.ainvoke(tool_args) if hasattr(t, "ainvoke") else t.invoke(tool_args)
                         result = str(raw)
                     except Exception as exc:
                         logger.error("Tool %s failed: %s", tool_name, exc)
@@ -664,6 +698,5 @@ class ManagerAgent:
 
                 messages.append(ToolMessage(content=result, tool_call_id=tool_id))
 
-        # Exceeded max rounds — return what we have
         logger.warning("Manager exceeded max tool rounds (%d)", _MAX_TOOL_ROUNDS)
         return "I was unable to complete the request within the allowed steps. Please try a more specific question."

@@ -32,7 +32,7 @@ def get_or_create(user_id: str) -> object:
             return agent
         logger.debug("Session expired for user %s; creating new agent", user_id[:8])
 
-    agent = ConversationalAgent(user_id=user_id)
+    agent = ConversationalAgent.create(user_id=user_id)
     _cache[user_id] = (agent, now)
     logger.info("Created new ConversationalAgent for user %s", user_id[:8])
     return agent

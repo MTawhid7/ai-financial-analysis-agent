@@ -19,6 +19,7 @@ from langchain_core.messages import HumanMessage
 from ..core.conversation_state import ChatMessage
 from ..core.llm import content_to_str
 from .long_term import LongTermMemory
+from .protocol import MemoryBackend
 from .short_term import ShortTermMemory
 
 logger = logging.getLogger(__name__)
@@ -66,12 +67,12 @@ class MemoryManager:
 
     def __init__(
         self,
-        long_term: LongTermMemory,
-        subllm: Any = None,
-        embedder: Any = None,
+        long_term: LongTermMemory | MemoryBackend,
+        subllm:    Any = None,
+        embedder:  Any = None,
     ) -> None:
-        self._lt = long_term
-        self._subllm = subllm
+        self._lt       = long_term
+        self._subllm   = subllm
         self._embedder = embedder
 
     # ------------------------------------------------------------------

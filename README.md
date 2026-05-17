@@ -29,11 +29,21 @@ A **conversational AI financial analyst** with Google authentication, persistent
 ## Architecture
 
 ```
-React 19 + Vite  →  FastAPI 0.115  →  Manager LLM (tool-use)  →  LangGraph Pipeline
-       │                   │                    │                        │
-  Google OAuth         JWT cookie           8 tools                 Researcher
-  SSE streaming        DB migration         auto-routing            Quant Analyst
-  Citation badges      user_id scope        memory context          Editor
+React 19 + Vite  →  FastAPI 0.115  →  ConversationalAgent  →  Manager LLM (tool-use)  →  LangGraph Pipeline
+       │                   │                    │                         │                        │
+  Google OAuth         JWT cookie          LLMRegistry               11 tools                 Researcher (concurrent)
+  SSE streaming        DB migration        MemoryBackend              auto-routing             Quant Analyst (DCF+scenarios)
+  Citation badges      user_id scope       (Protocol)                 memory context           Editor
+
+Layered package structure:
+  config/    — Settings (pydantic-settings, all config from env vars)
+  core/llm/  — LLMClient Protocol, CircuitBreaker, LLMRegistry (no module-level singletons)
+  core/utils — safe_float, estimate_tokens, extract_domain (shared utilities)
+  data/      — yahoo/* (7 modules), market/*, benchmark/*, search/* (injectable, concurrent)
+  tools/     — thin @tool wrappers delegating to data/
+  agents/    — ConversationalAgent (DI), ManagerAgent (cached tools), researcher (concurrent)
+  memory/    — MemoryBackend Protocol, SQLite + InMemory implementations
+  pipeline/  — LangGraph DAG: researcher → quant_analyst → editor (conditional routing)
 ```
 
 ```mermaid
@@ -139,7 +149,7 @@ cd frontend && npm run dev
 
 ```bash
 pytest tests/unit/ tests/integration/ tests/adversarial/ -v
-# 224 tests passing as of Phase 2
+# 477 tests passing
 cd frontend && npm run build      # zero TypeScript errors required
 ```
 
@@ -149,26 +159,48 @@ cd frontend && npm run build      # zero TypeScript errors required
 
 ```
 ai_financial_analyst/
-  agents/
-    manager.py               Tool-use LLM orchestrator (10 tools: analysis, charts, docs, memory…)
-    conversational_agent.py  Session wrapper; delegates to Manager
-    comparison_agent.py      Multi-ticker pipeline + comparison table
-    refinement_handler.py    str_replace surgical report editing
-    researcher.py / quant_analyst.py / editor.py / orchestrator.py
+  config/
+    settings.py              Single-source Settings class (pydantic-settings, all env-overridable)
   core/
-    llm.py                   Gemini client: retry + circuit breaker + Flash-Lite fallback
-    state.py / conversation_state.py
-    sanitizer.py             Injection filter + canary token
+    llm/                     LLM abstraction layer
+      protocols.py           LLMClient Protocol (@runtime_checkable)
+      circuit_breaker.py     CircuitBreaker (per-instance, no module-level singletons)
+      gemini.py              Gemini Flash + Flash-Lite wrappers with retry
+      registry.py            LLMRegistry: creates and caches LLM instances per session
+    utils.py                 Shared utilities: safe_float, estimate_tokens, extract_domain
+    sanitizer.py             Injection filter + dynamic canary token + NFKC normalization
     budget_tracker.py / cache.py / tracing.py / artifacts.py
+    state.py / conversation_state.py
+  data/                      Data access layer (all fetch logic lives here)
+    yahoo/                   7 focused modules: price, fundamentals, balance_sheet,
+                             cash_flow, earnings, metrics, trends + concurrent coordinator
+    market/                  risk_free.py (^TNX), sp500.py (^GSPC)
+    benchmark/               damodaran.py (live), static.py (lazy fallback), normalizer.py
+    search/                  tavily.py (injectable client), credibility.py (source tiers)
+  tools/                     Thin LangChain @tool wrappers — delegate to data/
+    yahoo_finance.py / benchmark_lookup.py / web_search.py / market_data.py
+    calculator.py            numexpr AST guard + format hints + context variables
+    financial_formulas.py    NPV, IRR, PV, FV, CAGR, WACC, payback, ROI
+  agents/
+    conversational_agent.py  DI constructor + create() factory; uses LLMRegistry
+    manager.py               Tool-use orchestrator (cached tools, _StepCallbackProxy)
+    comparison_agent.py      Multi-ticker pipeline + comparison table
+    refinement_handler.py    str_replace surgical editing; INSERT versioning
+    researcher.py            Concurrent two-phase yfinance fetch + TavilySearchClient
+    quant_analyst.py         DCF, scenario analysis, structured output
+    editor.py                SOP rubric, financial number grounding check
+    orchestrator.py          LangGraph DAG with conditional routing + early_exit
   memory/
-    long_term.py             SQLAlchemy/Postgres: preferences, summaries, conversations, messages, reports
+    protocol.py              MemoryBackend Protocol (@runtime_checkable)
+    in_memory.py             InMemoryBackend (zero I/O, for tests)
+    long_term.py             SQLite implementation via aiosqlite
     memory_manager.py        Facade: context injection, preference extraction, summary saving
-    short_term.py            Token-budget context window
-  pageindex/                 ← PageIndex document retrieval system
+    short_term.py            Turn-pair aware token-budget context window
+  pageindex/                 PageIndex document retrieval system
     __init__.py              Public API: index_document, search_documents, get_page
     embedder.py              Gemini text-embedding-004 (768-dim) + ResultCache
     pipeline.py              Ingestion: extract → summarise → embed → store → link
-    retriever.py             Hybrid search: pgvector ANN + Postgres FTS + RRF
+    retriever.py             Hybrid search: pgvector ANN + Postgres FTS + RRF + HyDE
     ocr.py                   Scanned PDF detection + pytesseract OCR fallback
   charts/                    13 Plotly chart types (modular)
     _theme.py / _data.py     Palette, fetch utils, ticker aliases, earnings annotations
