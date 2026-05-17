@@ -186,7 +186,7 @@ def _make_mock_ticker(
     return mock
 
 
-@patch("ai_financial_analyst.tools.yahoo_finance.yf.Ticker")
+@patch("yfinance.Ticker")   # patches yf.Ticker in all data/yahoo/* modules
 @patch("ai_financial_analyst.tools.yahoo_finance._cache")
 class TestYahooFinanceTool:
 

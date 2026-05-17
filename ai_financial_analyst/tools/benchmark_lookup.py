@@ -30,10 +30,19 @@ from .base import StrictToolInput, ToolError, ErrorType, safe_tool_call
 logger = logging.getLogger(__name__)
 
 _cache     = ResultCache()
-_DATA_PATH = Path(__file__).parent.parent / "data" / "benchmarks.json"
 
-with _DATA_PATH.open() as _f:
-    _STATIC_BENCHMARKS: dict = json.load(_f)
+# Static benchmarks are now lazily loaded by data/benchmark/static.py.
+# This property delegates to the lazy loader so import-time I/O is eliminated.
+def _get_static_benchmarks() -> dict:
+    from ..data.benchmark.static import load
+    return load()
+
+# Module-level alias for backward compat with code that references _STATIC_BENCHMARKS.
+class _LazyStaticBenchmarks:
+    def get(self, key, default=None):
+        return _get_static_benchmarks().get(key, default)
+
+_STATIC_BENCHMARKS = _LazyStaticBenchmarks()
 
 # ── Damodaran URLs ─────────────────────────────────────────────────────────────
 _DAMODARAN_URLS = {

@@ -1,9 +1,12 @@
-"""Researcher Agent — data acquisition node for the LangGraph pipeline.
+"""Researcher Agent — concurrent data acquisition node for the LangGraph pipeline.
 
-Fetches 6 data types per ticker (price_history, fundamentals, balance_sheet,
-cash_flow, earnings, price_metrics) plus a web-news search.  New data types are
-fetched after the original three so that MAX_ITERATIONS failures only degrade
-gracefully — the core data is always attempted first.
+Architecture change from sequential to concurrent:
+  Old: 7 data types × N tickers fetched one-by-one in a serial loop (~60–120s/ticker)
+  New: Phase-1 (3 core types parallel) + Phase-2 (4 extended types parallel) per ticker
+       with adaptive early exit when all core types fail (~6–10s/ticker)
+
+yfinance HTTP calls consume zero Gemini RPM quota — concurrency is safe.
+The asyncio.Semaphore in data/yahoo/__init__.py limits to 3 concurrent threads.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from ..config import settings
 from ..core.state import (
     AgentState,
     DataCoverage,
@@ -21,51 +25,27 @@ from ..core.state import (
     PartialStateError,
 )
 from ..core.tracing import ErrorType, RunTracer
-from ..tools.yahoo_finance import yahoo_finance_tool
-from ..tools.web_search import web_search_tool
+from ..core.utils import estimate_tokens
+from ..data.yahoo import fetch_ticker_data
+from ..data.search.tavily import TavilySearchClient
 
 logger = logging.getLogger(__name__)
 
-# Core data types (must succeed for a useful report)
-_CORE_DATA_TYPES = ["price_history", "fundamentals", "balance_sheet"]
-# Extended data types (improve quality; graceful degradation if missing)
-_EXTENDED_DATA_TYPES = ["cash_flow", "earnings", "price_metrics", "financials_trend"]
-
-MAX_ITERATIONS = 10   # 6 yfinance calls + 1 web search + 3 buffer
+# Retained for backward compatibility with existing tests and callers.
+# The concurrent fetcher no longer uses a hard iteration counter — adaptive
+# early-exit logic in data/yahoo/__init__.py replaces it.
+MAX_ITERATIONS = 10
 
 
 def _current_year() -> str:
     return str(datetime.utcnow().year)
 
 
-_SYSTEM_PROMPT = """You are a financial data researcher. Your job is to gather comprehensive
-financial data for the requested stock tickers.
-
-For EACH ticker you MUST:
-1. Call yahoo_finance with data_type="price_history"
-2. Call yahoo_finance with data_type="fundamentals"
-3. Call yahoo_finance with data_type="balance_sheet"
-4. Call yahoo_finance with data_type="cash_flow"
-5. Call yahoo_finance with data_type="earnings"
-6. Call yahoo_finance with data_type="price_metrics"
-7. Call web_search with a query like "{TICKER} recent news analyst outlook {YEAR}"
-
-Rules:
-- Do NOT skip any data type for any ticker.
-- If a tool returns a ToolError JSON, record it and move on — do NOT retry.
-- If a tool returns null data, note the gap explicitly in your final summary.
-- Your final response MUST be a JSON object with keys:
-  "raw_data": {{ ticker -> {{ data_type -> result }} }},
-  "data_coverage": [ {{ ticker, price_history, fundamentals, balance_sheet, news_search, data_gaps }} ],
-  "researcher_gaps": [ "description of each missing data point" ]
-"""
-
-
 async def researcher_node(state: AgentState, config: dict | None = None) -> AgentState:
-    """LangGraph node: Researcher agent."""
-    tracer: RunTracer | None = config.get("tracer") if config else None
-    artifacts = config.get("artifacts") if config else None
-    step_callback = config.get("step_callback") if config else None
+    """LangGraph node: Researcher agent (concurrent data fetching)."""
+    tracer:        RunTracer | None = config.get("tracer")        if config else None
+    artifacts                      = config.get("artifacts")      if config else None
+    step_callback                  = config.get("step_callback")  if config else None
 
     tickers        = state.get("tickers", [])
     query          = state.get("query", "")
@@ -75,131 +55,132 @@ async def researcher_node(state: AgentState, config: dict | None = None) -> Agen
     if tracer:
         tracer.record_agent_start("researcher", {"tickers": tickers, "query": query})
 
-    raw_data:      dict[str, Any]        = {}
-    data_coverage: list[DataCoverage]    = []
-    data_gaps:     list[str]             = []
+    raw_data:      dict[str, Any]     = {}
+    data_coverage: list[DataCoverage] = []
+    data_gaps:     list[str]          = []
     step = len(iteration_log)
 
     for ticker in tickers:
-        ticker_data: dict[str, Any] = {}
+        step += 1
+
+        # ── Phase 1+2: Concurrent yfinance fetch (adaptive) ──────────────────
+        if step_callback:
+            step_callback({
+                "step": step, "agent": "researcher", "tool": "yahoo_finance",
+                "input": {"ticker": ticker, "mode": "concurrent"}, "cache_hit": False, "ok": True,
+            })
+
+        ticker_data: dict[str, Any] = await fetch_ticker_data(ticker)
+
+        # Build iteration log entries and coverage from results
         coverage = DataCoverage(
-            ticker=ticker,
-            price_history=False,
-            fundamentals=False,
-            balance_sheet=False,
-            news_search=False,
-            data_gaps=[],
+            ticker        = ticker,
+            price_history = "price_history" in ticker_data,
+            fundamentals  = "fundamentals"  in ticker_data,
+            balance_sheet = "balance_sheet" in ticker_data,
+            news_search   = False,
+            data_gaps     = [],
         )
-        calls_made = 0
 
-        # ── Fetch all yfinance data types ─────────────────────────────────
-        all_types = _CORE_DATA_TYPES + _EXTENDED_DATA_TYPES
-        for data_type in all_types:
-            if calls_made >= MAX_ITERATIONS:
-                logger.warning("max_iterations=%d reached for %s", MAX_ITERATIONS, ticker)
-                break
-
-            step += 1
-            calls_made += 1
-            tool_input = {"ticker": ticker, "data_type": data_type}
-
-            try:
-                result_str = await yahoo_finance_tool.arun(tool_input)
-                result     = json.loads(result_str)
-            except Exception as exc:
-                result     = {"error_type": "TOOL_ERROR", "message": str(exc)}
-                result_str = json.dumps(result)
-
-            cache_hit = result.get("cache_hit", False)
+        # Surface data quality / degradation from each fetched type
+        for data_type, result in ticker_data.items():
+            result_str = json.dumps(result)
             iteration_log.append(IterationLogEntry(
-                step=step, agent="researcher", tool="yahoo_finance",
-                input=tool_input, output_tokens=len(result_str) // 4, cache_hit=cache_hit,
+                step          = step,
+                agent         = "researcher",
+                tool          = "yahoo_finance",
+                input         = {"ticker": ticker, "data_type": data_type},
+                output_tokens = estimate_tokens(result_str),
+                cache_hit     = False,
             ))
-
             if tracer:
                 tracer.record_tool_call(
-                    agent="researcher", tool="yahoo_finance",
-                    input_data=tool_input, output_data=result,
-                    output_tokens=len(result_str) // 4, cache_hit=cache_hit,
+                    agent        = "researcher",
+                    tool         = "yahoo_finance",
+                    input_data   = {"ticker": ticker, "data_type": data_type},
+                    output_data  = result,
+                    output_tokens= estimate_tokens(result_str),
                 )
             if artifacts:
                 artifacts.record_tool_response(
-                    agent="researcher", tool="yahoo_finance",
-                    input_data=tool_input, full_output=result_str,
-                    step=step, cache_hit=cache_hit,
+                    agent      = "researcher",
+                    tool       = "yahoo_finance",
+                    input_data = {"ticker": ticker, "data_type": data_type},
+                    full_output= result_str,
+                    step       = step,
                 )
-            if step_callback:
-                step_callback({
-                    "step": step, "agent": "researcher", "tool": "yahoo_finance",
-                    "input": tool_input, "cache_hit": cache_hit,
-                    "ok": "error_type" not in result,
-                })
-
-            if "error_type" in result:
-                gap = f"{ticker}/{data_type}: {result.get('message', 'unknown error')}"
+            # Collect quality degradation notes as data gaps
+            note = result.get("degradation_note")
+            if result.get("data_quality") == "PARTIAL" and note:
+                gap = f"{ticker}/{data_type}: {note}"
+                coverage["data_gaps"].append(gap)
+                data_gaps.append(gap)
+            elif result.get("data_quality") == "UNAVAILABLE":
+                reason = result.get("reason", "unavailable")
+                gap    = f"{ticker}/{data_type}: {reason}"
                 coverage["data_gaps"].append(gap)
                 data_gaps.append(gap)
                 errors.append({"error_type": ErrorType.TOOL_ERROR.value, "detail": gap})
-            elif "reason" in result and result.get("result") is None:
-                gap = f"{ticker}/{data_type}: {result['reason']}"
-                coverage["data_gaps"].append(gap)
-                data_gaps.append(gap)
-            else:
-                ticker_data[data_type] = result
-                # Update core coverage flags
-                if data_type == "price_history":
-                    coverage["price_history"] = True
-                elif data_type == "fundamentals":
-                    coverage["fundamentals"] = True
-                elif data_type == "balance_sheet":
-                    coverage["balance_sheet"] = True
 
-        # ── Web news search ───────────────────────────────────────────────
-        if calls_made < MAX_ITERATIONS:
-            step += 1
-            calls_made += 1
-            news_query = (
-                f"{ticker} stock news analyst outlook earnings results {_current_year()}"
+        if not ticker_data:
+            gap = f"{ticker}: all data types failed — skipping"
+            data_gaps.append(gap)
+            errors.append({"error_type": ErrorType.TOOL_ERROR.value, "detail": gap})
+
+        # ── Web news search ───────────────────────────────────────────────────
+        step += 1
+        news_query = (
+            f"{ticker} stock news analyst outlook earnings results {_current_year()}"
+        )
+        news_result: dict = {}
+        try:
+            client     = TavilySearchClient()
+            results    = client.search(news_query)
+            news_result = {
+                "query":        news_query,
+                "result_count": len(results),
+                "summaries": [
+                    {
+                        "headline":    r.headline,
+                        "url":         r.url,
+                        "content":     r.content,
+                        "score":       r.score,
+                        "source_tier": r.source_tier,
+                    }
+                    for r in results if r.content
+                ],
+            }
+            ticker_data["news"] = news_result
+            coverage["news_search"] = True
+        except Exception as exc:
+            gap = f"{ticker}/news: {exc}"
+            coverage["data_gaps"].append(gap)
+            data_gaps.append(gap)
+            logger.warning("Web search failed for %s: %s", ticker, exc)
+
+        news_str = json.dumps(news_result)
+        iteration_log.append(IterationLogEntry(
+            step          = step,
+            agent         = "researcher",
+            tool          = "web_search",
+            input         = {"query": news_query},
+            output_tokens = estimate_tokens(news_str),
+            cache_hit     = False,
+        ))
+        if tracer:
+            tracer.record_tool_call(
+                agent         = "researcher",
+                tool          = "web_search",
+                input_data    = {"query": news_query},
+                output_data   = news_result,
+                output_tokens = estimate_tokens(news_str),
             )
-            news_input = {"query": news_query, "max_results": 3}
-
-            try:
-                news_str    = await web_search_tool.arun(news_input)
-                news_result = json.loads(news_str)
-            except Exception as exc:
-                news_result = {"error_type": "TOOL_ERROR", "message": str(exc)}
-                news_str    = json.dumps(news_result)
-
-            iteration_log.append(IterationLogEntry(
-                step=step, agent="researcher", tool="web_search",
-                input=news_input, output_tokens=len(news_str) // 4, cache_hit=False,
-            ))
-
-            if tracer:
-                tracer.record_tool_call(
-                    agent="researcher", tool="web_search",
-                    input_data=news_input, output_data=news_result,
-                    output_tokens=len(news_str) // 4,
-                )
-            if artifacts:
-                artifacts.record_tool_response(
-                    agent="researcher", tool="web_search",
-                    input_data=news_input, full_output=news_str, step=step,
-                )
-            if step_callback:
-                step_callback({
-                    "step": step, "agent": "researcher", "tool": "web_search",
-                    "input": news_input, "cache_hit": False,
-                    "ok": "error_type" not in news_result,
-                })
-
-            if "error_type" not in news_result:
-                ticker_data["news"] = news_result
-                coverage["news_search"] = True
-            else:
-                gap = f"{ticker}/news: {news_result.get('message', 'search failed')}"
-                coverage["data_gaps"].append(gap)
-                data_gaps.append(gap)
+        if step_callback:
+            step_callback({
+                "step": step, "agent": "researcher", "tool": "web_search",
+                "input": {"query": news_query}, "cache_hit": False,
+                "ok": coverage["news_search"],
+            })
 
         raw_data[ticker] = ticker_data
         data_coverage.append(coverage)
