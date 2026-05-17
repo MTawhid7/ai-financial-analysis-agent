@@ -8,20 +8,7 @@ No I/O — all state lives in ConversationState.messages.
 from __future__ import annotations
 
 from ..core.conversation_state import ChatMessage
-
-
-def _estimate_tokens(content: str) -> int:
-    """Estimate token count with content-type awareness.
-
-    JSON-heavy content (high density of {, [, ") is ~2 chars/token.
-    Prose and markdown is ~4 chars/token.
-    """
-    if not content:
-        return 0
-    structural = content.count("{") + content.count("[") + content.count('"')
-    json_density = structural / len(content)
-    chars_per_token = 2.0 if json_density > 0.10 else 4.0
-    return max(1, int(len(content) / chars_per_token))
+from ..core.utils import estimate_tokens as _estimate_tokens  # re-exported for callers
 
 
 class ShortTermMemory:

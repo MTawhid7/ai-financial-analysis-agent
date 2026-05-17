@@ -292,7 +292,7 @@ class TestCircuitBreakerHalfOpen:
 
     def _tripped_breaker(self) -> _CircuitBreaker:
         """Return a breaker that has just tripped (max failures reached)."""
-        cb = _CircuitBreaker(max_failures=2, window_seconds=60)
+        cb = _CircuitBreaker(max_failures=2, window_s=60)
         # Force two failures to trip it
         for _ in range(2):
             try:
