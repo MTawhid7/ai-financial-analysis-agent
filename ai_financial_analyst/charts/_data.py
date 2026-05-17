@@ -10,11 +10,15 @@ from ._theme import _AMBER
 logger = logging.getLogger(__name__)
 
 # ── Period → interval mapping ─────────────────────────────────────────────────
+# Short periods use fine-grained intraday intervals (within yfinance's 60-day limit
+# for sub-hourly data).  Longer periods use daily/weekly as before.
 _PERIOD_INTERVAL: dict[str, str] = {
-    "1d": "1h", "5d": "1h",
-    "1mo": "1d", "3mo": "1d", "6mo": "1d",
-    "1y": "1d", "2y": "1wk", "5y": "1wk",
-    "10y": "1mo", "ytd": "1d", "max": "1mo",
+    "1d":  "5m",   # ~78 bars at 5-min resolution (was "1h")
+    "5d":  "15m",  # ~130 bars at 15-min resolution (was "1h")
+    "1mo": "1h",   # ~143 bars hourly (was "1d")
+    "3mo": "1d",   "6mo": "1d",
+    "1y":  "1d",   "2y": "1wk",  "5y": "1wk",
+    "10y": "1mo",  "ytd": "1d",  "max": "1mo",
 }
 
 
@@ -31,6 +35,8 @@ def _interval_for_range(start: str | None, end: str | None, period: str) -> str:
         s = datetime.strptime(start[:10], "%Y-%m-%d")
         e = datetime.strptime(end[:10], "%Y-%m-%d") if end else datetime.now()
         days = (e - s).days
+        if days <= 5:    return "5m"   # intraday: 5-min bars for very short ranges
+        if days <= 30:   return "1h"   # hourly for up to 1 month
         if days <= 60:   return "1d"
         if days <= 730:  return "1wk"
         return "1mo"

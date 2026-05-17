@@ -44,6 +44,23 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (mag_a * mag_b)
 
 
+# Blend weights for semantic search: semantic relevance vs. recency.
+_DECAY_ALPHA = 0.7   # 70% semantic weight, 30% recency weight
+
+
+def _blended_score(similarity: float, created_at: float, lambda_: float) -> float:
+    """Combine cosine similarity with exponential time-decay.
+
+    With lambda=0.01: 30-day-old → 0.74 recency weight; 180-day-old → 0.16.
+    Set lambda=0 to rank purely by semantic similarity.
+    """
+    if lambda_ == 0.0:
+        return similarity
+    days_ago = (time.time() - created_at) / 86_400
+    recency = math.exp(-lambda_ * days_ago)
+    return _DECAY_ALPHA * similarity + (1.0 - _DECAY_ALPHA) * recency
+
+
 class LongTermMemory:
     """Persistent cross-session memory store.
 
@@ -73,6 +90,7 @@ class LongTermMemory:
                 CREATE TABLE IF NOT EXISTS preferences (
                     key        TEXT PRIMARY KEY,
                     value      TEXT NOT NULL,
+                    created_at REAL NOT NULL DEFAULT 0.0,
                     updated_at REAL NOT NULL
                 )
             """)
@@ -118,6 +136,13 @@ class LongTermMemory:
                     )
                 except Exception:
                     pass
+            # created_at for preferences — tracks when a preference was first stated.
+            try:
+                await db.execute(
+                    "ALTER TABLE preferences ADD COLUMN created_at REAL DEFAULT 0.0"
+                )
+            except Exception:
+                pass
             # Semantic search column for analysis summaries — nullable, added lazily.
             try:
                 await db.execute(
@@ -133,12 +158,28 @@ class LongTermMemory:
 
     async def save_preference(self, key: str, value: str) -> None:
         await self._ensure_init()
+        k, v = key.strip(), value.strip()
         async with aiosqlite.connect(self._db_path) as db:
+            # Read current value to detect and log changes.
+            async with db.execute(
+                "SELECT value FROM preferences WHERE key = ? AND user_id = ?",
+                (k, self._user_id),
+            ) as cur:
+                existing = await cur.fetchone()
+
+            if existing and existing[0] != v:
+                logger.info(
+                    "Preference '%s' updated: '%s' → '%s'", k, existing[0], v
+                )
+
+            now = time.time()
             await db.execute(
-                "INSERT INTO preferences (key, value, updated_at, user_id) VALUES (?, ?, ?, ?)"
-                " ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
-                " updated_at=excluded.updated_at, user_id=excluded.user_id",
-                (key.strip(), value.strip(), time.time(), self._user_id),
+                "INSERT INTO preferences (key, value, created_at, updated_at, user_id)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET"
+                " value=excluded.value, updated_at=excluded.updated_at",
+                # created_at NOT in ON CONFLICT SET — preserved from original INSERT.
+                (k, v, now, now, self._user_id),
             )
             await db.commit()
 
@@ -239,7 +280,9 @@ class LongTermMemory:
             if emb_json:
                 try:
                     d_vec = json.loads(emb_json)
-                    score = _cosine(q_vec, d_vec)
+                    score = _blended_score(
+                        _cosine(q_vec, d_vec), created_at, settings.memory_decay_lambda
+                    )
                     scored.append((score, row_dict))
                 except Exception:
                     keyword_fallback.append(row_dict)

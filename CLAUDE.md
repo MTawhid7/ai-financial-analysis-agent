@@ -63,7 +63,7 @@ pytest --cov=ai_financial_analyst --cov-report=term-missing
 cd frontend && npm run build
 ```
 
-Current status: **152/152** Python tests passing + frontend build clean.
+Current status: **622/622** Python tests passing + frontend build clean.
 
 ---
 
@@ -126,7 +126,7 @@ Researcher → Quant Analyst → Editor → Report + Charts
 | `ai_financial_analyst/memory/long_term.py` | SQLAlchemy/Postgres: preferences, summaries, conversations, messages, reports, feedback (user-scoped) |
 | `ai_financial_analyst/memory/memory_manager.py` | Memory facade: context injection, preference extraction, summary saving |
 | `ai_financial_analyst/tools/calculator.py` | AST-validated numexpr evaluator (no REPL) |
-| `ai_financial_analyst/tools/chart_generator.py` | Shim → `ai_financial_analyst/charts/` (13 chart types) |
+| `ai_financial_analyst/tools/chart_generator.py` | Shim → `ai_financial_analyst/charts/` (16 chart types) |
 | `ai_financial_analyst/tools/file_parser.py` | Shim → `ai_financial_analyst/parsers/` (7 format parsers) |
 | `ai_financial_analyst/tools/xlsx_exporter.py` | Excel workbook with live CAGR formula cells |
 | `ai_financial_analyst/pageindex/__init__.py` | PageIndex public API: index_document, search_documents, get_page |
@@ -160,6 +160,13 @@ Researcher → Quant Analyst → Editor → Report + Charts
 ### Configuration (Settings Class)
 All tunable values live in `config/settings.py` (`Settings` class, pydantic-settings). Never add `os.environ["KEY"]` or hardcoded constants in business-logic modules. Add new fields to `Settings` with env var aliases. Existing callers use `from ai_financial_analyst.config import settings`.
 
+New fields added in Phase 5 (all env-overridable):
+- `RESEARCHER_TICKER_CONCURRENCY` (default 3) — semaphore for parallel ticker fetching
+- `PAGEINDEX_RRF_K` (default 60) — RRF merge constant
+- `PAGEINDEX_EMBED_BATCH_SIZE` (default 100) — Gemini embedding batch size
+- `PAGEINDEX_CHUNK_MAX_CHARS` (default 1500) — page length threshold for sub-page chunking
+- `PAGEINDEX_CHUNK_OVERLAP_CHARS` (default 150) — overlap between consecutive chunks
+
 ### No Python REPL
 `CalculatorTool` uses `numexpr` with a three-level AST guard. CSV/XLSX files are parsed to a fixed-schema JSON summary only — no arbitrary pandas operations on user data.
 
@@ -184,14 +191,22 @@ All agent nodes return `AgentState(**{**state, "key": value})` — never `AgentS
 ### Manager LLM — Tool-Use Orchestrator
 The Manager uses LangChain `bind_tools` (function-calling) rather than a hardcoded intent classifier. Adding new capabilities requires only registering a new `@tool` function — no classifier changes. The tool-use loop has a hard cap of 5 rounds to prevent infinite loops.
 
-### str_replace Document Editing
-`refinement_handler.py` sends the full report to Flash primary and asks for `old_string` + `new_string`. `_flexible_str_replace()` tries exact match first, then line-strip normalization (strips trailing whitespace from each line before matching — handles the most common LLM failure mode). Each successful edit is persisted as a new INSERT row — version history is natural; rollback is always available via `ORDER BY created_at DESC`. The original report row is never overwritten.
+### str_replace Document Editing — Section-Aware
+`refinement_handler.py` first calls `_infer_target_section(message)` to detect the section the user intends to edit (e.g., "make the bull case more pessimistic" → "Bull Case"). `_extract_section_context()` extracts just that section's text. The LLM prompt then shows only the section (not the full document), reducing tokens and improving accuracy. str_replace is still applied to the full document. If no section is detected, the existing full-document flow runs unchanged. `_flexible_str_replace()` tries exact match, then line-strip normalization. Each edit is persisted as a new INSERT row for natural version history.
 
 ### user_id Scoping
 All `LongTermMemory` queries include `WHERE user_id = ?`. The FastAPI DB migration adds `user_id TEXT DEFAULT 'default'` to all tables. Existing tests use `user_id="default"` implicitly.
 
 ### Hierarchical Document Summarisation
 Large documents (PDF, DOCX, TXT) are split into overlapping 3,000-char chunks, each summarised by Flash-Lite, then combined into a final summary. No truncation — all content is covered.
+
+### Short-Term Memory — Hierarchical Summarisation
+`get_windowed_with_summary()` (async, in `short_term.py`) is a drop-in extension of `get_windowed_messages()` that accepts an optional `summarizer: Callable[[list[ChatMessage]], Awaitable[str]] | None`. When messages are dropped due to budget pressure, the summarizer condenses them into a synthetic `role="system"` message injected at the start of the conversation. `MemoryManager._make_summarizer()` wraps the subllm. `MemoryManager.get_windowed_context()` exposes the wired-up version. When no summarizer is available, behavior is identical to the sync static method.
+
+### PageIndex — Sub-Page Chunking + Model Version Tracking
+Long pages (> `settings.pageindex_chunk_max_chars`, default 1500 chars) are split into overlapping chunks by `_split_into_chunks()` in `pipeline.py`, using paragraph then sentence boundaries. Each chunk is stored as a `DocumentPage` row with `chunk_index >= 1`. The root row (`chunk_index=0`) keeps the full page content and is the only row returned by display queries (`get_page`, `get_document_page_by_number`). `search_documents()` calls `_deduplicate_by_page()` after RRF merge to collapse chunk hits to their parent page, then `_resolve_root_page()` to return full-page content.
+
+Every `DocumentPage` row stores `embedding_model TEXT` (the `settings.llm_embedding_model` value at index time). `_vector_search()` filters by current model — stale embeddings are silently excluded and a one-time WARNING is logged. Schema migration adds both new columns via `ALTER TABLE` wrapped in try/except (idempotent on both SQLite and Postgres).
 
 ### PageIndex — Two-Tier Document Access Model
 Documents are either `scope='user'` (private, `user_id` required) or `scope='system'` (visible to all authenticated users, `user_id=NULL`). DB-level `CHECK` constraints enforce this. Every retrieval query always returns both tiers via `WHERE (user_id=$uid AND scope='user') OR scope='system'`. User documents are deleted on account deletion (ON DELETE CASCADE). System documents are managed exclusively through `POST /admin/documents/upload` protected by the `ADMIN_USER_IDS` env var.
@@ -213,11 +228,14 @@ Documents are either `scope='user'` (private, `user_id` required) or `scope='sys
 ### Memory — Semantic Summary Search
 `LongTermMemory.save_analysis_summary()` accepts an optional `embedder` parameter. When provided, it embeds the summary text with `embed_texts()` and stores the 768-dim vector as `embedding_json TEXT` in SQLite. `search_summaries(query, embedder=...)` embeds the query, loads all stored vectors, computes cosine similarity in Python (trivially fast for < 50 summaries), and returns results ranked by semantic similarity. Falls back to `LIKE` matching for un-embedded rows and when no embedder is provided.
 
+### Researcher — Multi-Ticker Parallelism
+The researcher processes all tickers concurrently via `asyncio.gather`. Per-ticker logic is in `_fetch_single_ticker()`. The semaphore is `asyncio.Semaphore(settings.researcher_ticker_concurrency)` (default 3). yfinance and Tavily calls consume zero Gemini RPM — fully safe to parallelize. `return_exceptions=True` ensures one ticker's failure doesn't abort the others.
+
 ### Orchestrator — Conditional Routing
 `_route_after_researcher()` and `_route_after_quant()` are pure functions that inspect `AgentState` and return `"quant_analyst"` / `"editor"` or `"early_exit"`. The `early_exit` node generates a partial report if none exists. Conditional edges are registered with `add_conditional_edges()` — the happy path (data retrieved, analysis computed) flows researcher → quant → editor → END unchanged.
 
-### Report Writer — Two-Call Generation
-`report_writer_tool` makes two LLM calls: Call 1 uses Flash-Lite (cheap) for sections 1–3 (Executive Summary, Data Coverage, Financial Overview); Call 2 uses primary Flash for sections 4–7 (Quantitative Analysis, Bull/Bear Case, Conclusion). Both receive the full analysis JSON (no truncation). A `_validate_sections()` post-pass appends stub placeholders for any missing mandatory section headings.
+### Report Writer — Two-Call Generation + Quality Scoring
+`write_report()` makes two LLM calls: Call 1 uses Flash-Lite (cheap) for sections 1–3 (Executive Summary, Data Coverage, Financial Overview); Call 2 uses primary Flash for sections 4–7 (Quantitative Analysis, Bull/Bear Case, Conclusion). Both receive the full analysis JSON (no truncation). `_validate_sections()` appends stub placeholders for missing headings. `_check_quality()` logs warnings for under-length sections (thresholds in `_MIN_SECTION_WORDS`). `_DISCLAIMER` is the single-source constant used by both `report_writer.py` and `editor.py` (imported).
 
 ### Grounding Check — Financial Number Parser
 `_NUMERIC_PATTERN` in `editor.py` now matches `$1,234` (commas), `(4,200)` (accounting negatives), `$4.17T` (SI suffixes), and standard decimals/percentages. `_clean_numeric()` strips all formatting before float conversion. Tolerance is tiered: 2% for percentages, 5% for values > 1e6, 1.5% otherwise.

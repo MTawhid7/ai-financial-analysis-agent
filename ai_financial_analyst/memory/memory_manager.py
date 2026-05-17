@@ -9,18 +9,20 @@ Provides:
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
+from pydantic import Field as _Field
 
+from ..config import settings
 from ..core.conversation_state import ChatMessage
 from ..core.llm import content_to_str
 from .long_term import LongTermMemory
 from .protocol import MemoryBackend
-from .short_term import ShortTermMemory
+from .short_term import ShortTermMemory, get_windowed_with_summary
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +30,26 @@ logger = logging.getLogger(__name__)
 _MAX_CONTEXT_CHARS = 2000
 
 # Signals that the user is stating a preference — LLM extraction only runs when matched.
+# Expanded to cover novel phrasings beyond the original 11 exact patterns.
 _PREFERENCE_SIGNALS = re.compile(
-    r"\b(i prefer|always show|always include|i like|i'?m a|i am a|"
-    r"please always|please never|keep it|make it|focus on|"
-    r"i want .{0,20}(analysis|report|summary))\b",
+    r"\b("
+    # Direct preference statements
+    r"i prefer|i would prefer|i'?d prefer|"
+    r"my preference|my style|my approach is|"
+    # Request / instruction style
+    r"always show|always include|always give|always use|always provide|"
+    r"please always|please never|please only|please don'?t|please do not|"
+    r"give me|only show|only give|never show|"
+    # Identity / investor-type declarations
+    r"i'?m a|i am a|as a|i consider myself|i tend to|i typically|i usually|"
+    # Like / want style
+    r"i like|i'?d like|i would like|"
+    # Configuration style
+    r"keep it|make it|focus on|concentrate on|"
+    r"i want .{0,20}(analysis|report|summary|focus|style)|"
+    # Imperative style
+    r"make sure (to|you)|ensure that"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -47,19 +65,38 @@ One-paragraph summary:"""
 
 _PREFERENCE_PROMPT = """\
 Extract any explicit user preferences from the message below.
-Return a JSON object mapping preference keys to string values.
 Only include explicit statements — do not infer or guess.
-Return {{}} if no preferences are found.
+Return an empty preferences dict if no preferences are found.
+
+Use these canonical key names when the user's preference maps to one:
+  investment_style   → conservative | balanced | aggressive | value | growth
+  investor_type      → long-term | short-term | income | speculative
+  risk_tolerance     → low | medium | high
+  summary_length     → brief | standard | detailed | comprehensive
+  analysis_focus     → fundamental | technical | macro | esg | quantitative
+  report_format      → concise | detailed | table | bullet-points
+  sector_preference  → technology | healthcare | energy | financials | consumer | etc.
+
+For preferences outside this list, choose a short descriptive snake_case key.
 
 Examples:
-  "I prefer conservative analysis"    → {{"investment_style": "conservative"}}
-  "always show brief summaries"       → {{"summary_length": "brief"}}
-  "I'm a long-term investor"          → {{"investor_type": "long-term"}}
-  "focus on dividend stocks"          → {{"focus": "dividend stocks"}}
+  "I prefer conservative analysis"       →  investment_style: conservative
+  "I'm a long-term value investor"       →  investor_type: long-term, investment_style: value
+  "I'm risk-averse"                      →  risk_tolerance: low
+  "always show brief summaries"          →  summary_length: brief
+  "focus on technical analysis"          →  analysis_focus: technical
+  "I like dividend stocks"               →  sector_preference: dividend
 
-Message: {message}
+Message: {message}"""
 
-JSON:"""
+
+class _PreferenceOutput(BaseModel):
+    """Structured output schema for preference extraction — enforced by Gemini JSON mode."""
+
+    preferences: dict[str, str] = _Field(
+        default_factory=dict,
+        description="Preference key-value pairs extracted from the message. Empty dict if none found.",
+    )
 
 
 class MemoryManager:
@@ -74,6 +111,44 @@ class MemoryManager:
         self._lt       = long_term
         self._subllm   = subllm
         self._embedder = embedder
+
+    # ------------------------------------------------------------------
+    # Short-term windowing with optional summarisation
+    # ------------------------------------------------------------------
+
+    def _make_summarizer(self):
+        """Return an async summarizer closure over subllm, or None when unavailable."""
+        if self._subllm is None:
+            return None
+
+        subllm = self._subllm
+
+        async def _summarize(msgs: list[ChatMessage]) -> str:
+            formatted = "\n".join(
+                f"{m.get('role', 'user')}: {m.get('content', '')}" for m in msgs
+            )
+            resp = await subllm.ainvoke(
+                [HumanMessage(content=(
+                    "Summarise the following conversation in 2–3 sentences, "
+                    "capturing the main topics and any decisions made:\n\n"
+                    f"{formatted}"
+                ))]
+            )
+            return content_to_str(resp.content if hasattr(resp, "content") else resp).strip()
+
+        return _summarize
+
+    async def get_windowed_context(
+        self,
+        messages: list[ChatMessage],
+        max_tokens: int = ShortTermMemory.DEFAULT_MAX_TOKENS,
+    ) -> list[ChatMessage]:
+        """Return windowed messages, summarising dropped pairs when a subllm is available."""
+        return await get_windowed_with_summary(
+            messages,
+            max_tokens=max_tokens,
+            summarizer=self._make_summarizer(),
+        )
 
     # ------------------------------------------------------------------
     # Context building — called on every turn
@@ -99,8 +174,20 @@ class MemoryManager:
 
         try:
             if query.strip():
+                # Adaptive limit: reserve proportionally more space for summaries
+                # when preferences are short, fewer when they already fill the budget.
+                pref_block = parts[0] if parts else ""
+                pref_chars = len(pref_block)
+                remaining_chars = max(0, _MAX_CONTEXT_CHARS - pref_chars)
+                # ~200 chars per summary on average; at least 1, at most configured limit
+                adaptive_limit = max(1, min(
+                    settings.memory_context_summaries_limit,
+                    remaining_chars // 200,
+                ))
                 summaries = await self._lt.search_summaries(
-                    query.strip(), limit=2, embedder=self._embedder
+                    query.strip(),
+                    limit=adaptive_limit,
+                    embedder=self._embedder,
                 )
                 if summaries:
                     lines = "\n".join(
@@ -134,21 +221,9 @@ class MemoryManager:
 
         try:
             prompt = _PREFERENCE_PROMPT.format(message=message)
-            response = await self._subllm.ainvoke([HumanMessage(content=prompt)])
-            raw = content_to_str(
-                response.content if hasattr(response, "content") else response
-            ).strip()
-
-            # Strip markdown code fences if present.
-            if raw.startswith("```"):
-                raw = raw.split("```", 2)[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-                raw = raw.rstrip("`").strip()
-
-            prefs = json.loads(raw)
-            if not isinstance(prefs, dict):
-                return
+            structured_llm = self._subllm.with_structured_output(_PreferenceOutput)
+            result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+            prefs = result.preferences if result else {}
 
             for key, value in prefs.items():
                 if isinstance(key, str) and isinstance(value, str) and key and value:
@@ -174,7 +249,7 @@ class MemoryManager:
             return
 
         try:
-            prompt = _SUMMARY_PROMPT.format(report_excerpt=report_markdown[:3000])
+            prompt = _SUMMARY_PROMPT.format(report_excerpt=report_markdown)
             response = await self._subllm.ainvoke([HumanMessage(content=prompt)])
             summary = content_to_str(
                 response.content if hasattr(response, "content") else response

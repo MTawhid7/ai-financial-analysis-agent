@@ -7,8 +7,10 @@ index_document(file_bytes, filename, user_id, subllm, scope='user')
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any
@@ -18,6 +20,52 @@ from ..config import settings
 logger = logging.getLogger(__name__)
 
 _UPLOAD_DIR = settings.upload_dir
+
+
+def _split_into_chunks(text: str) -> list[str]:
+    """Split text into overlapping chunks on paragraph/sentence boundaries.
+
+    Returns an empty list when the text fits within settings.pageindex_chunk_max_chars
+    (no splitting needed).  Each chunk overlaps the previous by
+    settings.pageindex_chunk_overlap_chars to preserve inter-sentence context.
+    """
+    max_chars = settings.pageindex_chunk_max_chars
+    overlap   = settings.pageindex_chunk_overlap_chars
+
+    if len(text) <= max_chars:
+        return []
+
+    # Prefer paragraph (\n\n) splits; fall back to sentence splits for monolithic text.
+    paragraph_splits = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if len(paragraph_splits) <= 1:
+        # No paragraph structure — split on sentence boundaries (period+space)
+        sentence_splits = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        units: list[str] = sentence_splits if len(sentence_splits) > 1 else [text]
+    else:
+        units = paragraph_splits
+
+    sep = "\n\n" if len(paragraph_splits) > 1 else " "
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for unit in units:
+        unit_len = len(unit)
+        if current_len + unit_len + len(sep) > max_chars and current:
+            chunk_text = sep.join(current)
+            chunks.append(chunk_text)
+            # Carry the last overlap_chars of the previous chunk forward
+            overlap_text = chunk_text[-overlap:] if len(chunk_text) > overlap else chunk_text
+            current = [overlap_text] if overlap_text else []
+            current_len = len(overlap_text) if overlap_text else 0
+        current.append(unit)
+        current_len += unit_len + len(sep)
+
+    if current:
+        chunks.append(sep.join(current))
+
+    return chunks if len(chunks) > 1 else []
 
 
 # ---------------------------------------------------------------------------
@@ -119,12 +167,27 @@ async def index_document(
             summary = ""
         summaries.append(summary)
 
-    # ── Generate embeddings ──────────────────────────────────────────────────
-    texts_to_embed = [
+    # ── Build embed texts: root pages get full text; chunks get chunk text ────
+    current_model = settings.llm_embedding_model
+
+    root_texts = [
         " | ".join(p.heading_breadcrumb) + "\n\n" + p.content
         for p in raw_pages
     ]
-    vectors = await embed_texts(texts_to_embed)
+
+    # Compute sub-page chunks for long pages.  Stored as (page_idx, chunk_idx, text).
+    chunk_records: list[tuple[int, int, str]] = []
+    for i, page in enumerate(raw_pages):
+        chunks = _split_into_chunks(page.content)
+        for ci, chunk_text in enumerate(chunks):
+            chunk_records.append((i, ci + 1, chunk_text))
+
+    # Embed root pages and all chunks in one batched call.
+    chunk_texts = [ct for _, _, ct in chunk_records]
+    all_texts   = root_texts + chunk_texts
+    all_vectors = await embed_texts(all_texts)
+    root_vectors  = all_vectors[:len(root_texts)]
+    chunk_vectors = all_vectors[len(root_texts):]
 
     # ── Bulk insert DocumentPage rows ────────────────────────────────────────
     page_ids: list[str] = []
@@ -135,15 +198,11 @@ async def index_document(
             delete(DocumentPage).where(DocumentPage.document_id == doc_id)
         )
 
-        for i, (page, summary, vector) in enumerate(zip(raw_pages, summaries, vectors)):
+        for i, (page, summary, vector) in enumerate(zip(raw_pages, summaries, root_vectors)):
             page_id = str(uuid.uuid4())
             page_ids.append(page_id)
 
-            # Serialise vector: stored as pgvector if available, else JSON text
-            if HAS_PGVECTOR:
-                embedding_val = vector
-            else:
-                embedding_val = json.dumps(vector)
+            embedding_val = vector if HAS_PGVECTOR else json.dumps(vector)
 
             dp = DocumentPage(
                 id=page_id,
@@ -160,13 +219,46 @@ async def index_document(
                 word_count=page.word_count,
                 token_estimate=page.token_estimate,
                 embedding=embedding_val,
+                embedding_model=current_model,
+                chunk_index=0,
                 is_toc=page.is_toc,
                 is_bibliography=page.is_bibliography,
                 created_at=time.time(),
             )
             session.add(dp)
 
+        # Insert sub-page chunks (chunk_index >= 1) for vector-search precision.
+        for (page_idx, chunk_idx, chunk_text), chunk_vector in zip(chunk_records, chunk_vectors):
+            page = raw_pages[page_idx]
+            chunk_embedding = chunk_vector if HAS_PGVECTOR else json.dumps(chunk_vector)
+            session.add(DocumentPage(
+                id=str(uuid.uuid4()),
+                document_id=doc_id,
+                user_id=user_id,
+                scope=scope,
+                page_number=page.page_number,
+                section_path=page.section_path or str(page.page_number),
+                heading_breadcrumb=page.heading_breadcrumb,
+                content=chunk_text,        # chunk text only
+                content_summary=None,      # display not needed for chunks
+                has_figures=False,
+                word_count=len(chunk_text.split()),
+                token_estimate=len(chunk_text) // 4,
+                embedding=chunk_embedding,
+                embedding_model=current_model,
+                chunk_index=chunk_idx,
+                is_toc=False,
+                is_bibliography=False,
+                created_at=time.time(),
+            ))
+
         await session.commit()
+
+    if chunk_records:
+        logger.info(
+            "PageIndex: inserted %d sub-page chunks for document %s",
+            len(chunk_records), doc_id,
+        )
 
     # ── Link pages (prev/next chain) ─────────────────────────────────────────
     await _link_pages(doc_id, page_ids)
@@ -226,8 +318,7 @@ async def _link_pages(doc_id: str, page_ids: list[str]) -> None:
         await session.commit()
 
 
-import re as _re
-_SEE_PAGE_RE = _re.compile(r"\bsee\s+page\s+(\d+)\b", _re.I)
+_SEE_PAGE_RE = re.compile(r"\bsee\s+page\s+(\d+)\b", re.I)
 
 
 async def _detect_cross_references(doc_id: str, pages: list[Any], page_ids: list[str]) -> None:
@@ -274,6 +365,3 @@ def _extract_title(filename: str, file_bytes: bytes, file_type: str) -> str:
     # Fallback: clean up the filename
     name = filename.rsplit(".", 1)[0]
     return name.replace("_", " ").replace("-", " ").strip()
-
-
-import io  # noqa: E402 (import at bottom to keep top clean)

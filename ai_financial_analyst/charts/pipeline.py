@@ -10,6 +10,34 @@ from ._theme import (
 logger = logging.getLogger(__name__)
 
 
+def _pe_color(premium: float) -> str:
+    """Map a P/E premium percentage to a continuously interpolated green→blue→red color.
+
+    −50% (or below) → deep green (#16a34a)
+      0%            → neutral blue (#60a5fa)
+    +50% (or above) → deep red (#dc2626)
+
+    The smooth gradient replaces the previous hard-coded 3-color threshold
+    (>20% red, <-10% green, else blue) and makes relative valuation immediately
+    readable without knowing the exact threshold values.
+    """
+    t = max(0.0, min(1.0, (float(premium) + 50.0) / 100.0))  # 0 = green, 0.5 = blue, 1 = red
+
+    if t <= 0.5:                             # green (#16a34a) → blue (#60a5fa)
+        r1, g1, b1 = 0x16, 0xa3, 0x4a
+        r2, g2, b2 = 0x60, 0xa5, 0xfa
+        s = t / 0.5
+    else:                                    # blue (#60a5fa) → red (#dc2626)
+        r1, g1, b1 = 0x60, 0xa5, 0xfa
+        r2, g2, b2 = 0xdc, 0x26, 0x26
+        s = (t - 0.5) / 0.5
+
+    r = int(r1 + (r2 - r1) * s)
+    g = int(g1 + (g2 - g1) * s)
+    b = int(b1 + (b2 - b1) * s)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def generate_pe_chart(ticker: str, analysis: dict) -> dict | None:
     """Horizontal bar: company P/E vs sector average."""
     try:
@@ -19,10 +47,18 @@ def generate_pe_chart(ticker: str, analysis: dict) -> dict | None:
             return None
         sector  = ta.get("sector", "Sector")
         premium = ta.get("pe_vs_sector_premium_pct", 0)
-        bar_col = _RED if premium > 20 else (_GREEN if premium < -10 else _BLUE)
+        bar_col = _pe_color(premium)
         layout  = _base_layout(f"{ticker} — P/E vs {sector} Sector")
         layout["barmode"] = "group"
         layout["xaxis"]["title"] = {"text": "P/E Ratio", "font": {"size": 10}}
+        layout["annotations"] = [{
+            "text": "Color: green = discount · blue = parity · red = premium (vs sector avg)",
+            "xref": "paper", "yref": "paper",
+            "x": 0, "y": -0.18,
+            "showarrow": False,
+            "font": {"size": 9, "color": _FONT},
+            "xanchor": "left",
+        }]
         return {
             "data": [
                 {"type": "bar", "orientation": "h", "x": [round(co_pe,  1)], "y": [ticker],

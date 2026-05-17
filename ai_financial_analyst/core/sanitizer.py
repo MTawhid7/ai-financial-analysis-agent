@@ -47,17 +47,37 @@ def get_canary_token() -> str:
 # Broad patterns intentionally — false positives (rejecting a legitimate article)
 # are far less harmful than allowing injection to reach the reasoning agent.
 _INJECTION_PATTERNS: list[re.Pattern] = [
+    # High-confidence patterns: essentially only appear in injection attempts.
     re.compile(r"ignore\s+.{0,30}instructions?", re.I),
     re.compile(r"disregard\s+.{0,30}instructions?", re.I),
-    re.compile(r"forget\s+(your|all|the|these|my|previous)\s+\w+", re.I),
     re.compile(r"new\s+instruction\s*:", re.I),
-    re.compile(r"system\s+prompt", re.I),
-    re.compile(r"you\s+are\s+now\s+(a|an)\s+", re.I),
-    re.compile(r"act\s+as\s+(a|an)\s+", re.I),
     re.compile(r"(output|reveal|expose|print)\s+(your\s+)?(api\s+key|secret|password|token)", re.I),
     re.compile(r"unrestricted\s+(ai|assistant|model|llm)", re.I),
     re.compile(r"<\s*/?instructions?\s*>", re.I),
     re.compile(r"\[INST\]", re.I),
+    # Context-aware patterns: tightened to require injection-specific vocabulary.
+    # Without context, these fire on legitimate financial news (AI company articles,
+    # "acts as a broker", "forget your losses", "you are now a shareholder").
+    re.compile(
+        r"(?:reveal|output|expose|show|print|dump)\s+.{0,30}system\s+prompt"
+        r"|system\s+prompt\s*[,:]\s*(?:ignore|disregard|output|reveal|you\s+(?:are|should|must|will|can))",
+        re.I,
+    ),
+    re.compile(
+        r"forget\s+(?:your|all|the|these|my|previous)\s+"
+        r"(?:instructions?|training|guidelines?|rules?|constraints?|restrictions?|prior\s+instructions?|system\s+prompt)",
+        re.I,
+    ),
+    re.compile(
+        r"you\s+are\s+now\s+(?:a|an)\s+(?:different|unrestricted|jailbroken|uncensored|new|evil|hacked)"
+        r"|you\s+are\s+now\s+(?:a|an)\s+(?:ai|llm|gpt|chatgpt|language\s+model|assistant\s+without)",
+        re.I,
+    ),
+    re.compile(
+        r"act\s+as\s+(?:a|an)\s+(?:jailbroken|unrestricted|uncensored|different|evil|hacked|new\s+ai|better\s+ai)"
+        r"|you\s+(?:must|should|now|will)\s+act\s+as",
+        re.I,
+    ),
 ]
 
 

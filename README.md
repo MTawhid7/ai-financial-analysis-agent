@@ -58,7 +58,7 @@ flowchart LR
     MGR -->|edit_report_section| DB2[("📋 reports\ntable")]
     MGR -->|recall_past_analysis| DB[("🐘 Postgres\nSupabase")]
     MGR -->|answer_finance_question| LLM["Gemini Flash\n(direct answer)"]
-    MGR -->|generate_chart| Charts["📊 13 chart types\nplotly JSON"]
+    MGR -->|generate_chart| Charts["📊 16 chart types\nplotly JSON"]
     MGR -->|search_documents| PageIdx[("📄 PageIndex\npgvector+FTS")]
     MGR -->|get_document_page| PageIdx
     MGR -->|reject_request| Reject["Polite rejection"]
@@ -94,6 +94,21 @@ Large documents (PDF, DOCX, TXT) are split into overlapping 3,000-char chunks, e
 
 ### Conditional Pipeline Routing
 The LangGraph pipeline uses conditional edges after `researcher` and `quant_analyst`. When no usable data is retrieved (all errors, empty raw_data, or rate-limited), the pipeline routes to an `early_exit` node instead of burning API quota on downstream agents.
+
+### Multi-Ticker Parallelism (Researcher)
+The researcher fetches data for all tickers concurrently via `asyncio.gather`. yfinance and Tavily calls consume zero Gemini RPM, so parallelism is safe. One ticker failing does not abort the others. Concurrency is capped at 3 (configurable via `RESEARCHER_TICKER_CONCURRENCY`).
+
+### Section-Aware Report Editing
+When refining a report, the system infers the target section from the user's message ("make the bull case more pessimistic" → "Bull Case"). The LLM receives only that section instead of the full document, reducing token usage and improving edit accuracy. Falls back to full-document editing when no section is detected.
+
+### Short-Term Memory Hierarchical Summarisation
+When conversation history exceeds the token budget, dropped turn-pairs are condensed into a synthetic summary message by the subllm rather than being silently discarded. Available via `MemoryManager.get_windowed_context()`.
+
+### Report Quality Scoring
+After every `write_report()` call, `_check_quality()` validates word counts per section against minimum thresholds and logs warnings for under-length sections (e.g., Quantitative Analysis < 80 words). Non-blocking — the report is returned regardless.
+
+### PageIndex Sub-Page Chunking
+Pages longer than 1,500 chars are split into overlapping sentence/paragraph chunks. Each chunk gets its own embedding vector, stored as a `DocumentPage` row with `chunk_index >= 1`. Search results are deduplicated back to root pages for display. Every embedding row records its source model for staleness detection.
 
 ### HyDE Query Expansion (PageIndex)
 When searching uploaded documents, the retriever uses Hypothetical Document Embedding: Flash-Lite generates a synthetic passage that would answer the query, that passage is embedded (not the raw question), and the embedding is used for vector search. Questions and passages inhabit different embedding spaces — this improves retrieval for short or ambiguous queries.
@@ -149,7 +164,7 @@ cd frontend && npm run dev
 
 ```bash
 pytest tests/unit/ tests/integration/ tests/adversarial/ -v
-# 477 tests passing
+# 622 tests passing
 cd frontend && npm run build      # zero TypeScript errors required
 ```
 
@@ -202,7 +217,7 @@ ai_financial_analyst/
     pipeline.py              Ingestion: extract → summarise → embed → store → link
     retriever.py             Hybrid search: pgvector ANN + Postgres FTS + RRF + HyDE
     ocr.py                   Scanned PDF detection + pytesseract OCR fallback
-  charts/                    13 Plotly chart types (modular)
+  charts/                    16 Plotly chart types (modular)
     _theme.py / _data.py     Palette, fetch utils, ticker aliases, earnings annotations
     price_action.py          Candlestick (BB/EMA overlays, earnings markers, date ranges)
     technical.py             RSI, MACD
@@ -242,7 +257,7 @@ frontend/
 
 tests/              unit / integration / adversarial / e2e
 docs/
-  MANUAL_TESTING.md  Complete manual testing guide (15 sections)
+  MANUAL_TESTING.md  Complete manual testing guide (18 sections)
 ```
 
 ---

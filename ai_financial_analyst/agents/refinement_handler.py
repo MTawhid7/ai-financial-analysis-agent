@@ -29,6 +29,10 @@ from ..core.llm import content_to_str
 
 logger = logging.getLogger(__name__)
 
+
+class EditConflictError(Exception):
+    """Raised when a concurrent request modified the report since it was last read."""
+
 _EDITOR_SYSTEM = (
     "You are a precise financial report editor. "
     "Apply the user's requested change surgically — modify only what is asked. "
@@ -61,6 +65,28 @@ Rules:
 
 JSON:"""
 
+_STR_REPLACE_SECTION_PROMPT = """\
+Apply the following edit to the **{section_name}** section of the financial report.
+
+Edit request: {instruction}
+
+Section to edit:
+```markdown
+{section_text}
+```
+
+Output ONLY a JSON object with exactly two keys:
+- "old_string": the exact verbatim text from the section above that should be replaced.
+  It must be unique within the section. Include a line of context above and below.
+- "new_string": the replacement text, preserving Markdown structure.
+
+Rules:
+- old_string must exist verbatim in the section text above (copy-paste carefully)
+- Do NOT invent numerical figures not already in the report
+- Output only valid JSON — no explanation, no markdown fences
+
+JSON:"""
+
 _RETRY_PROMPT = """\
 Your previous edit attempt failed because the old_string you provided was not found
 in the report verbatim. Here is the error:
@@ -81,6 +107,47 @@ Full report:
 ```
 
 Output ONLY the corrected JSON object (old_string + new_string):"""
+
+
+# ── Section-aware helpers ────────────────────────────────────────────────────
+
+_SECTION_KEYWORDS: dict[str, str] = {
+    "executive summary": "Executive Summary",
+    "bull case":         "Bull Case",
+    "bear case":         "Bear Case",
+    "quantitative":      "Quantitative Analysis",
+    "conclusion":        "Conclusion",
+    "financial overview": "Financial Overview",
+    "data coverage":     "Data Coverage",
+}
+
+
+def _infer_target_section(message: str) -> str | None:
+    """Detect which report section the user intends to edit from their message."""
+    lower = message.lower()
+    for keyword, section_name in _SECTION_KEYWORDS.items():
+        if keyword in lower:
+            return section_name
+    return None
+
+
+def _extract_section_context(report: str, section_name: str) -> tuple[str, str, str] | None:
+    """Extract (before, section_text, after) for a named section.
+
+    Returns None if the section heading cannot be found in the report.
+    The section spans from its heading line to the start of the next heading.
+    """
+    # Use {{1,3}} to produce the literal regex quantifier {1,3} inside an f-string
+    pattern = rf"(?m)(^#{{1,3}}\s+.*{re.escape(section_name)}.*$)"
+    match = re.search(pattern, report, re.IGNORECASE)
+    if not match:
+        return None
+    start = match.start()
+    heading_end = match.end()  # position just after the heading line
+    # Search for the next heading starting AFTER the current heading line
+    next_hdr = re.search(r"(?m)^#{1,3}\s", report[heading_end:])
+    end = heading_end + next_hdr.start() if next_hdr else len(report)
+    return report[:start], report[start:end], report[end:]
 
 
 def _extract_json(text: str) -> str:
@@ -144,11 +211,24 @@ async def refine_analysis(
             "Please run a financial analysis first — e.g. *\"Analyse AAPL\"*."
         )
 
-    full_report: str = report_data["report_markdown"]  # no truncation
-    tickers: str = report_data.get("tickers", "")
+    full_report: str    = report_data["report_markdown"]  # no truncation
+    tickers: str        = report_data.get("tickers", "")
+    base_created_at     = report_data.get("created_at")   # optimistic lock token
+
+    # --- Section-aware scoping: narrow context for the LLM when possible ---
+    target_section = _infer_target_section(message)
+    section_parts = _extract_section_context(full_report, target_section) if target_section else None
+    if section_parts:
+        logger.info("Refinement: scoping LLM to section '%s'", target_section)
+    else:
+        target_section = None  # fallback to full-document edit
 
     # --- First attempt ---
-    result = await _attempt_str_replace(message, full_report, primary_llm)
+    result = await _attempt_str_replace(
+        message, full_report, primary_llm,
+        section_name=target_section,
+        section_text=section_parts[1] if section_parts else None,
+    )
 
     if isinstance(result, str):
         # Success — result is the updated document
@@ -157,7 +237,8 @@ async def refine_analysis(
         # result is the bad old_string — retry once with corrective prompt
         bad_old_string = result["bad_old_string"]
         logger.warning("str_replace: old_string not found, retrying. Bad string: %s…", bad_old_string[:80])
-        retry_result = await _retry_str_replace(message, full_report, bad_old_string, primary_llm)
+        retry_result = await _retry_str_replace(
+            message, full_report, bad_old_string, primary_llm)
 
         if isinstance(retry_result, str):
             updated_report = retry_result
@@ -168,9 +249,18 @@ async def refine_analysis(
                 "Could you be more specific about which section you'd like me to change?"
             )
 
-    # Persist the updated report so future refinements and exports use the latest version
+    # Persist the updated report so future refinements and exports use the latest version.
     try:
-        await _save_updated_report(updated_report, conversation_id, user_id, db_path)
+        await _save_updated_report(
+            updated_report, conversation_id, user_id, db_path,
+            base_created_at=base_created_at,
+        )
+    except EditConflictError as exc:
+        logger.warning("Concurrent edit conflict for %s: %s", conversation_id[:8], exc)
+        return (
+            "Your edit couldn't be saved because the report was modified by another "
+            "request. Please reload the report and try again."
+        )
     except Exception as exc:
         logger.warning("Could not persist updated report: %s", exc)
 
@@ -181,18 +271,33 @@ async def _attempt_str_replace(
     instruction: str,
     full_report: str,
     primary_llm: Any,
+    *,
+    section_name: str | None = None,
+    section_text: str | None = None,
 ) -> str | dict:
     """
     Returns the updated document string on success.
     Returns {"bad_old_string": ...} if old_string was not found.
+
+    When section_name and section_text are provided, the LLM receives only that
+    section — reducing token usage and improving edit accuracy.  The str_replace
+    is still applied against full_report so surrounding content is preserved.
     """
     try:
-        response = await primary_llm.ainvoke([
-            SystemMessage(content=_EDITOR_SYSTEM),
-            HumanMessage(content=_STR_REPLACE_PROMPT.format(
+        if section_name and section_text:
+            prompt_content = _STR_REPLACE_SECTION_PROMPT.format(
+                section_name=section_name,
+                instruction=instruction,
+                section_text=section_text,
+            )
+        else:
+            prompt_content = _STR_REPLACE_PROMPT.format(
                 instruction=instruction,
                 full_report=full_report,
-            )),
+            )
+        response = await primary_llm.ainvoke([
+            SystemMessage(content=_EDITOR_SYSTEM),
+            HumanMessage(content=prompt_content),
         ])
         raw = content_to_str(response.content if hasattr(response, "content") else response)
         parsed = json.loads(_extract_json(raw))
@@ -243,7 +348,7 @@ async def _load_latest_report(
 ) -> dict | None:
     async with aiosqlite.connect(db_path) as db:
         async with db.execute(
-            "SELECT tickers, report_markdown, raw_data_json, analysis_json"
+            "SELECT tickers, report_markdown, raw_data_json, analysis_json, created_at"
             " FROM reports WHERE conversation_id = ? AND user_id = ?"
             " ORDER BY created_at DESC LIMIT 1",
             (conversation_id, user_id),
@@ -253,10 +358,11 @@ async def _load_latest_report(
     if not row:
         return None
     return {
-        "tickers": row[0],
+        "tickers":         row[0],
         "report_markdown": row[1],
-        "raw_data": json.loads(row[2] or "{}"),
-        "analysis": json.loads(row[3] or "{}"),
+        "raw_data":        json.loads(row[2] or "{}"),
+        "analysis":        json.loads(row[3] or "{}"),
+        "created_at":      row[4],   # optimistic lock token
     }
 
 
@@ -265,14 +371,32 @@ async def _save_updated_report(
     conversation_id: str,
     user_id: str,
     db_path: str,
+    base_created_at: float | None = None,
 ) -> None:
     """Insert the edited report as a new versioned row (INSERT, not UPDATE).
 
-    _load_latest_report uses ORDER BY created_at DESC LIMIT 1, so the new row
-    is automatically picked up on the next load. The original row is preserved,
-    enabling natural rollback to any prior version.
+    If base_created_at is provided (optimistic lock token from _load_latest_report),
+    verifies that no concurrent request has written a newer version before inserting.
+    Raises EditConflictError when the check fails — the caller should surface a
+    user-friendly message asking them to reload and reapply.
     """
     async with aiosqlite.connect(db_path) as db:
+        # Optimistic lock check: verify no concurrent write occurred since load.
+        if base_created_at is not None:
+            async with db.execute(
+                "SELECT MAX(created_at) FROM reports"
+                " WHERE conversation_id = ? AND user_id = ?",
+                (conversation_id, user_id),
+            ) as cur:
+                row = await cur.fetchone()
+            current_latest = row[0] if row else None
+            if current_latest != base_created_at:
+                raise EditConflictError(
+                    f"Report was modified by a concurrent request "
+                    f"(expected version {base_created_at}, found {current_latest}). "
+                    "Please reload and reapply your edit."
+                )
+
         # Copy metadata from the current latest row
         async with db.execute(
             "SELECT tickers, raw_data_json, analysis_json FROM reports"

@@ -235,6 +235,70 @@ class Settings(BaseSettings):
         alias="PIPELINE_SESSION_TTL_S",
         description="ConversationalAgent inactivity TTL in the session LRU cache (30 min)",
     )
+    pipeline_node_max_retries: int = Field(
+        default=1,
+        alias="PIPELINE_NODE_MAX_RETRIES",
+        description=(
+            "Max retry attempts for transient errors in pipeline nodes. "
+            "PartialStateError, CircuitBreakerError, and SanitizationAlert are never retried. "
+            "Set to 0 to disable retries."
+        ),
+    )
+    pipeline_node_retry_delay_s: float = Field(
+        default=0.5,
+        alias="PIPELINE_NODE_RETRY_DELAY_S",
+        description="Base delay (seconds) between node retry attempts (linear: delay × attempt_number).",
+    )
+    memory_context_summaries_limit: int = Field(
+        default=3,
+        alias="MEMORY_CONTEXT_SUMMARIES_LIMIT",
+        description="Max past analysis summaries injected into the system prompt context",
+    )
+    memory_decay_lambda: float = Field(
+        default=0.01,
+        alias="MEMORY_DECAY_LAMBDA",
+        description=(
+            "Exponential decay rate for summary age in semantic search scoring. "
+            "lambda=0.01 → 30-day-old summary retains ~74%% recency weight; "
+            "180-day-old retains ~16%%. Set to 0 to disable decay."
+        ),
+    )
+
+    # ── Researcher ────────────────────────────────────────────────────────────
+    researcher_ticker_concurrency: int = Field(
+        default=3,
+        alias="RESEARCHER_TICKER_CONCURRENCY",
+        description=(
+            "Max concurrent ticker fetches in the researcher node. "
+            "Each fetch uses yfinance + Tavily (no Gemini RPM consumed), "
+            "so concurrency is safe. Semaphore-gated."
+        ),
+    )
+
+    # ── PageIndex ─────────────────────────────────────────────────────────────
+    pageindex_rrf_k: int = Field(
+        default=60,
+        alias="PAGEINDEX_RRF_K",
+        description="RRF constant k in score = 1/(k + rank). Higher k = softer rank differences.",
+    )
+    pageindex_embed_batch_size: int = Field(
+        default=100,
+        alias="PAGEINDEX_EMBED_BATCH_SIZE",
+        description="Max texts per Gemini embedding API request.",
+    )
+    pageindex_chunk_max_chars: int = Field(
+        default=1500,
+        alias="PAGEINDEX_CHUNK_MAX_CHARS",
+        description=(
+            "Pages longer than this (chars) are split into overlapping sub-page chunks "
+            "for more precise vector search. Each chunk gets its own embedding."
+        ),
+    )
+    pageindex_chunk_overlap_chars: int = Field(
+        default=150,
+        alias="PAGEINDEX_CHUNK_OVERLAP_CHARS",
+        description="Character overlap between consecutive sub-page chunks to preserve context.",
+    )
 
     # ── Database (optional Postgres) ──────────────────────────────────────────
     database_url: str | None = Field(

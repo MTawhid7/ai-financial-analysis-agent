@@ -29,13 +29,16 @@ def generate_on_demand_chart(
     end: str | None = None,
     overlays: list[str] | None = None,
     compare_tickers: list[str] | None = None,
+    **kwargs: Any,
 ) -> dict | None:
     """Route a chart_type string to the correct generator.
 
     All parameters are optional/keyword so callers can add new ones without
-    breaking existing call sites.
+    breaking existing call sites. Extra kwargs (e.g. interval="5m") are forwarded
+    to chart generators that accept them.
     """
-    ct = chart_type.lower().replace(" ", "_").replace("-", "_")
+    ct       = chart_type.lower().replace(" ", "_").replace("-", "_")
+    interval = kwargs.get("interval")
 
     # ── Comparison (multi-ticker) ─────────────────────────────────────────────
     if ct in ("relative_performance", "comparison", "compare", "normalized",
@@ -51,15 +54,22 @@ def generate_on_demand_chart(
 
     # ── Price action ──────────────────────────────────────────────────────────
     if ct in ("candlestick", "ohlc", "candle", "ohlcv"):
-        return generate_candlestick_chart(ticker, period, start, end, overlays, raw_data=raw_data)
+        return generate_candlestick_chart(
+            ticker, period, start, end, overlays, raw_data=raw_data, interval=interval
+        )
     if ct in ("price", "price_history", "price_chart", "line"):
-        return generate_price_chart(ticker, raw_data, period, start, end)
+        return generate_price_chart(ticker, raw_data, period, start, end, interval=interval)
 
     # ── Technical indicators ──────────────────────────────────────────────────
     if ct in ("rsi", "relative_strength", "relative_strength_index"):
         return generate_rsi_chart(ticker, period, start, end)
     if ct in ("macd", "momentum"):
         return generate_macd_chart(ticker, period, start, end)
+
+    # ── Volume profile ────────────────────────────────────────────────────────
+    if ct in ("volume_profile", "vap", "volume_at_price", "price_volume"):
+        from .volume import generate_volume_profile_chart
+        return generate_volume_profile_chart(ticker, period=period, start=start, end=end)
 
     # ── Fundamental trends ────────────────────────────────────────────────────
     if ct in ("revenue_trend", "revenue", "income", "revenue_vs_income", "revenue_vs_profit"):
@@ -84,8 +94,12 @@ def generate_on_demand_chart(
         return generate_radar_chart(ticker, raw_data, analysis)
 
     # Default: candlestick with the requested period/range
-    return (generate_candlestick_chart(ticker, period, start, end, overlays, raw_data=raw_data)
-            or generate_price_chart(ticker, raw_data, period, start, end))
+    return (
+        generate_candlestick_chart(
+            ticker, period, start, end, overlays, raw_data=raw_data, interval=interval
+        )
+        or generate_price_chart(ticker, raw_data, period, start, end, interval=interval)
+    )
 
 
 def generate_all_charts(final_state: Any) -> list[dict]:

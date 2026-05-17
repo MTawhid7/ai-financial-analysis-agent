@@ -121,8 +121,7 @@ class TestInjectionInWebSearchPipeline:
 
         safe_report = "# Financial Report\n\nApple had strong Q1 results.\n\n---\n*This is not financial advice.*"
 
-        with patch("ai_financial_analyst.agents.editor.report_writer_tool") as mock_rw:
-            mock_rw.arun = AsyncMock(return_value=safe_report)
+        with patch("ai_financial_analyst.agents.editor.write_report", new_callable=AsyncMock, return_value=safe_report):
             result = await editor_node(state, config={"primary_llm": None, "tracer": None})
 
         report = result.get("report_markdown", "")

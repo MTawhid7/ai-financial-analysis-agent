@@ -8,9 +8,12 @@ All data is lost when the object is garbage-collected — that's by design.
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class InMemoryBackend:
@@ -22,7 +25,9 @@ class InMemoryBackend:
 
     def __init__(self, user_id: str = "test") -> None:
         self._user_id      = user_id
-        self._preferences: dict[str, str]   = {}
+        # Internal structure: {key: {value, created_at, updated_at}}
+        # get_all_preferences() returns {key: value} — Protocol unchanged.
+        self._preferences: dict[str, dict]  = {}
         self._summaries:   list[dict]       = []
         self._conversations: dict[str, dict] = {}
         self._messages:    list[dict]        = []
@@ -30,10 +35,21 @@ class InMemoryBackend:
     # ── Preferences ───────────────────────────────────────────────────────────
 
     async def save_preference(self, key: str, value: str) -> None:
-        self._preferences[key.strip()] = value.strip()
+        k, v = key.strip(), value.strip()
+        now  = time.time()
+        existing = self._preferences.get(k)
+        if existing and existing["value"] != v:
+            logger.info(
+                "Preference '%s' updated: '%s' → '%s'", k, existing["value"], v
+            )
+        self._preferences[k] = {
+            "value":      v,
+            "created_at": existing["created_at"] if existing else now,
+            "updated_at": now,
+        }
 
     async def get_all_preferences(self) -> dict[str, str]:
-        return dict(self._preferences)
+        return {k: v["value"] for k, v in self._preferences.items()}
 
     # ── Analysis summaries ────────────────────────────────────────────────────
 

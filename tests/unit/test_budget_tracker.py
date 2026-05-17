@@ -51,6 +51,54 @@ class TestRequestBudgetTracker:
         assert warning_count == 1
 
 
+class TestPerToolTracking:
+    def test_record_tool_call_increments_per_tool_counter(self):
+        tracker = RequestBudgetTracker(daily_budget=1500)
+        tracker.record_tool_call("yahoo_finance", is_primary=False)
+        stats = tracker.get_stats()
+        assert stats["per_tool_calls"]["yahoo_finance"] == 1
+
+    def test_record_tool_call_primary_increments_primary_calls(self):
+        tracker = RequestBudgetTracker(daily_budget=1500)
+        tracker.record_tool_call("report_writer", is_primary=True)
+        assert tracker.get_stats()["primary_calls"] == 1
+
+    def test_record_tool_call_sub_increments_sub_calls(self):
+        tracker = RequestBudgetTracker(daily_budget=1500)
+        tracker.record_tool_call("web_search", is_primary=False)
+        assert tracker.get_stats()["sub_calls"] == 1
+
+    def test_multiple_tools_tracked_independently(self):
+        tracker = RequestBudgetTracker(daily_budget=1500)
+        tracker.record_tool_call("yahoo_finance", is_primary=False)
+        tracker.record_tool_call("yahoo_finance", is_primary=False)
+        tracker.record_tool_call("benchmark_lookup", is_primary=True)
+        stats = tracker.get_stats()
+        assert stats["per_tool_calls"]["yahoo_finance"] == 2
+        assert stats["per_tool_calls"]["benchmark_lookup"] == 1
+
+    def test_cache_hit_with_tool_name_tracks_cache_credits(self):
+        tracker = RequestBudgetTracker(daily_budget=1500)
+        tracker.record_cache_hit("yahoo_finance")
+        stats = tracker.get_stats()
+        assert stats["cache_hits"] == 1
+        assert stats["cache_credits"] == 1
+        assert stats["per_tool_calls"].get("cache:yahoo_finance") == 1
+
+    def test_cache_credits_reduce_effective_calls(self):
+        tracker = RequestBudgetTracker(daily_budget=100)
+        tracker.record_primary_call()
+        tracker.record_primary_call()
+        tracker.record_cache_hit()  # credit one back
+        assert tracker.effective_calls == 1
+
+    def test_effective_calls_never_negative(self):
+        tracker = RequestBudgetTracker(daily_budget=100)
+        tracker.record_cache_hit()
+        tracker.record_cache_hit()
+        assert tracker.effective_calls == 0  # max(0, -2) = 0
+
+
 class TestRpmTracking:
     def test_get_stats_includes_rpm_fields(self):
         tracker = RequestBudgetTracker(daily_budget=1500)

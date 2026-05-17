@@ -19,10 +19,11 @@ def generate_price_chart(
     period: str = "1y",
     start: str | None = None,
     end: str | None = None,
+    interval: str | None = None,
 ) -> dict | None:
     """Weekly/daily price line with 52-week high/low dashed bands."""
     try:
-        hist, resolved = _fetch_hist(ticker, period, start=start, end=end)
+        hist, resolved = _fetch_hist(ticker, period, interval=interval, start=start, end=end)
         if hist.empty:
             return None
         dates  = [str(d.date()) for d in hist.index]
@@ -74,15 +75,18 @@ def generate_candlestick_chart(
     overlays: list[str] | None = None,
     show_earnings: bool = True,
     raw_data: dict | None = None,
+    interval: str | None = None,
 ) -> dict | None:
     """OHLCV candlestick + SMA-50/200 + volume + optional analyst targets.
 
     overlays: list of strings from {"bollinger", "bb", "ema", "ema_N"} where N is any integer.
     show_earnings: overlay vertical markers at quarterly earnings dates.
     raw_data: pipeline raw_data dict — when provided, adds analyst price target overlay.
+    interval: explicit yfinance interval override ("1m", "5m", "15m", "1h", "1d", etc.).
+              When None, the interval is derived from the period or date range.
     """
     try:
-        hist, resolved = _fetch_hist(ticker, period, start=start, end=end)
+        hist, resolved = _fetch_hist(ticker, period, interval=interval, start=start, end=end)
         if len(hist) < 10:
             return None
 

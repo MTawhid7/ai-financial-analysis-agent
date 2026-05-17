@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 _EMBED_MODEL = settings.llm_embedding_model
 _EMBED_DIMS  = 768
-_BATCH_SIZE  = 100  # max texts per Gemini embedding request
 
 
 def _make_embedder(task_type: str) -> Any:
@@ -75,8 +74,9 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     # Embed uncached texts in batches
     if uncached_texts:
         embedder = _get_doc_embedder()
-        for batch_start in range(0, len(uncached_texts), _BATCH_SIZE):
-            batch = uncached_texts[batch_start: batch_start + _BATCH_SIZE]
+        batch_size = settings.pageindex_embed_batch_size
+        for batch_start in range(0, len(uncached_texts), batch_size):
+            batch = uncached_texts[batch_start: batch_start + batch_size]
             try:
                 batch_vectors = await embedder.aembed_documents(batch)
             except Exception as exc:
@@ -84,7 +84,7 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
                 batch_vectors = [[0.0] * _EMBED_DIMS] * len(batch)
 
             for j, (orig_idx, vector) in enumerate(
-                zip(uncached_indices[batch_start: batch_start + _BATCH_SIZE], batch_vectors)
+                zip(uncached_indices[batch_start: batch_start + batch_size], batch_vectors)
             ):
                 results[orig_idx] = vector
                 # Cache for future runs

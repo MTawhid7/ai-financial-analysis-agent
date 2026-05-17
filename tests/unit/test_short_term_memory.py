@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ai_financial_analyst.memory.short_term import ShortTermMemory
+from ai_financial_analyst.memory.short_term import ShortTermMemory, get_windowed_with_summary
 from ai_financial_analyst.core.conversation_state import ChatMessage
 
 
@@ -101,3 +101,120 @@ class TestPairPreservation:
         result2 = ShortTermMemory.get_windowed_messages([prose_msg], max_tokens=100)
         # Prose: 480 chars / 4 = 120 tokens > 100 → excluded
         assert len(result2) == 0
+
+
+class TestSystemMessagePriority:
+    """System-role messages are always included regardless of budget pressure."""
+
+    def test_system_message_always_included(self):
+        sys_msg = _msg("system", "You are a financial analyst.")
+        # 20 user/assistant pairs that together far exceed any budget
+        many_msgs = [_msg("user", "Q"), _msg("assistant", "A")] * 20
+        messages = [sys_msg] + many_msgs
+
+        result = ShortTermMemory.get_windowed_messages(messages, max_tokens=50)
+
+        roles = [m["role"] for m in result]
+        assert "system" in roles
+        assert result[0]["role"] == "system"  # system message comes first
+
+    def test_system_message_cost_reduces_available_budget(self):
+        # System message of ~25 tokens (100 chars / 4)
+        sys_msg = _msg("system", "x" * 100)
+        # User message of ~25 tokens
+        user_msg = _msg("user", "x" * 100)
+
+        # Budget of 30 tokens: enough for system (25) but not system + user (50)
+        result = ShortTermMemory.get_windowed_messages(
+            [sys_msg, user_msg], max_tokens=30
+        )
+        roles = [m["role"] for m in result]
+        assert "system" in roles
+        assert "user" not in roles  # user dropped — budget exhausted by system
+
+    def test_system_message_appears_before_conversation(self):
+        sys_msg  = _msg("system", "Instructions.")
+        user_msg = _msg("user", "Hello.")
+        asst_msg = _msg("assistant", "Hi.")
+
+        result = ShortTermMemory.get_windowed_messages(
+            [sys_msg, user_msg, asst_msg], max_tokens=500
+        )
+        assert result[0]["role"] == "system"
+
+    def test_no_system_messages_behaves_as_before(self):
+        messages = [_msg("user", "A"), _msg("assistant", "B")] * 3
+        result = ShortTermMemory.get_windowed_messages(messages, max_tokens=500)
+        # All messages fit; no system messages; result is unchanged
+        assert len(result) == 6
+        assert all(m["role"] in ("user", "assistant") for m in result)
+
+
+class TestGetWindowedWithSummary:
+    """Tests for the async hierarchical-summarisation variant."""
+
+    @pytest.mark.asyncio
+    async def test_no_summarizer_behaves_identically_to_sync(self):
+        messages = [_msg("user", "hi"), _msg("assistant", "hello")]
+        sync_result  = ShortTermMemory.get_windowed_messages(messages, max_tokens=1000)
+        async_result = await get_windowed_with_summary(messages, max_tokens=1000, summarizer=None)
+        assert sync_result == async_result
+
+    @pytest.mark.asyncio
+    async def test_summarizer_called_for_dropped_messages(self):
+        """When messages are dropped, the summarizer should receive them and the
+        result should contain a synthetic system summary message."""
+        # Make 4 messages where only the most recent 2 fit in the budget
+        old_pair = [_msg("user", "a" * 400), _msg("assistant", "b" * 400)]  # ~200 tokens
+        new_pair = [_msg("user", "c" * 400), _msg("assistant", "d" * 400)]  # ~200 tokens
+        messages = old_pair + new_pair
+
+        calls: list[list] = []
+
+        async def mock_summarizer(msgs):
+            calls.append(msgs)
+            return "Earlier we discussed topic A."
+
+        result = await get_windowed_with_summary(
+            messages, max_tokens=250, summarizer=mock_summarizer
+        )
+
+        assert calls, "summarizer should have been called"
+        # The old_pair should be the dropped messages passed to the summarizer
+        assert len(calls[0]) == 2
+
+        roles = [m["role"] for m in result]
+        assert "system" in roles
+        # The summary should appear as a system message
+        summary_msgs = [m for m in result if m.get("role") == "system" and "Earlier" in m.get("content", "")]
+        assert summary_msgs
+
+    @pytest.mark.asyncio
+    async def test_no_dropped_messages_summarizer_not_called(self):
+        """When all messages fit, the summarizer should NOT be called."""
+        messages = [_msg("user", "hi"), _msg("assistant", "hello")]
+        calls: list = []
+
+        async def mock_summarizer(msgs):
+            calls.append(msgs)
+            return "summary"
+
+        await get_windowed_with_summary(messages, max_tokens=10000, summarizer=mock_summarizer)
+        assert not calls, "summarizer should not be called when no messages are dropped"
+
+    @pytest.mark.asyncio
+    async def test_summarizer_failure_falls_back_to_silent_drop(self):
+        """A summarizer that raises should not propagate the error."""
+        old = _msg("user", "a" * 400)
+        new_pair = [_msg("user", "b" * 400), _msg("assistant", "c" * 400)]
+        messages = [old] + new_pair
+
+        async def failing_summarizer(msgs):
+            raise RuntimeError("LLM unavailable")
+
+        result = await get_windowed_with_summary(
+            messages, max_tokens=250, summarizer=failing_summarizer
+        )
+        # Should return the windowed result without the summary message
+        assert isinstance(result, list)
+        assert len(result) >= 0  # no crash

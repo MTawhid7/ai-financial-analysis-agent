@@ -78,4 +78,17 @@ async def run_migrations() -> None:
                     WITH (lists = 100)
                 """))
 
+    # ── Idempotent column additions (for existing deployments) ───────────────
+    # SQLite and Postgres both use try/except for column-exists safety.
+    from sqlalchemy import text as _text
+    for col_sql in (
+        "ALTER TABLE document_pages ADD COLUMN chunk_index INTEGER DEFAULT 0",
+        "ALTER TABLE document_pages ADD COLUMN embedding_model TEXT",
+    ):
+        try:
+            async with engine.begin() as _conn:
+                await _conn.execute(_text(col_sql))
+        except Exception:
+            pass  # Column already exists — safe to ignore
+
     logger.info("Database migrations complete.")

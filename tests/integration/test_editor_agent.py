@@ -81,8 +81,7 @@ async def test_editor_adds_disclaimer():
 
     mock_report = "# Financial Report\n\n## Executive Summary\nApple is strong.\n"
 
-    with patch("ai_financial_analyst.agents.editor.report_writer_tool") as mock_rw:
-        mock_rw.arun = AsyncMock(return_value=mock_report)
+    with patch("ai_financial_analyst.agents.editor.write_report", new_callable=AsyncMock, return_value=mock_report) as mock_rw:
 
         state = _make_state_with_analysis(_COMPLETE_ANALYSIS)
         config = {"primary_llm": None, "tracer": None}
@@ -97,8 +96,7 @@ async def test_editor_sop_checklist_populated():
 
     mock_report = "# Report\n## Data Coverage Summary\n..."
 
-    with patch("ai_financial_analyst.agents.editor.report_writer_tool") as mock_rw:
-        mock_rw.arun = AsyncMock(return_value=mock_report)
+    with patch("ai_financial_analyst.agents.editor.write_report", new_callable=AsyncMock, return_value=mock_report) as mock_rw:
 
         state = _make_state_with_analysis(_COMPLETE_ANALYSIS)
         config = {"primary_llm": None, "tracer": None}

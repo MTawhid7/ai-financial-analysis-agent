@@ -16,6 +16,8 @@ async pipelines; SqliteSaver only supports synchronous methods).
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -29,10 +31,10 @@ from ..config import settings
 from ..core.artifacts import RunArtifacts
 from ..core.budget_tracker import RequestBudgetTracker
 from ..core.llm import CircuitBreakerError, get_primary_llm_with_fallback, get_subllm
+from ..core.sanitizer import ContentSanitizer, SanitizationAlert
 from ..core.state import AgentState, PartialStateError
 from ..core.tracing import RunStatus, RunTracer
 from ..tools import web_search as web_search_module
-from ..tools import report_writer as report_writer_module
 from .editor import editor_node
 from .quant_analyst import quant_analyst_node
 from .researcher import researcher_node
@@ -77,6 +79,34 @@ def _route_after_quant(state: AgentState) -> str:
     if not state.get("analysis") or status in ("RATE_LIMITED", "FAILED"):
         return "early_exit"
     return "editor"
+
+
+# Fields that contain free-form LLM-generated text per node.
+# researcher is excluded: its output is structured API data already sanitized by
+# ContentSanitizer before reaching any LLM — no LLM narratives in state.
+_LLM_NARRATIVE_FIELDS: dict[str, tuple[str, ...]] = {
+    "quant_analyst": ("analysis",),
+    "editor":        ("report_markdown",),
+}
+
+
+def _check_intermediate_canary(node_name: str, state: AgentState) -> None:
+    """Check for canary token in LLM-generated state fields after each node.
+
+    The canary is random per process and never present in legitimate outputs.
+    Its appearance signals that injected content was echoed by the LLM.
+    Raises SanitizationAlert if the canary is found.
+    """
+    fields = _LLM_NARRATIVE_FIELDS.get(node_name, ())
+    if not fields:
+        return
+    sanitizer = ContentSanitizer()
+    for field in fields:
+        value = state.get(field)
+        if value is None:
+            continue
+        text = json.dumps(value, default=str) if not isinstance(value, str) else value
+        sanitizer.check_canary(text)
 
 
 def _build_graph(node_config: dict) -> StateGraph:
@@ -131,34 +161,63 @@ async def _safe_node(
     config: dict,
     tracer: RunTracer,
 ) -> AgentState:
-    """Wrap a node to catch known failure modes and emit partial output."""
-    try:
-        return await node_fn(state, config=config)
-    except PartialStateError as exc:
-        logger.error("PartialStateError in %s: %s", name, exc)
-        tracer.set_status(RunStatus.PARTIAL)
-        errors = list(state.get("errors", []))
-        errors.append(
-            {
-                "error_type": "STATE_VALIDATION_ERROR",
-                "agent": name,
-                "missing_fields": exc.missing_fields,
-            }
-        )
-        return AgentState(**{**state, "errors": errors, "status": "PARTIAL"})
-    except CircuitBreakerError as exc:
-        logger.critical("Circuit breaker tripped in %s: %s", name, exc)
-        tracer.set_status(RunStatus.RATE_LIMITED)
-        errors = list(state.get("errors", []))
-        errors.append({"error_type": "RATE_LIMIT", "agent": name, "detail": str(exc)})
-        report = state.get("report_markdown") or _partial_report(state, name)
-        return AgentState(**{**state, "errors": errors, "status": "RATE_LIMITED", "report_markdown": report})
-    except Exception as exc:
-        logger.exception("Unexpected error in node %s", name)
-        tracer.set_status(RunStatus.FAILED)
-        errors = list(state.get("errors", []))
-        errors.append({"error_type": "UNKNOWN", "agent": name, "detail": str(exc)})
-        return AgentState(**{**state, "errors": errors, "status": "FAILED"})
+    """Wrap a node to catch known failure modes and emit partial output.
+
+    Transient errors (generic Exception) are retried up to
+    settings.pipeline_node_max_retries times with linear backoff.
+    PartialStateError, CircuitBreakerError, and SanitizationAlert are never
+    retried — they represent permanent or rate-limit failures.
+    """
+    max_retries = settings.pipeline_node_max_retries
+    retry_delay = settings.pipeline_node_retry_delay_s
+
+    for attempt in range(max_retries + 1):
+        try:
+            result = await node_fn(state, config=config)
+            _check_intermediate_canary(name, result)
+            return result
+        except SanitizationAlert as exc:
+            logger.critical("SECURITY ALERT in node %s: %s", name, exc)
+            tracer.set_status(RunStatus.FAILED)
+            errors = list(state.get("errors", []))
+            errors.append({"error_type": "SECURITY", "agent": name, "detail": str(exc)})
+            report = state.get("report_markdown") or _partial_report(state, name)
+            return AgentState(**{**state, "errors": errors, "status": "FAILED", "report_markdown": report})
+        except PartialStateError as exc:
+            logger.error("PartialStateError in %s: %s", name, exc)
+            tracer.set_status(RunStatus.PARTIAL)
+            errors = list(state.get("errors", []))
+            errors.append(
+                {
+                    "error_type": "STATE_VALIDATION_ERROR",
+                    "agent": name,
+                    "missing_fields": exc.missing_fields,
+                }
+            )
+            return AgentState(**{**state, "errors": errors, "status": "PARTIAL"})
+        except CircuitBreakerError as exc:
+            logger.critical("Circuit breaker tripped in %s: %s", name, exc)
+            tracer.set_status(RunStatus.RATE_LIMITED)
+            errors = list(state.get("errors", []))
+            errors.append({"error_type": "RATE_LIMIT", "agent": name, "detail": str(exc)})
+            report = state.get("report_markdown") or _partial_report(state, name)
+            return AgentState(**{**state, "errors": errors, "status": "RATE_LIMITED", "report_markdown": report})
+        except Exception as exc:
+            if attempt < max_retries:
+                delay = retry_delay * (attempt + 1)
+                logger.warning(
+                    "Transient error in %s (attempt %d/%d), retrying in %.1fs: %s",
+                    name, attempt + 1, max_retries + 1, delay, exc,
+                )
+                await asyncio.sleep(delay)
+                continue
+            logger.exception(
+                "Unexpected error in node %s (failed after %d attempt(s))", name, attempt + 1
+            )
+            tracer.set_status(RunStatus.FAILED)
+            errors = list(state.get("errors", []))
+            errors.append({"error_type": "UNKNOWN", "agent": name, "detail": str(exc)})
+            return AgentState(**{**state, "errors": errors, "status": "FAILED"})
 
 
 def _partial_report(state: AgentState, failed_at: str) -> str:
@@ -193,6 +252,26 @@ def _partial_report(state: AgentState, failed_at: str) -> str:
     return "\n".join(lines)
 
 
+def _get_checkpointer_ctx(sqlite_path: str):
+    """Return the appropriate async checkpointer context manager.
+
+    Uses AsyncPostgresSaver when DATABASE_URL is set and the optional package
+    is installed (pip install langgraph-checkpoint-postgres).
+    Falls back to AsyncSqliteSaver with a warning if the package is missing.
+    """
+    if settings.database_url:
+        try:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # type: ignore
+            return AsyncPostgresSaver.from_conn_string(settings.database_url)
+        except ImportError:
+            logger.warning(
+                "DATABASE_URL is set but 'langgraph-checkpoint-postgres' is not installed. "
+                "Falling back to SQLite checkpointer. "
+                "Install with: pip install langgraph-checkpoint-postgres"
+            )
+    return AsyncSqliteSaver.from_conn_string(sqlite_path)
+
+
 def run_pipeline_from_tool(
     query: str,
     tickers: list[str],
@@ -203,7 +282,6 @@ def run_pipeline_from_tool(
     Calls asyncio.run(), so it must NOT be invoked from within an already-running
     event loop. Use `await run_pipeline(...)` directly from async contexts instead.
     """
-    import asyncio
     return asyncio.run(run_pipeline(query=query, tickers=tickers, step_callback=step_callback))
 
 
@@ -227,13 +305,13 @@ async def run_pipeline(
     subllm = get_subllm(budget_tracker=budget)
 
     web_search_module.configure(subllm=subllm)
-    report_writer_module.configure(primary_llm=primary_llm, subllm=subllm)
 
     tracer = RunTracer()
     run_id = str(uuid.uuid4())
     artifacts = RunArtifacts(run_id=run_id, tickers=[t.strip().upper() for t in tickers])
     node_config = {
         "primary_llm": primary_llm,
+        "subllm": subllm,
         "tracer": tracer,
         "budget": budget,
         "artifacts": artifacts,
@@ -258,7 +336,7 @@ async def run_pipeline(
     else:
         db_path = Path(_CHECKPOINT_PATH)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+        async with _get_checkpointer_ctx(str(db_path)) as checkpointer:
             app = graph.compile(checkpointer=checkpointer)
             final_state = await app.ainvoke(initial_state, config=thread_config)
 

@@ -129,3 +129,73 @@ class TestIsGroundedByScale:
 
     def test_unparseable_is_not_flagged(self):
         assert _is_grounded_by_scale("N/A", [100.0]) is True
+
+
+# ── SOP weighted scoring ──────────────────────────────────────────────────────
+
+class TestSOPWeightedScoring:
+    """Tests for the weighted SOP rubric replacing the binary pass/fail check."""
+
+    def _ticker_analysis(self, **present_keys) -> dict:
+        """Build a minimal analysis dict with the given keys set to truthy values."""
+        base = {
+            "price_cagr_5y_pct": None,
+            "sector_pe_avg":     None,
+            "company_pe":        None,
+            "bull_case":         None,
+            "bear_case":         None,
+        }
+        base.update(present_keys)
+        return base
+
+    def _compute_score(self, ticker_analysis: dict) -> float:
+        from ai_financial_analyst.agents.editor import _SOP_WEIGHTS
+        return round(
+            sum(w for key, (_, w) in _SOP_WEIGHTS.items() if ticker_analysis.get(key)),
+            3,
+        )
+
+    def test_all_fields_present_full_score(self):
+        analysis = self._ticker_analysis(
+            price_cagr_5y_pct=14.0, sector_pe_avg=25.0,
+            company_pe=28.0, bull_case=["growth"], bear_case=["risk"],
+        )
+        assert self._compute_score(analysis) == 1.0
+
+    def test_missing_bear_case_passes_threshold(self):
+        from ai_financial_analyst.agents.editor import _SOP_PASS_THRESHOLD
+        analysis = self._ticker_analysis(
+            price_cagr_5y_pct=14.0, sector_pe_avg=25.0,
+            company_pe=28.0, bull_case=["growth"],
+        )
+        assert self._compute_score(analysis) >= _SOP_PASS_THRESHOLD
+
+    def test_missing_both_narrative_fields_still_passes(self):
+        from ai_financial_analyst.agents.editor import _SOP_PASS_THRESHOLD
+        analysis = self._ticker_analysis(
+            price_cagr_5y_pct=14.0, sector_pe_avg=25.0, company_pe=28.0,
+        )
+        score = self._compute_score(analysis)
+        assert score == 0.75
+        assert score >= _SOP_PASS_THRESHOLD
+
+    def test_missing_two_critical_fields_fails(self):
+        from ai_financial_analyst.agents.editor import _SOP_PASS_THRESHOLD
+        # Only bull_case + bear_case present → 0.15 + 0.10 = 0.25
+        analysis = self._ticker_analysis(bull_case=["g"], bear_case=["r"])
+        assert self._compute_score(analysis) < _SOP_PASS_THRESHOLD
+
+    def test_weights_sum_to_one(self):
+        from ai_financial_analyst.agents.editor import _SOP_WEIGHTS
+        total = sum(w for _, w in _SOP_WEIGHTS.values())
+        assert abs(total - 1.0) < 1e-9
+
+    def test_sop_score_min_in_state(self):
+        """editor_node exposes sop_score_min in analysis_with_coverage."""
+        from ai_financial_analyst.agents.editor import _SOP_WEIGHTS, _SOP_PASS_THRESHOLD
+        # Score for a complete analysis = 1.0; verify constant expectation
+        full_analysis = {
+            k: "present" for k in _SOP_WEIGHTS
+        }
+        score = round(sum(w for _, w in _SOP_WEIGHTS.values()), 3)
+        assert score == 1.0

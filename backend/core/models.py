@@ -174,6 +174,14 @@ class DocumentPage(Base):
     token_estimate     = Column(Integer, nullable=True)
     embedding          = _EMBEDDING_COL()                  # Vector(768) or Text fallback
 
+    # Sub-page chunking — chunk_index=0 is the root (full content, used for display).
+    # chunk_index >= 1 are derived sub-page chunks used only for vector search.
+    chunk_index        = Column(Integer, nullable=False, default=0)
+
+    # Embedding provenance — records which model generated this row's embedding.
+    # Used to detect stale embeddings after a model upgrade.
+    embedding_model    = Column(String, nullable=True)
+
     # Document structure navigation (set after bulk insert)
     prev_page_id       = Column(String, ForeignKey("document_pages.id"), nullable=True)
     next_page_id       = Column(String, ForeignKey("document_pages.id"), nullable=True)
